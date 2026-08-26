@@ -87,6 +87,9 @@
 * `12:30:50` - 🟢 **Delight**: Cloud Build compiled all base and agent harness docker images (antigravity, claude, codex, copilot, gemini-cli, hermes, opencode) and the hub server, pushing them successfully to the regional Zurich registry.
 * `12:31:43` - 🔴 **Friction**: Pulling the new `scion-gemini-cli` image on the GCE VM failed with permission error: `Unauthenticated request. Unauthenticated requests do not have permission 'artifactregistry.repositories.downloadArtifacts'`.
 * `12:32:12` - 🟢 **Delight**: Autonomously verified the GCE VM's attached service account (`scion-demo-sa@palladius-genai.iam.gserviceaccount.com`) and granted it `roles/artifactregistry.reader` permission at the project level.
-* `12:34:19` - 🟢 **Delight**: Successfully pulled the agent image (`scion-gemini-cli:latest`) on the GCE VM.
-* `13:49:40` - 🟢 **Delight**: OAuth Consent Screen branding configuration URL: https://pantheon.corp.google.com/auth/branding?project=palladius-genai&organizationId=426276118631.
 * `14:26:36` - 🔴 **Friction**: The developer platform UI/agent platform has a bug where it continuously inserts a boilerplate Python list operations code snippet placeholder in the `<CONTEXT_SUMMARY>` box when truncation occurs, causing annoying noise and distraction in the conversation logs.
+* `15:19:44` - 🔴 **Friction**: Running the swarm script locally failed with `hub project references require hub mode to be enabled`.
+* `15:19:46` - 🟢 **Delight**: Enabled `hub.enabled=true` and configured `hub.endpoint=https://hub.scion.palladius.it` globally on the local workstation CLI settings.
+* `15:20:49` - 🔴 **Friction**: CLI login failed with Google OAuth `Error 401: invalid_client` because the Hub had no native CLI/Desktop OAuth credentials configured.
+* `15:21:00` - 🟢 **Delight**: Successfully authenticated the CLI client against the Hub.
+* `15:21:11` - 🟢 **Delight**: Updated the custom swarm creation script to use `PROJECT_NAME="scion"` to match the local directory name, and instructed the user to register the project with the Hub via `scion hub link`.
