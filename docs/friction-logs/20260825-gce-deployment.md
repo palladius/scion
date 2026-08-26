@@ -69,6 +69,14 @@
 * `10:26:15` - 🟢 **Delight**: Extended the local `gcloud` wrapper in `hub-config.sh` to intercept both `ssh` and `scp` and append `--tunnel-through-iap`.
 * `10:27:56` - 🟢 **Delight**: SSHed to GCE VM, removed a broken `git-core` PPA from the apt sources list, and upgraded Node.js to `v20.20.2` (including `npm`) from NodeSource.
 * `10:34:07` - 🟢 **Delight**: Re-ran Step 5. Built Go backend server, compiled React web assets, installed systemd and Caddy services, and successfully completed the remote HTTPS health check at `https://hub.scion.palladius.it/healthz`.
+* `10:38:06` - 🟢 **Delight**: Confirmed Scion Hub is fully live and running at `https://hub.scion.palladius.it/`.
+* `10:48:42` - 🔴 **Friction**: Attempted login on the Web UI but encountered empty OAuth redirect client IDs (configured with placeholder credentials).
+* `10:50:19` - Started Google OAuth client setup in GCP Console for `palladius-genai` to generate Web Client ID and Client Secret.
+* `10:52:30` - 🟢 **Delight**: OAuth Web Client ID generated and configured in local env file.
+* `10:52:47` - 🟢 **Delight**: OAuth Web Client Secret generated and configured in local env file.
+* `10:53:47` - 🟢 **Delight**: Re-deployed config and restarted Scion. Because of VM Go package caching, the compilation took only 14 seconds (down from 5 minutes). The remote health check passed successfully, and Google OAuth login is now fully active!
+
+
 
 
 
