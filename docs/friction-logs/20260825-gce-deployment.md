@@ -93,3 +93,6 @@
 * `15:20:49` - 🔴 **Friction**: CLI login failed with Google OAuth `Error 401: invalid_client` because the Hub had no native CLI/Desktop OAuth credentials configured.
 * `15:21:00` - 🟢 **Delight**: Successfully authenticated the CLI client against the Hub.
 * `15:21:11` - 🟢 **Delight**: Updated the custom swarm creation script to use `PROJECT_NAME="scion"` to match the local directory name, and instructed the user to register the project with the Hub via `scion hub link`.
+* `15:31:47` - 🟢 **Delight**: Swarm agents successfully started on the GCE VM after generating a PAT with the correct `agent:manage` scope and linking the project `Image Consistency`.
+* `15:39:32` - 🟢 **Delight**: Generated a dedicated `ed25519` SSH key for agent repository authentication.
+* `15:40:32` - 🟢 **Delight**: Implemented Scion's native Secret Management for projecting Obsidian credentials and SSH keys into agent containers, keeping the base image generic and secure.
