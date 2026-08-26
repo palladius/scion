@@ -81,6 +81,8 @@
 * `11:03:40` - 🟢 **Delight**: User updated the GCP credentials console to add the correct `https://hub.scion.palladius.it/auth/callback/google` redirect URI.
 * `11:05:11` - 🔴 **Friction**: Blocked with `Error 403: org_internal` because the OAuth Consent Screen was configured as Internal on a standalone project.
 * `11:07:01` - 🟢 **Delight**: User switched the consent screen to External (Testing) and added `ricc@google.com`, `palladiusbonton@gmail.com`, and `riccardolobotomy@gmail.com` as Test Users.
+* `11:14:30` - 🟢 **Delight**: User successfully logged in using Google OAuth and accessed the Scion Hub Dashboard UI.
+
 
 
 
