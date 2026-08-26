@@ -107,3 +107,13 @@ wait_for_cloud_init() {
     echo "Error: VM did not become ready after ${max_wait}s"
     return 1
 }
+
+# Wrap gcloud to automatically append --tunnel-through-iap when running compute ssh/scp if enabled
+gcloud() {
+    if [[ "${SCION_GCE_SSH_TUNNEL:-false}" == "true" ]] && [[ "${1:-}" == "compute" ]] && { [[ "${2:-}" == "ssh" ]] || [[ "${2:-}" == "scp" ]]; }; then
+        command gcloud compute "$2" --tunnel-through-iap "${@:3}"
+    else
+        command gcloud "$@"
+    fi
+}
+
