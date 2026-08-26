@@ -64,7 +64,7 @@ scion hub secret set --project "Image Consistency" OBSIDIAN_PASSWORD "your_passw
 ```
 
 ### File Projection (GitHub / Git SSH Keys)
-To project files (like private SSH keys) into the agent's container path (e.g., `/home/gemini/.ssh/id_rsa_scion`) with correct permissions (`0600`):
+To project files (like private SSH keys) into the agent's container path (e.g., `/home/scion/.ssh/id_rsa_scion`) with correct permissions (`0600`):
 1. Generate a dedicated Ed25519 key locally on your workstation:
    ```bash
    ssh-keygen -t ed25519 -C "scion-agent@derek" -f ~/.ssh/id_rsa_scion -N ""
@@ -74,12 +74,12 @@ To project files (like private SSH keys) into the agent's container path (e.g., 
    scion hub secret set \
      --project "Image Consistency" \
      --type file \
-     --target /home/gemini/.ssh/id_rsa_scion \
+     --target /home/scion/.ssh/id_rsa_scion \
      GITHUB_SSH_KEY @~/.ssh/id_rsa_scion
    ```
 3. Add the corresponding public key from `~/.ssh/id_rsa_scion.pub` to your GitHub account keys (**`https://github.com/settings/keys`**).
 
-*Note:* If you project the key as `/home/gemini/.ssh/id_rsa_scion` (instead of the default `id_rsa` / `id_ed25519`), you should make sure the agent's shell or Git commands are configured to find it. You can project a custom `config` file to `/home/gemini/.ssh/config` using a `file`-type secret containing:
+*Note:* If you project the key as `/home/scion/.ssh/id_rsa_scion` (instead of the default `id_rsa` / `id_ed25519`), you should make sure the agent's shell or Git commands are configured to find it. You can project a custom `config` file to `/home/scion/.ssh/config` using a `file`-type secret containing:
 ```text
 Host github.com
   IdentityFile ~/.ssh/id_rsa_scion
