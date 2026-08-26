@@ -79,6 +79,9 @@
 * `10:57:30` - Directed user to update the Authorized Redirect URI in the GCP console to match the correct format.
 * `10:58:00` - 🔴 **Friction**: Attempted login again, but still blocked with `redirect_uri_mismatch`. Noted that Google OAuth updates take up to 5 minutes to propagate, and advised the user to inspect the URL `redirect_uri` query parameter to verify it matches exactly.
 * `11:03:40` - 🟢 **Delight**: User updated the GCP credentials console to add the correct `https://hub.scion.palladius.it/auth/callback/google` redirect URI.
+* `11:05:11` - 🔴 **Friction**: Blocked with `Error 403: org_internal` because the OAuth Consent Screen was configured as Internal on a standalone project.
+* `11:07:01` - 🟢 **Delight**: User switched the consent screen to External (Testing) and added `ricc@google.com`, `palladiusbonton@gmail.com`, and `riccardolobotomy@gmail.com` as Test Users.
+
 
 
 
