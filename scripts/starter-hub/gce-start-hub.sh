@@ -211,8 +211,15 @@ WantedBy=multi-user.target
     # Caddyfile
     cat <<EOF > "$UPLOAD_DIR/Caddyfile"
 ${HUB_DOMAIN} {
-    # In combined mode, Hub API and Web UI are served on a single port
-    reverse_proxy localhost:8080
+    # Telegram webhook — must come BEFORE the catch-all
+    handle /telegram/webhook* {
+        reverse_proxy localhost:9094
+    }
+
+    # Hub API and Web UI
+    handle {
+        reverse_proxy localhost:8080
+    }
     tls /etc/letsencrypt/live/${CERT_DOMAIN}/fullchain.pem /etc/letsencrypt/live/${CERT_DOMAIN}/privkey.pem
 }
 EOF

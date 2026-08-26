@@ -83,18 +83,10 @@
 * `11:07:01` - 🟢 **Delight**: User switched the consent screen to External (Testing) and added `ricc@google.com`, `palladiusbonton@gmail.com`, and `riccardolobotomy@gmail.com` as Test Users.
 * `11:14:30` - 🟢 **Delight**: User successfully logged in using Google OAuth and accessed the Scion Hub Dashboard UI.
 * `11:16:50` - 🔴 **Friction**: Spawning first agent failed with image pull error (`failed to pull image 'gcr.io/palladius-genai/scion-agents/scion-gemini-cli:latest'`). Diagnosed that the default container configuration points to a GCR registry path that does not contain any pre-built images yet.
-* `11:18:37` - Triggered remote Cloud Build job (`a27cb0c9-bfd2-4d46-8979-da98432f71ea`) to build all base and harness docker images and push them to GCR.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+* `11:18:37` - 🟢 **Delight**: Shifted default image registry target from global GCR (`gcr.io`) to regional Zurich Artifact Registry (`europe-west6-docker.pkg.dev/palladius-genai/scion-agents`) to comply with corp organization location policy constraints. Succeeded in submitting multi-architecture build job `fc9b3cf9-2178-4cc9-ba50-f375f61983fe` to Cloud Build.
+* `12:30:50` - 🟢 **Delight**: Cloud Build compiled all base and agent harness docker images (antigravity, claude, codex, copilot, gemini-cli, hermes, opencode) and the hub server, pushing them successfully to the regional Zurich registry.
+* `12:31:43` - 🔴 **Friction**: Pulling the new `scion-gemini-cli` image on the GCE VM failed with permission error: `Unauthenticated request. Unauthenticated requests do not have permission 'artifactregistry.repositories.downloadArtifacts'`.
+* `12:32:12` - 🟢 **Delight**: Autonomously verified the GCE VM's attached service account (`scion-demo-sa@palladius-genai.iam.gserviceaccount.com`) and granted it `roles/artifactregistry.reader` permission at the project level.
+* `12:34:19` - 🟢 **Delight**: Successfully pulled the agent image (`scion-gemini-cli:latest`) on the GCE VM.
+* `13:49:40` - 🟢 **Delight**: OAuth Consent Screen branding configuration URL: https://pantheon.corp.google.com/auth/branding?project=palladius-genai&organizationId=426276118631.
+* `14:26:36` - 🔴 **Friction**: The developer platform UI/agent platform has a bug where it continuously inserts a boilerplate Python list operations code snippet placeholder in the `<CONTEXT_SUMMARY>` box when truncation occurs, causing annoying noise and distraction in the conversation logs.
