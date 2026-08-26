@@ -82,6 +82,9 @@
 * `11:05:11` - 🔴 **Friction**: Blocked with `Error 403: org_internal` because the OAuth Consent Screen was configured as Internal on a standalone project.
 * `11:07:01` - 🟢 **Delight**: User switched the consent screen to External (Testing) and added `ricc@google.com`, `palladiusbonton@gmail.com`, and `riccardolobotomy@gmail.com` as Test Users.
 * `11:14:30` - 🟢 **Delight**: User successfully logged in using Google OAuth and accessed the Scion Hub Dashboard UI.
+* `11:16:50` - 🔴 **Friction**: Spawning first agent failed with image pull error (`failed to pull image 'gcr.io/palladius-genai/scion-agents/scion-gemini-cli:latest'`). Diagnosed that the default container configuration points to a GCR registry path that does not contain any pre-built images yet.
+* `11:18:37` - Triggered remote Cloud Build job (`a27cb0c9-bfd2-4d46-8979-da98432f71ea`) to build all base and harness docker images and push them to GCR.
+
 
 
 
