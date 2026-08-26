@@ -96,3 +96,7 @@
 * `15:31:47` - 🟢 **Delight**: Swarm agents successfully started on the GCE VM after generating a PAT with the correct `agent:manage` scope and linking the project `Image Consistency`.
 * `15:39:32` - 🟢 **Delight**: Generated a dedicated `ed25519` SSH key for agent repository authentication.
 * `15:40:32` - 🟢 **Delight**: Implemented Scion's native Secret Management for projecting Obsidian credentials and SSH keys into agent containers, keeping the base image generic and secure.
+* `15:47:39` - 🔴 **Friction**: Setting secrets via CLI failed with `accepts 2 arg(s), received 3` because the parser treats value parameters separated by a space as positional arguments when flags have optional default values. Resolved by using `=` (e.g. `--project="Image Consistency"`).
+* `15:47:50` - 🔴 **Friction**: PAT token failed to set secrets with `403 Forbidden: Insufficient permissions` since PAT tokens are scoped to agent lifecycles only and cannot write database secrets.
+* `15:50:50` - 🟢 **Delight**: Bypassed local CLI limitations by setting the file-projected SSH keys and configuration securely in the Hub's Web UI dashboard.
+* `15:55:30` - 🟢 **Delight**: Corrected container user home directory path references from `/home/gemini/` to `/home/scion/` in the user manual.
