@@ -77,6 +77,8 @@
 * `10:53:47` - 🟢 **Delight**: Re-deployed config and restarted Scion. Because of VM Go package caching, the compilation took only 14 seconds (down from 5 minutes). The remote health check passed successfully, and Google OAuth login is now fully active!
 * `10:56:36` - 🔴 **Friction**: Attempted login but blocked by Google OAuth with `Error 400: redirect_uri_mismatch`. Diagnosed that the Hub constructs the callback redirect URI as `https://hub.scion.palladius.it/auth/callback/google` (omitting the expected `/api/v1` prefix).
 * `10:57:30` - Directed user to update the Authorized Redirect URI in the GCP console to match the correct format.
+* `10:58:00` - 🔴 **Friction**: Attempted login again, but still blocked with `redirect_uri_mismatch`. Noted that Google OAuth updates take up to 5 minutes to propagate, and advised the user to inspect the URL `redirect_uri` query parameter to verify it matches exactly.
+
 
 
 
