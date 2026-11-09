@@ -1,0 +1,381 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package messaging
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
+)
+
+// KeyInputs holds the inputs for conversation key derivation.
+type KeyInputs struct {
+	ThreadID      string
+	ProjectID     string
+	SenderKind    string
+	SenderID      string
+	RecipientKind string
+	RecipientID   string
+}
+
+// DeriveError is returned by DeriveConversationKey when key derivation is
+// refused. Cause provides a machine-readable category for aggregate reporting;
+// the wrapped Err provides the human-readable detail.
+type DeriveError struct {
+	Cause string
+	Err   error
+}
+
+func (e *DeriveError) Error() string { return e.Err.Error() }
+func (e *DeriveError) Unwrap() error { return e.Err }
+
+// Derive-error cause constants. These match the four refusal branches in
+// DeriveConversationKey and are stable identifiers for aggregate counters.
+const (
+	DeriveErrDMKeyParse      = "dm_key_parse"         // dm: prefix, ParseDMKey or re-derive failed
+	DeriveErrDMKeyCanonical  = "dm_key_not_canonical" // dm: prefix, parsed but not canonical
+	DeriveErrThreadNoProject = "thread_no_project"    // non-dm ThreadID, empty ProjectID
+	DeriveErrPrincipalPair   = "principal_pair"       // empty ThreadID, principal-pair derivation failed
+	DeriveErrSurfaceUnmap    = "surface_unmap"        // channel cannot be mapped to a surface (DEF-156 P3)
+	DeriveErrSurfaceConflict = "surface_conflict"     // messages in same group disagree on channel (DEF-156 P3)
+)
+
+// DeriveConversationKey is the ONLY function that should construct a conversation
+// external_ref (thread: or dm: key). All call sites must use this function.
+//
+// Returns the canonical external_ref, the conversation kind, and the project
+// scope (nil for direct conversations, which are global per section 2.4.1).
+//
+// Parse failure returns an error. Callers MUST NOT create a row on error and
+// MUST NOT fall back to a constructed key: any guess on any input to the key
+// derivation is a guess on the ACL.
+func DeriveConversationKey(in KeyInputs) (extRef string, kind string, projectID *string, err error) {
+	// Case 1: ThreadID has "dm:" prefix — parse, verify canonicality, return verbatim.
+	if strings.HasPrefix(in.ThreadID, "dm:") {
+		kindA, idA, kindB, idB, parseErr := messages.ParseDMKey(in.ThreadID)
+		if parseErr != nil {
+			// DO NOT fall through to case 2 — falling through is exactly how
+			// DEF-15 produces its defective row.
+			return "", "", nil, &DeriveError{Cause: DeriveErrDMKeyParse, Err: fmt.Errorf("dm key parse failed: %w", parseErr)}
+		}
+
+		rederived, deriveErr := messages.DMConversationKey(kindA, idA, kindB, idB)
+		if deriveErr != nil {
+			return "", "", nil, &DeriveError{Cause: DeriveErrDMKeyParse, Err: fmt.Errorf("dm key re-derivation failed: %w", deriveErr)}
+		}
+
+		// We re-derive to verify canonicality (token order, UUID format, kind casing)
+		// but return the ORIGINAL key, not the re-derived one. Normalising here would
+		// make the stored identity differ from the string the caller may already have
+		// authorised against — that is the read-gate normalisation refused in §2.15.4(c).
+		// Differ means error, never silent rewrite.
+		if rederived != in.ThreadID {
+			return "", "", nil, &DeriveError{Cause: DeriveErrDMKeyCanonical, Err: fmt.Errorf("dm key is not canonical: got %q, canonical form is %q", in.ThreadID, rederived)}
+		}
+
+		return in.ThreadID, "direct", nil, nil
+	}
+
+	// Case 2: ThreadID non-empty, no "dm:" prefix — thread conversation.
+	if in.ThreadID != "" {
+		if in.ProjectID == "" {
+			return "", "", nil, &DeriveError{Cause: DeriveErrThreadNoProject, Err: fmt.Errorf("thread key requires non-empty projectID")}
+		}
+		pid := in.ProjectID
+		return fmt.Sprintf("thread:%s:%s", in.ProjectID, in.ThreadID), "group", &pid, nil
+	}
+
+	// Case 3: ThreadID empty — derive from principal pair.
+	ref, deriveErr := messages.DMConversationKey(in.SenderKind, in.SenderID, in.RecipientKind, in.RecipientID)
+	if deriveErr != nil {
+		return "", "", nil, &DeriveError{Cause: DeriveErrPrincipalPair, Err: fmt.Errorf("dm key derivation from principals failed: %w", deriveErr)}
+	}
+	return ref, "direct", nil, nil
+}
+
+// ThreadConversationExternalRef returns the canonical external_ref for a
+// thread-based group conversation. This is a thin wrapper over the thread-key
+// branch of DeriveConversationKey (case 2) and MUST be used by every call site
+// that needs the "thread:<projectID>:<threadID>" string — including pkg/hub's
+// topic backfill and CreateTopic. Two independent fmt.Sprintf calls producing
+// the same format string is precisely the defect DEF-156 is fixing.
+func ThreadConversationExternalRef(projectID, threadID string) (string, error) {
+	if projectID == "" || threadID == "" {
+		return "", fmt.Errorf("ThreadConversationExternalRef: projectID and threadID must both be non-empty (projectID=%q, threadID=%q)", projectID, threadID)
+	}
+	extRef, _, _, err := DeriveConversationKey(KeyInputs{
+		ThreadID:  threadID,
+		ProjectID: projectID,
+	})
+	if err != nil {
+		return "", err
+	}
+	return extRef, nil
+}
+
+// ParseThreadConversationExternalRef is the inverse of ThreadConversationExternalRef.
+// It decomposes a "thread:<projectID>:<threadID>" external_ref into its components.
+//
+// This function MUST be used by every call site that needs to recover the
+// projectID or threadID from a stored thread external_ref. An ad-hoc
+// strings.TrimPrefix at the call site is the mirror image of the defect DEF-156
+// fixed: the forward helper centralises construction, and this helper
+// centralises decomposition, so neither can drift from the other.
+//
+// Returns an error if:
+//   - ref does not start with "thread:"
+//   - ref does not have exactly three colon-separated parts
+//   - projectID or threadID is empty
+//   - threadID starts with "dm:" (a dm: key must never round-trip through the
+//     thread path — mirrored from ThreadConversationExternalRef's own refusal)
+func ParseThreadConversationExternalRef(ref string) (projectID, threadID string, err error) {
+	if !strings.HasPrefix(ref, "thread:") {
+		return "", "", fmt.Errorf("ParseThreadConversationExternalRef: ref must start with \"thread:\" (got %q)", ref)
+	}
+	parts := strings.SplitN(ref, ":", 3)
+	if len(parts) != 3 {
+		return "", "", fmt.Errorf("ParseThreadConversationExternalRef: expected 3 colon-separated parts, got %d (ref=%q)", len(parts), ref)
+	}
+	projectID = parts[1]
+	threadID = parts[2]
+	if projectID == "" {
+		return "", "", fmt.Errorf("ParseThreadConversationExternalRef: projectID is empty (ref=%q)", ref)
+	}
+	if threadID == "" {
+		return "", "", fmt.Errorf("ParseThreadConversationExternalRef: threadID is empty (ref=%q)", ref)
+	}
+	if strings.HasPrefix(threadID, "dm:") {
+		return "", "", fmt.Errorf("ParseThreadConversationExternalRef: threadID must not have \"dm:\" prefix — a dm: key must not round-trip through the thread path (ref=%q)", ref)
+	}
+	return projectID, threadID, nil
+}
+
+// conversationByKeyConfig holds optional parameters for ResolveOrCreateConversationByKey.
+type conversationByKeyConfig struct {
+	topicLookup    TopicConversationLookup
+	surface        string
+	parentRef      string
+	defaultAgentID *string
+	participants   ParticipantEnsurer
+}
+
+// ConversationByKeyOption is a functional option for ResolveOrCreateConversationByKey.
+type ConversationByKeyOption func(*conversationByKeyConfig)
+
+// WithKeyTopicLookup injects a TopicConversationLookup into the resolve step.
+func WithKeyTopicLookup(tl TopicConversationLookup) ConversationByKeyOption {
+	return func(c *conversationByKeyConfig) { c.topicLookup = tl }
+}
+
+// WithParticipants injects a ParticipantEnsurer so that, when the resolved
+// conversation is kind=="direct" (a dm: external_ref), both principals named
+// in the key are registered as participants (A25.6 F1/F3). This is the
+// generic counterpart of ResolveOrCreateDMConversation's participant
+// registration, for the many call sites that resolve a DM through the
+// derive-key/by-key path instead. A nil (or omitted) ensurer is a no-op —
+// callers that do not need listing support (or cannot supply one) are
+// unaffected.
+func WithParticipants(pe ParticipantEnsurer) ConversationByKeyOption {
+	return func(c *conversationByKeyConfig) { c.participants = pe }
+}
+
+// WithSurface overrides the default surface ("native").
+func WithSurface(s string) ConversationByKeyOption {
+	return func(c *conversationByKeyConfig) { c.surface = s }
+}
+
+// WithParentRef sets the parent_ref for the conversation.
+func WithParentRef(pr string) ConversationByKeyOption {
+	return func(c *conversationByKeyConfig) { c.parentRef = pr }
+}
+
+// WithDefaultAgentID sets the default_agent_id for the conversation.
+func WithDefaultAgentID(id *string) ConversationByKeyOption {
+	return func(c *conversationByKeyConfig) { c.defaultAgentID = id }
+}
+
+// ResolveOrCreateConversationByKey performs UpsertConversationByExternalRef with
+// pre-derived key parameters. This is the shared resolve step used by both the
+// delegating conversation.go functions and handler call sites.
+//
+// When a TopicConversationLookup is provided via WithKeyTopicLookup, the function
+// intercepts "thread:" group refs and attempts to resolve via the webchat topic's
+// linked conversation_id. This intercept is the sole guard for pre-fix topics
+// (external_ref = ”) and belt-and-braces for post-fix topics
+// (external_ref = 'thread:…') that also converge via the partial unique index.
+// See DEF-156 §3.4 for the mixed population rationale.
+func ResolveOrCreateConversationByKey(
+	ctx context.Context,
+	cs ConversationUpserter,
+	log *slog.Logger,
+	extRef, kind string,
+	projectID *string,
+	opts ...ConversationByKeyOption,
+) (*ConversationResult, error) {
+	var cfg conversationByKeyConfig
+	cfg.surface = "native" // default
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	// Topic lookup intercept: when kind is "group" and extRef has a
+	// "thread:" prefix, attempt to resolve via the webchat topic's
+	// linked conversation_id. This intercept prevents the live write
+	// path from minting shadow conversations for native topics that
+	// already have a conversation.
+	//
+	// Mixed population (DEF-156): pre-fix topic conversations have
+	// external_ref = '' and rely on this intercept as their only guard.
+	// Post-fix topics write external_ref = 'thread:<project>:<topicID>'
+	// and converge via the partial unique index, making this intercept
+	// redundant for them. It stays as belt-and-braces for the pre-fix
+	// population until the switch collapse normalises them.
+	// A thread key names its project ("thread:<projectID>:<threadID>"). It
+	// resolves only within the project of the conversation being resolved:
+	// a key naming another project is answered exactly like a conversation
+	// that belongs to another project. Keys derived by DeriveConversationKey
+	// always carry the same project; a caller-supplied external_ref (chat
+	// integrations) may not.
+	if kind == "group" && projectID != nil && *projectID != "" && strings.HasPrefix(extRef, "thread:") {
+		if parts := strings.SplitN(extRef, ":", 3); len(parts) == 3 && parts[1] != *projectID {
+			return nil, fmt.Errorf("thread key names another project (external_ref=%q): %w", extRef, store.ErrConversationProjectMismatch)
+		}
+	}
+
+	if cfg.topicLookup != nil && kind == "group" && strings.HasPrefix(extRef, "thread:") {
+		// Extract threadID from "thread:<projectID>:<threadID>"
+		parts := strings.SplitN(extRef, ":", 3)
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("malformed thread: ref (external_ref=%q, parts=%d)", extRef, len(parts))
+		}
+		// The topic is looked up within the key's project (parts[1]),
+		// which the check above has matched to the conversation's project
+		// when one is given. A topic of another project answers ErrNotFound
+		// and takes the "not a native topic" fall-through below. Agent
+		// outbound sends answer a missing thread before they reach this
+		// point (outboundThreadConversationState).
+		threadID := parts[2]
+		convID, lookupErr := cfg.topicLookup.GetTopicConversationIDIncludingDeletedInProject(ctx, parts[1], threadID)
+		if lookupErr == nil && convID != "" {
+			log.Debug("conversation resolved via topic lookup (sink-level)",
+				"external_ref", extRef, "conversation_id", convID)
+			return &ConversationResult{
+				ConversationID: convID,
+				Kind:           kind,        // from DeriveConversationKey
+				Surface:        cfg.surface, // caller-supplied or default "native"
+			}, nil
+		}
+		if lookupErr == nil && convID == "" {
+			// Topic exists but not yet backfilled — refuse to mint.
+			return nil, fmt.Errorf("topic has no conversation_id yet (external_ref=%q)", extRef)
+		}
+		if lookupErr != nil {
+			if errors.Is(lookupErr, store.ErrNotFound) {
+				// Not a native topic — fall through to upsert.
+				// This is the normal case for non-native surface threads.
+			} else {
+				return nil, fmt.Errorf("topic lookup infrastructure error (external_ref=%q): %w", extRef, lookupErr)
+			}
+		}
+	}
+
+	conv := &store.Conversation{
+		Kind:        kind,
+		Surface:     cfg.surface,
+		ExternalRef: extRef,
+		DriftState:  DriftStateActive,
+		ProjectID:   projectID,
+	}
+	if cfg.parentRef != "" {
+		conv.ParentRef = cfg.parentRef
+	}
+	if cfg.defaultAgentID != nil {
+		conv.DefaultAgentID = cfg.defaultAgentID
+	}
+
+	result, err := cs.UpsertConversationByExternalRef(ctx, conv)
+	if err != nil {
+		return nil, fmt.Errorf("conversation upsert failed (external_ref=%q, kind=%q): %w", extRef, kind, err)
+	}
+
+	// A25.6 F1/F3: a direct (dm:) conversation resolved through this sink
+	// must have both principals registered as participants, the same as
+	// ResolveOrCreateDMConversation already does for its own callers.
+	// Without this, `conversation list` can never discover the conversation
+	// (report-7-gteam-2a F1/F3): the preamble's advertised catch-up flow
+	// (`conversation list --json` -> `catch-up conv:<id>`) depends on it.
+	//
+	// The two principals are recovered by parsing the CANONICAL external_ref
+	// read back from the DB (result.ExternalRef), not the input extRef or
+	// anything from the request payload — the dm: key already encodes
+	// exactly the sender/recipient pair that DeriveConversationKey validated
+	// (B5: identity comes from the authenticated sender and the resolved
+	// recipient, never from the payload).
+	if kind == "direct" && cfg.participants != nil {
+		ensureConversationParticipants(ctx, cfg.participants, log, result.ID, result.ExternalRef)
+	}
+
+	return &ConversationResult{
+		ConversationID: result.ID,
+		ExternalRef:    result.ExternalRef,
+		Kind:           result.Kind,
+		Surface:        result.Surface,
+		DisplayName:    result.DisplayName,
+	}, nil
+}
+
+// ensureConversationParticipants registers both principals named in a
+// canonical dm: external_ref as participants of conversationID. Failure is
+// G2 non-fatal (same exception as ResolveOrCreateDMConversation): a listing
+// gap is logged as a WARN and self-repairs on the next resolve, it must
+// never deny or unwind the send.
+func ensureConversationParticipants(ctx context.Context, pe ParticipantEnsurer, log *slog.Logger, conversationID, externalRef string) {
+	// Callers are expected to skip this helper when no ParticipantEnsurer is
+	// configured; fail safe (no-op) rather than panic if one does not.
+	if pe == nil {
+		return
+	}
+	kindA, idA, kindB, idB, parseErr := messages.ParseDMKey(externalRef)
+	if parseErr != nil {
+		// Should not happen: DeriveConversationKey already validated (case 1)
+		// or constructed (case 3) this external_ref as a canonical dm: key.
+		// Non-fatal, matching the rest of this function's failure semantics.
+		log.Warn("skipping participant registration: direct conversation external_ref did not parse as a dm key",
+			"conversation_id", conversationID, "external_ref", externalRef, "error", parseErr)
+		return
+	}
+	for _, pp := range []struct{ kind, id string }{
+		{kindA, idA},
+		{kindB, idB},
+	} {
+		if ensureErr := pe.EnsureParticipant(ctx, &store.ConversationParticipant{
+			ConversationID: conversationID,
+			PrincipalKind:  pp.kind,
+			PrincipalID:    pp.id,
+			Role:           "member",
+		}); ensureErr != nil {
+			log.Warn("participant registration failed (listing gap, not access)",
+				"conversation_id", conversationID,
+				"principal_kind", pp.kind,
+				"principal_id", pp.id,
+				"error", ensureErr)
+		}
+	}
+}

@@ -8,6 +8,7 @@
 /build/
 /.build/
 /scion
+/sciontool
 scion-agent
 extras/scion-chat-app/scion-chat-app
 
@@ -61,6 +62,7 @@ testdata/hub-v46-fixture.db-shm
 fixturegen
 
 # Agent state files
+.agents/
 .coordinator-state.md
 .eng-manager-state.md
 
@@ -70,8 +72,23 @@ fixturegen
 # Screenshot artifacts
 web/.screenshots/
 
+# Playwright E2E artifacts
+web/test-results/
+web/playwright-report/
+
 # Downloaded files
 downloads/
+
+# Local pinned tool installs (task-owned, not committed)
+/.tools/
+
+# Terraform local state/cache (the .terraform.lock.hcl provider lock IS committed)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!**/terraform.tfvars.example
 
 # PR review artifacts
 pr-*-review*.md
@@ -79,3 +96,7 @@ pr-*-review*.md
 # Python bytecode (harness provisioner unit tests)
 __pycache__/
 *.pyc
+/checksecuritymarkergates
+
+# Local scratch space (not tracked)
+/scratch/

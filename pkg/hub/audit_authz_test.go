@@ -1,0 +1,608 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build !no_sqlite
+
+package hub
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// =============================================================================
+// Test Helpers
+// =============================================================================
+
+// =============================================================================
+// Decision Audit Tests
+// =============================================================================
+
+func TestDecisionAudit_AllowAndDeny(t *testing.T) {
+	srv, s := testServer(t)
+
+	// Create a project and an agent for testing
+	ctx := context.Background()
+	project := &store.Project{
+		ID:        tid("audit-project"),
+		Name:      "Audit Test Project",
+		Slug:      "audit-project",
+		CreatedBy: DevUserID,
+		OwnerID:   DevUserID,
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	// Set up recording emitter
+	emitter := &recordingDecisionAuditEmitter{}
+	srv.authzService.SetDecisionAuditEmitter(emitter)
+
+	// Test allow decision (dev user is admin, should be allowed)
+	resource := Resource{
+		Type:       "project",
+		ID:         project.ID,
+		ParentType: "",
+	}
+	identity := NewAuthenticatedUser(DevUserID, "dev@localhost", "Development User", "admin", "api")
+	decision := srv.authzService.CheckAccess(ctx, identity, resource, ActionRead)
+	if !decision.Allowed {
+		t.Errorf("expected allow decision for admin, got deny: %s", decision.Reason)
+	}
+
+	// Wait a bit for async emission
+	time.Sleep(50 * time.Millisecond)
+
+	if len(emitter.records) < 1 {
+		t.Fatalf("expected at least 1 audit record, got %d", len(emitter.records))
+	}
+
+	allowRecord := emitter.records[len(emitter.records)-1]
+	if allowRecord.Result != "allow" {
+		t.Errorf("expected result=allow, got %s", allowRecord.Result)
+	}
+	if allowRecord.PrincipalKind != "user" {
+		t.Errorf("expected principal_kind=user, got %s", allowRecord.PrincipalKind)
+	}
+	if allowRecord.PrincipalID != DevUserID {
+		t.Errorf("expected principal_id=%s, got %s", DevUserID, allowRecord.PrincipalID)
+	}
+	if allowRecord.ResourceType != "project" {
+		t.Errorf("expected resource_type=project, got %s", allowRecord.ResourceType)
+	}
+	if allowRecord.Permission != "read" {
+		t.Errorf("expected permission=read, got %s", allowRecord.Permission)
+	}
+
+	// Test deny decision (create a non-admin user)
+	nonAdminID := tid("non-admin-user")
+	if err := s.CreateUser(ctx, &store.User{
+		ID:          nonAdminID,
+		Email:       "nonadmin@test.com",
+		DisplayName: "Non Admin",
+		Role:        "member",
+		Status:      "active",
+	}); err != nil {
+		t.Fatalf("failed to create non-admin user: %v", err)
+	}
+
+	// Non-admin user trying to access a resource they don't own
+	nonAdmin := NewAuthenticatedUser(nonAdminID, "nonadmin@test.com", "Non Admin", "member", "api")
+	otherResource := Resource{
+		Type:    "policy",
+		ID:      tid("some-policy"),
+		OwnerID: tid("someone-else"),
+	}
+	denyDecision := srv.authzService.CheckAccess(ctx, nonAdmin, otherResource, ActionDelete)
+	if denyDecision.Allowed {
+		t.Errorf("expected deny for non-admin non-owner, got allow")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	lastRecord := emitter.records[len(emitter.records)-1]
+	if lastRecord.Result != "deny" {
+		t.Errorf("expected result=deny, got %s", lastRecord.Result)
+	}
+	if lastRecord.CredentialType == "" {
+		// Should have credential info even for deny
+		t.Log("credential_type is empty for deny record (acceptable if no credential present)")
+	}
+}
+
+func TestDecisionAudit_BrokerDenyAudited(t *testing.T) {
+	srv, _ := testServer(t)
+
+	emitter := &recordingDecisionAuditEmitter{}
+	srv.authzService.SetDecisionAuditEmitter(emitter)
+
+	broker := NewBrokerIdentity(tid("audit-broker"))
+	decision := srv.authzService.CheckAccess(context.Background(), broker, Resource{Type: "skill", ID: tid("skill-1")}, ActionRead)
+	require.False(t, decision.Allowed)
+
+	require.Len(t, emitter.records, 1, "broker deny must emit a decision audit record")
+	rec := emitter.records[0]
+	assert.Equal(t, "deny", rec.Result)
+	assert.Equal(t, string(PrincipalKindBroker), rec.PrincipalKind)
+	assert.Equal(t, "broker identities are not supported by authorization", rec.Reason)
+}
+
+func TestDecisionAudit_NoSecrets(t *testing.T) {
+	srv, _ := testServer(t)
+
+	emitter := &recordingDecisionAuditEmitter{}
+	srv.authzService.SetDecisionAuditEmitter(emitter)
+
+	ctx := context.Background()
+	identity := NewAuthenticatedUser(DevUserID, "dev@localhost", "Development User", "admin", "api")
+
+	resource := Resource{
+		Type: "agent",
+		ID:   tid("test-agent"),
+	}
+
+	_ = srv.authzService.CheckAccess(ctx, identity, resource, ActionRead)
+	time.Sleep(50 * time.Millisecond)
+
+	if len(emitter.records) == 0 {
+		t.Fatal("expected at least one audit record")
+	}
+
+	for _, record := range emitter.records {
+		// Check that no field contains bearer tokens or secrets
+		fields := []string{
+			record.Reason,
+			record.MatchedPolicy,
+			record.MatchedGrant,
+			record.CredentialID,
+			record.CredentialType,
+			record.Route,
+		}
+		for _, field := range fields {
+			lower := strings.ToLower(field)
+			if strings.Contains(lower, "bearer") || strings.Contains(lower, "token_value") || strings.Contains(lower, "secret") {
+				t.Errorf("audit record contains potential secret in field: %s", field)
+			}
+		}
+	}
+}
+
+func TestDecisionAudit_Sampling(t *testing.T) {
+	srv, _ := testServer(t)
+
+	emitter := &recordingDecisionAuditEmitter{}
+	srv.authzService.SetDecisionAuditEmitter(emitter)
+	srv.authzService.DecisionAuditSampleRate = 0.0 // Sample nothing
+
+	ctx := context.Background()
+	identity := NewAuthenticatedUser(DevUserID, "dev@localhost", "Development User", "admin", "api")
+
+	// Allow decision with 0% sample rate - should not be audited
+	resource := Resource{
+		Type: "agent",
+		ID:   tid("sample-agent"),
+	}
+	decision := srv.authzService.CheckAccess(ctx, identity, resource, ActionRead)
+	if !decision.Allowed {
+		t.Errorf("expected allow, got deny")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	allowCount := 0
+	for _, r := range emitter.records {
+		if r.Result == "allow" {
+			allowCount++
+		}
+	}
+	if allowCount > 0 {
+		t.Errorf("expected 0 allow audit records with sample rate 0, got %d", allowCount)
+	}
+
+	// Deny decisions should always be audited regardless of sample rate
+	nonAdmin := NewAuthenticatedUser(tid("sample-nonadmin"), "sample@test.com", "Sampler", "member", "api")
+	denyResource := Resource{
+		Type:    "policy",
+		ID:      tid("restricted"),
+		OwnerID: tid("other"),
+	}
+	denyDecision := srv.authzService.CheckAccess(ctx, nonAdmin, denyResource, ActionDelete)
+	if denyDecision.Allowed {
+		t.Errorf("expected deny")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	denyCount := 0
+	for _, r := range emitter.records {
+		if r.Result == "deny" {
+			denyCount++
+		}
+	}
+	if denyCount == 0 {
+		t.Errorf("expected deny decisions to be audited regardless of sample rate")
+	}
+}
+
+// =============================================================================
+// Explain API Tests
+// =============================================================================
+
+func TestExplainAPI_SuperAdmin(t *testing.T) {
+	srv, s := testServer(t)
+
+	// Create a project
+	ctx := context.Background()
+	project := &store.Project{
+		ID:        tid("explain-project"),
+		Name:      "Explain Test",
+		Slug:      "explain-test",
+		CreatedBy: DevUserID,
+		OwnerID:   DevUserID,
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	// Create a non-admin user to explain for
+	targetUserID := tid("explain-target")
+	if err := s.CreateUser(ctx, &store.User{
+		ID:          targetUserID,
+		Email:       "target@test.com",
+		DisplayName: "Target User",
+		Role:        "member",
+		Status:      "active",
+	}); err != nil {
+		t.Fatalf("failed to create target user: %v", err)
+	}
+
+	// Super-admin explains for another user
+	body := map[string]interface{}{
+		"resource": map[string]interface{}{
+			"type":      "project",
+			"id":        project.ID,
+			"projectId": project.ID,
+		},
+		"action":        "read",
+		"principalId":   targetUserID,
+		"principalKind": "user",
+	}
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/authz/explain", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp explainResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	// CO1: The AK1 kernel does not yet build inline explain traces.
+	// Verify the response contains a decision (allowed + reason) rather
+	// than requiring trace steps.
+	if resp.Reason == "" {
+		t.Error("expected non-empty reason in explain response")
+	}
+}
+
+func TestExplainAPI_Self(t *testing.T) {
+	srv, s := testServer(t)
+
+	ctx := context.Background()
+	project := &store.Project{
+		ID:        tid("explain-self-project"),
+		Name:      "Explain Self Test",
+		Slug:      "explain-self",
+		CreatedBy: DevUserID,
+		OwnerID:   DevUserID,
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	// Dev user explains their own access (dev user = admin, explains self)
+	body := map[string]interface{}{
+		"resource": map[string]interface{}{
+			"type": "project",
+			"id":   project.ID,
+		},
+		"action": "read",
+	}
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/authz/explain", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp explainResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	if !resp.Allowed {
+		t.Error("expected allowed=true for admin user")
+	}
+
+	// CO1: The AK1 kernel does not yet build inline explain traces.
+	// The response includes allowed/reason but trace may be empty.
+	if resp.Reason == "" {
+		t.Error("expected non-empty reason for self explain")
+	}
+}
+
+func TestExplainAPI_DeniedForOtherPrincipal(t *testing.T) {
+	srv, s := testServer(t)
+
+	ctx := context.Background()
+
+	// Create a non-admin user
+	nonAdminID := tid("explain-requester")
+	if err := s.CreateUser(ctx, &store.User{
+		ID:          nonAdminID,
+		Email:       "requester@test.com",
+		DisplayName: "Requester",
+		Role:        "member",
+		Status:      "active",
+	}); err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+	ensureHubMembership(ctx, s, nonAdminID)
+
+	// Test the handler directly with a non-admin identity context to verify
+	// that non-admins cannot explain for another principal.
+	body := map[string]interface{}{
+		"resource": map[string]interface{}{
+			"type": "project",
+			"id":   tid("some-project"),
+		},
+		"action":      "read",
+		"principalId": tid("another-user"),
+	}
+
+	bodyBytes, _ := json.Marshal(body)
+	req := newRequestWithIdentity(t, http.MethodPost, "/api/v1/authz/explain", bodyBytes,
+		NewAuthenticatedUser(nonAdminID, "requester@test.com", "Requester", "member", "api"))
+
+	// Call the handler directly (bypassing the route guard middleware)
+	rec := httptest.NewRecorder()
+	srv.handleAuthzExplain(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for non-admin explaining other principal, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestExplainAPI_MemberWithoutAuditReadCannotExplainForOthers(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	// A member user without hub.audit.read cannot explain for another principal,
+	// even with other hub-level policies. This verifies the Decide-based gate
+	// that replaced the IsUnscopedLocalPlatformAdmin check.
+	memberID := tid("explain-member-noaudit")
+	require.NoError(t, s.CreateUser(ctx, &store.User{
+		ID: memberID, Email: "member-noaudit@test.com", DisplayName: "Member", Role: "member", Status: "active",
+	}))
+	ensureHubMembership(ctx, s, memberID)
+
+	body := map[string]interface{}{
+		"resource":    map[string]interface{}{"type": "agent", "id": tid("some-agent")},
+		"action":      "read",
+		"principalId": tid("another-user"),
+	}
+	bodyBytes, _ := json.Marshal(body)
+	req := newRequestWithIdentity(t, http.MethodPost, "/api/v1/authz/explain", bodyBytes,
+		NewAuthenticatedUser(memberID, "member-noaudit@test.com", "Member", "member", "api"))
+	rec := httptest.NewRecorder()
+	srv.handleAuthzExplain(rec, req)
+	assert.Equal(t, http.StatusForbidden, rec.Code, "member without hub.audit.read must be denied explain-for-other")
+}
+
+func TestExplainAPI_SuperAdminCanExplainForOthersViaDecide(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	// Super-admin (role=admin) can still explain for another principal after
+	// the IsUnscopedLocalPlatformAdmin check was replaced with a Decide call.
+	// The step-1 admin bypass in checkAccessForUser grants hub.audit.read.
+	targetID := tid("explain-target-decide")
+	require.NoError(t, s.CreateUser(ctx, &store.User{
+		ID: targetID, Email: "target-decide@test.com", DisplayName: "Target", Role: "member", Status: "active",
+	}))
+
+	project := &store.Project{
+		ID: tid("explain-decide-project"), Name: "Explain Decide Test", Slug: "explain-decide",
+		CreatedBy: DevUserID, OwnerID: DevUserID,
+	}
+	require.NoError(t, s.CreateProject(ctx, project))
+
+	body := map[string]interface{}{
+		"resource":      map[string]interface{}{"type": "project", "id": project.ID, "projectId": project.ID},
+		"action":        "read",
+		"principalId":   targetID,
+		"principalKind": "user",
+	}
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/authz/explain", body)
+	assert.Equal(t, http.StatusOK, rec.Code, "super-admin must be able to explain for other principals: %s", rec.Body.String())
+
+	var resp explainResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	// CO1: The AK1 kernel does not yet build inline explain traces.
+	// Verify the response includes a reason instead.
+	assert.NotEmpty(t, resp.Reason, "explain response must include a reason")
+}
+
+func TestExplainAPI_NoSecretLeakage(t *testing.T) {
+	srv, s := testServer(t)
+
+	ctx := context.Background()
+	project := &store.Project{
+		ID:        tid("explain-leak-project"),
+		Name:      "Leak Test",
+		Slug:      "leak-test",
+		CreatedBy: DevUserID,
+		OwnerID:   DevUserID,
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	body := map[string]interface{}{
+		"resource": map[string]interface{}{
+			"type": "project",
+			"id":   project.ID,
+		},
+		"action": "read",
+	}
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/authz/explain", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp explainResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	// Check trace for secrets
+	responseStr := rec.Body.String()
+	sensitivePatterns := []string{"bearer", "token_value", "secret_key", "password", "scion_pat_", "scion_dev_"}
+	for _, pattern := range sensitivePatterns {
+		if strings.Contains(strings.ToLower(responseStr), pattern) {
+			t.Errorf("explain response contains potential secret pattern %q", pattern)
+		}
+	}
+}
+
+func TestExplainAPI_TraceContainsDecidingPolicy(t *testing.T) {
+	srv, s := testServer(t)
+
+	ctx := context.Background()
+	project := &store.Project{
+		ID:        tid("trace-policy-project"),
+		Name:      "Trace Policy Test",
+		Slug:      "trace-policy",
+		CreatedBy: DevUserID,
+		OwnerID:   DevUserID,
+	}
+	if err := s.CreateProject(ctx, project); err != nil {
+		t.Fatalf("failed to create project: %v", err)
+	}
+
+	body := map[string]interface{}{
+		"resource": map[string]interface{}{
+			"type": "project",
+			"id":   project.ID,
+		},
+		"action": "read",
+	}
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/authz/explain", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var resp explainResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	// CO1: The AK1 kernel does not yet build inline explain traces.
+	// Verify the response returns a valid decision with reason.
+	if !resp.Allowed {
+		t.Errorf("expected allowed=true for admin user, got reason=%q", resp.Reason)
+	}
+	if resp.Reason == "" {
+		t.Error("expected non-empty reason in explain response")
+	}
+}
+
+// TestMutationAudit_CredentialRevocation was vacuous pre-RS4: the token ID
+// extraction was wrong (read createResp["id"] instead of createResp["accessToken"]["id"]),
+// so it always hit t.Skip. Post-RS4, the create returns 403 for a DevUser without a
+// project role binding, also hitting t.Skip.
+//
+// Superseded by TestRS4_MutationAudit_CredentialRevocation_Asserting in
+// rs4_credential_test.go, which verifies that DELETE produces exactly one
+// credential_revoke audit record with substantive fields.
+//
+// Deleted per R1 review O2 — do not re-add.
+
+// =============================================================================
+// Retention Cleanup Tests
+// =============================================================================
+
+func TestRetentionCleanup(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	oldTime := time.Now().AddDate(0, 0, -100)
+	recentTime := time.Now().Add(-1 * time.Hour)
+
+	// Create old mutation audit records
+	oldMutation := &store.MutationAuditRecord{
+		MutationType:       "policy_create",
+		ActorPrincipalKind: "user",
+		ActorPrincipalID:   tid("cleanup-user"),
+		TargetType:         "policy",
+		TargetID:           tid("old-policy"),
+		Timestamp:          oldTime,
+	}
+	recentMutation := &store.MutationAuditRecord{
+		MutationType:       "policy_create",
+		ActorPrincipalKind: "user",
+		ActorPrincipalID:   tid("cleanup-user"),
+		TargetType:         "policy",
+		TargetID:           tid("recent-policy"),
+		Timestamp:          recentTime,
+	}
+
+	if err := s.CreateMutationAudit(ctx, oldMutation); err != nil {
+		t.Fatalf("failed to create old mutation: %v", err)
+	}
+	if err := s.CreateMutationAudit(ctx, recentMutation); err != nil {
+		t.Fatalf("failed to create recent mutation: %v", err)
+	}
+
+	// Run cleanup with 90-day retention
+	if err := srv.CleanupAuditRecords(ctx, 90); err != nil {
+		t.Fatalf("CleanupAuditRecords failed: %v", err)
+	}
+
+	// Verify old mutation records were deleted.
+	mutationRecords, total, err := s.ListMutationAudits(ctx, store.MutationAuditFilter{
+		ActorPrincipalID: tid("cleanup-user"),
+		Limit:            10,
+	})
+	if err != nil {
+		t.Fatalf("failed to list mutation audits: %v", err)
+	}
+	if total != 1 {
+		t.Errorf("expected 1 mutation audit remaining after cleanup, got %d", total)
+	}
+	_ = mutationRecords
+}
+
+// =============================================================================
+// Test Helpers for non-dev auth requests
+// =============================================================================

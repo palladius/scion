@@ -125,39 +125,6 @@ func TestHubClient_DeliverInbound_Hub4xx(t *testing.T) {
 	assert.Contains(t, err.Error(), "400")
 }
 
-func TestHubClient_DeliverCallback(t *testing.T) {
-	var receivedData map[string]interface{}
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "POST", r.Method)
-		assert.Equal(t, "/api/v1/broker/callback", r.URL.Path)
-
-		body, err := io.ReadAll(r.Body)
-		require.NoError(t, err)
-
-		var payload callbackPayload
-		err = json.Unmarshal(body, &payload)
-		require.NoError(t, err)
-		receivedData = payload.Data
-
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ts.Close()
-
-	hmacKey := base64.StdEncoding.EncodeToString([]byte("secret"))
-	client := NewHubClient(ts.URL, hmacKey, "broker", slog.Default())
-	client.httpClient = ts.Client()
-
-	data := map[string]interface{}{
-		"action": "submit",
-		"value":  "test",
-	}
-
-	err := client.DeliverCallback(context.Background(), data)
-	require.NoError(t, err)
-	assert.Equal(t, "submit", receivedData["action"])
-}
-
 func TestHubClient_SignRequest_NoCredentials(t *testing.T) {
 	// When no HMAC credentials are set, signing should be a no-op.
 	client := NewHubClient("http://example.com", "", "", slog.Default())
@@ -166,4 +133,64 @@ func TestHubClient_SignRequest_NoCredentials(t *testing.T) {
 	err := client.signRequest(req)
 	assert.NoError(t, err)
 	assert.Empty(t, req.Header.Get("X-Scion-Signature"))
+}
+
+func TestHubClient_Reads_SendLinkedUser(t *testing.T) {
+	var headers []http.Header
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headers = append(headers, r.Header.Clone())
+		switch r.URL.Path {
+		case "/api/v1/projects/proj-1/agents":
+			json.NewEncoder(w).Encode(hubAgentsResponse{})
+		default:
+			json.NewEncoder(w).Encode(hubProjectsResponse{})
+		}
+	}))
+	defer ts.Close()
+
+	hmacKey := base64.StdEncoding.EncodeToString([]byte("test-secret-key-1234"))
+	client := NewHubClient(ts.URL, hmacKey, "teams-broker-1", slog.Default())
+	client.httpClient = ts.Client()
+	ctx := context.Background()
+
+	_, err := client.ListAgents(ctx, "proj-1", "user:alice@example.com")
+	require.NoError(t, err)
+	_, err = client.ListUserProjects(ctx, "user:alice@example.com", "")
+	require.NoError(t, err)
+
+	require.Len(t, headers, 2)
+	for _, h := range headers {
+		assert.Equal(t, "user:alice@example.com", h.Get("X-Scion-On-Behalf-Of"))
+		assert.Equal(t, "x-scion-on-behalf-of", h.Get("X-Scion-Signed-Headers"))
+		assert.NotEmpty(t, h.Get("X-Scion-Signature"))
+	}
+}
+
+func TestHubClient_Reads_NoLinkedUserOmitsHeader(t *testing.T) {
+	var headers []http.Header
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headers = append(headers, r.Header.Clone())
+		if r.URL.Path == "/api/v1/projects" {
+			json.NewEncoder(w).Encode(hubProjectsResponse{})
+			return
+		}
+		json.NewEncoder(w).Encode(hubAgentsResponse{})
+	}))
+	defer ts.Close()
+
+	hmacKey := base64.StdEncoding.EncodeToString([]byte("test-secret-key-1234"))
+	client := NewHubClient(ts.URL, hmacKey, "teams-broker-1", slog.Default())
+	client.httpClient = ts.Client()
+	ctx := context.Background()
+
+	_, err := client.ListAgents(ctx, "proj-1", "")
+	require.NoError(t, err)
+	_, err = client.ListUserProjects(ctx, "", "")
+	require.NoError(t, err)
+
+	require.Len(t, headers, 2)
+	for _, h := range headers {
+		assert.Empty(t, h.Get("X-Scion-On-Behalf-Of"))
+		assert.Empty(t, h.Get("X-Scion-Signed-Headers"))
+	}
 }

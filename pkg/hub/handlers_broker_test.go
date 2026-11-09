@@ -41,6 +41,8 @@ func setupBrokerAuthzTest(t *testing.T) (srv *Server, s store.Store, alice, bob,
 	srv, s = testServer(t)
 	ctx := context.Background()
 
+	// CO1: Create users with role bindings. The AK1 kernel evaluates role
+	// bindings, not the User.Role field.
 	alice = &store.User{
 		ID:          tid("user-broker-alice"),
 		Email:       "broker-alice@test.com",
@@ -61,19 +63,22 @@ func setupBrokerAuthzTest(t *testing.T) (srv *Server, s store.Store, alice, bob,
 	}
 	require.NoError(t, s.CreateUser(ctx, bob))
 
-	admin = &store.User{
-		ID:          tid("user-broker-admin"),
-		Email:       "broker-admin@test.com",
-		DisplayName: "Admin",
-		Role:        store.UserRoleAdmin,
-		Status:      "active",
-		Created:     time.Now(),
-	}
-	require.NoError(t, s.CreateUser(ctx, admin))
+	// CO1: Admin user needs a super-admin role binding for admin bypass.
+	// Use createTestUserWithRole which creates user + role binding together.
+	adminID := tid("user-broker-admin")
+	createTestUserWithRole(t, s, adminID, "broker-admin@test.com", "admin", store.SystemRoleSuperAdmin)
+	adminUser, err := s.GetUser(ctx, adminID)
+	require.NoError(t, err)
+	admin = adminUser
 
-	// Add alice and bob to hub-members group
+	// Add alice, bob, and admin to hub-members group
 	ensureHubMembership(ctx, s, alice.ID)
 	ensureHubMembership(ctx, s, bob.ID)
+	ensureHubMembership(ctx, s, admin.ID)
+
+	// The hub-member role's broker.read (granted via ensureHubMembership
+	// above) already covers GET /api/v1/runtime-brokers/:id and its
+	// /projects sub-route — no extra grant needed here.
 
 	// Create a project owned by alice
 	project = &store.Project{
@@ -86,17 +91,11 @@ func setupBrokerAuthzTest(t *testing.T) (srv *Server, s store.Store, alice, bob,
 		Updated:   time.Now(),
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
-	srv.createProjectMembersGroupAndPolicy(ctx, project)
+	srv.seedProjectCreatorMembership(ctx, project)
 
-	// Add bob as a project member so he can create agents (project-level authz)
-	membersGroup, err := s.GetGroupBySlug(ctx, "project:"+project.Slug+":members")
-	require.NoError(t, err)
-	_ = s.AddGroupMember(ctx, &store.GroupMember{
-		GroupID:    membersGroup.ID,
-		MemberType: store.GroupMemberTypeUser,
-		MemberID:   bob.ID,
-		Role:       store.GroupMemberRoleMember,
-	})
+	// CO1: Add bob as a project member via role binding so he can create
+	// agents (project-level authz).
+	createTestUserWithProjectRole(t, s, bob.ID, bob.Email, project.ID, store.ProjectRoleMember)
 
 	// Create a broker owned by alice directly in the store
 	broker = &store.RuntimeBroker{
@@ -111,10 +110,14 @@ func setupBrokerAuthzTest(t *testing.T) (srv *Server, s store.Store, alice, bob,
 	require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
 
 	// Link broker as a provider to the project and set as default
+	// The broker serves the hub-managed project from its own checkout, so
+	// a dispatch reaches the broker authorization these tests check instead
+	// of the workspace-storage refusal (ptone/scion#5813).
 	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
 		ProjectID:  project.ID,
 		BrokerID:   broker.ID,
 		BrokerName: broker.Name,
+		LocalPath:  fixtureProviderCheckout(t),
 		Status:     broker.Status,
 	}))
 	project.DefaultRuntimeBrokerID = broker.ID
@@ -128,10 +131,11 @@ func setupBrokerAuthzTest(t *testing.T) (srv *Server, s store.Store, alice, bob,
 // ============================================================================
 
 func TestBrokerAuthz_Registration_MemberCanRegister(t *testing.T) {
+	t.Parallel()
 	srv, _, alice, _, _, _, _ := setupBrokerAuthzTest(t)
 
 	// Non-admin member should be able to register a broker
-	rec := doRequestAsUser(t, srv, alice, http.MethodPost, "/api/v1/brokers",
+	rec := doRequestAsUserLoopback(t, srv, alice, http.MethodPost, "/api/v1/brokers",
 		CreateBrokerRegistrationRequest{Name: "Alice New Broker"})
 
 	assert.Equal(t, http.StatusCreated, rec.Code,
@@ -144,9 +148,10 @@ func TestBrokerAuthz_Registration_MemberCanRegister(t *testing.T) {
 }
 
 func TestBrokerAuthz_Registration_UnauthenticatedDenied(t *testing.T) {
+	t.Parallel()
 	srv, _ := testServer(t)
 
-	rec := doRequestNoAuth(t, srv, http.MethodPost, "/api/v1/brokers",
+	rec := doRequestNoAuthLoopback(t, srv, http.MethodPost, "/api/v1/brokers",
 		CreateBrokerRegistrationRequest{Name: "Unauthenticated Broker"})
 
 	assert.Equal(t, http.StatusUnauthorized, rec.Code,
@@ -158,6 +163,7 @@ func TestBrokerAuthz_Registration_UnauthenticatedDenied(t *testing.T) {
 // ============================================================================
 
 func TestBrokerAuthz_Dispatch_OwnerAllowed(t *testing.T) {
+	t.Parallel()
 	srv, _, alice, _, _, project, _ := setupBrokerAuthzTest(t)
 
 	// Alice (broker owner) should pass dispatch authorization.
@@ -171,6 +177,7 @@ func TestBrokerAuthz_Dispatch_OwnerAllowed(t *testing.T) {
 }
 
 func TestBrokerAuthz_Dispatch_NonOwnerDenied(t *testing.T) {
+	t.Parallel()
 	srv, _, _, bob, _, project, _ := setupBrokerAuthzTest(t)
 
 	// Bob (not the broker owner) should be denied dispatch.
@@ -186,6 +193,7 @@ func TestBrokerAuthz_Dispatch_NonOwnerDenied(t *testing.T) {
 }
 
 func TestBrokerAuthz_Dispatch_AutoProvide_NonOwnerAllowed(t *testing.T) {
+	t.Parallel()
 	srv, s, _, bob, _, project, broker := setupBrokerAuthzTest(t)
 	ctx := context.Background()
 
@@ -207,6 +215,7 @@ func TestBrokerAuthz_Dispatch_AutoProvide_NonOwnerAllowed(t *testing.T) {
 }
 
 func TestBrokerAuthz_Dispatch_AdminBypass(t *testing.T) {
+	t.Parallel()
 	srv, _, _, _, admin, project, _ := setupBrokerAuthzTest(t)
 
 	// Admin should bypass broker dispatch authorization.
@@ -224,6 +233,7 @@ func TestBrokerAuthz_Dispatch_AdminBypass(t *testing.T) {
 // ============================================================================
 
 func TestBrokerAuthz_Update_OwnerAllowed(t *testing.T) {
+	t.Parallel()
 	srv, _, alice, _, _, _, broker := setupBrokerAuthzTest(t)
 
 	rec := doRequestAsUser(t, srv, alice, http.MethodPatch,
@@ -235,6 +245,7 @@ func TestBrokerAuthz_Update_OwnerAllowed(t *testing.T) {
 }
 
 func TestBrokerAuthz_Update_NonOwnerDenied(t *testing.T) {
+	t.Parallel()
 	srv, _, _, bob, _, _, broker := setupBrokerAuthzTest(t)
 
 	rec := doRequestAsUser(t, srv, bob, http.MethodPatch,
@@ -246,6 +257,7 @@ func TestBrokerAuthz_Update_NonOwnerDenied(t *testing.T) {
 }
 
 func TestBrokerAuthz_Update_AdminBypass(t *testing.T) {
+	t.Parallel()
 	srv, _, _, _, admin, _, broker := setupBrokerAuthzTest(t)
 
 	rec := doRequestAsUser(t, srv, admin, http.MethodPatch,
@@ -261,6 +273,7 @@ func TestBrokerAuthz_Update_AdminBypass(t *testing.T) {
 // ============================================================================
 
 func TestBrokerAuthz_Delete_NonOwnerDenied(t *testing.T) {
+	t.Parallel()
 	srv, _, _, bob, _, _, broker := setupBrokerAuthzTest(t)
 
 	rec := doRequestAsUser(t, srv, bob, http.MethodDelete,
@@ -270,6 +283,7 @@ func TestBrokerAuthz_Delete_NonOwnerDenied(t *testing.T) {
 }
 
 func TestBrokerAuthz_Delete_OwnerAllowed(t *testing.T) {
+	t.Parallel()
 	srv, _, alice, _, _, _, broker := setupBrokerAuthzTest(t)
 
 	rec := doRequestAsUser(t, srv, alice, http.MethodDelete,
@@ -279,6 +293,7 @@ func TestBrokerAuthz_Delete_OwnerAllowed(t *testing.T) {
 }
 
 func TestBrokerAuthz_Delete_AdminBypass(t *testing.T) {
+	t.Parallel()
 	srv, _, _, _, admin, _, broker := setupBrokerAuthzTest(t)
 
 	rec := doRequestAsUser(t, srv, admin, http.MethodDelete,
@@ -292,6 +307,7 @@ func TestBrokerAuthz_Delete_AdminBypass(t *testing.T) {
 // ============================================================================
 
 func TestBrokerAuthz_Capabilities_OwnerSeesDispatch(t *testing.T) {
+	t.Parallel()
 	srv, _, alice, _, _, _, broker := setupBrokerAuthzTest(t)
 
 	rec := doRequestAsUser(t, srv, alice, http.MethodGet,
@@ -310,6 +326,7 @@ func TestBrokerAuthz_Capabilities_OwnerSeesDispatch(t *testing.T) {
 }
 
 func TestBrokerAuthz_Capabilities_AutoProvide_NonOwnerSeesDispatch(t *testing.T) {
+	t.Parallel()
 	srv, s, _, bob, _, _, broker := setupBrokerAuthzTest(t)
 	ctx := context.Background()
 
@@ -334,6 +351,7 @@ func TestBrokerAuthz_Capabilities_AutoProvide_NonOwnerSeesDispatch(t *testing.T)
 }
 
 func TestBrokerAuthz_Capabilities_NonOwnerNoDispatch(t *testing.T) {
+	t.Parallel()
 	srv, _, _, bob, _, _, broker := setupBrokerAuthzTest(t)
 
 	rec := doRequestAsUser(t, srv, bob, http.MethodGet,
@@ -356,6 +374,7 @@ func TestBrokerAuthz_Capabilities_NonOwnerNoDispatch(t *testing.T) {
 // ============================================================================
 
 func TestAgentCreate_BrokerResolution(t *testing.T) {
+	t.Parallel()
 	srv, s := testServer(t)
 	ctx := context.Background()
 
@@ -379,10 +398,14 @@ func TestAgentCreate_BrokerResolution(t *testing.T) {
 	require.NoError(t, s.CreateProject(ctx, project))
 
 	// Register broker as provider
+	// The broker is remote and serves the hub-managed project from its own
+	// checkout; a remote broker without one is refused at create
+	// (ptone/scion#5813).
 	provider := &store.ProjectProvider{
 		ProjectID:  project.ID,
 		BrokerID:   broker.ID,
 		BrokerName: broker.Name,
+		LocalPath:  fixtureProviderCheckout(t),
 		Status:     store.BrokerStatusOnline,
 	}
 	require.NoError(t, s.AddProjectProvider(ctx, provider))
@@ -394,7 +417,7 @@ func TestAgentCreate_BrokerResolution(t *testing.T) {
 			"runtimeBrokerId": tid("broker_id_123"),
 		}
 		rec := doRequest(t, srv, http.MethodPost, "/api/v1/agents", body)
-		assert.Equal(t, http.StatusCreated, rec.Code)
+		require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
 
 		var resp CreateAgentResponse
 		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
@@ -408,7 +431,7 @@ func TestAgentCreate_BrokerResolution(t *testing.T) {
 			"runtimeBrokerId": "My Laptop",
 		}
 		rec := doRequest(t, srv, http.MethodPost, "/api/v1/agents", body)
-		assert.Equal(t, http.StatusCreated, rec.Code)
+		require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
 
 		var resp CreateAgentResponse
 		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
@@ -422,7 +445,7 @@ func TestAgentCreate_BrokerResolution(t *testing.T) {
 			"runtimeBrokerId": "my-laptop",
 		}
 		rec := doRequest(t, srv, http.MethodPost, "/api/v1/agents", body)
-		assert.Equal(t, http.StatusCreated, rec.Code)
+		require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
 
 		var resp CreateAgentResponse
 		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
@@ -436,7 +459,12 @@ func TestAgentCreate_BrokerResolution(t *testing.T) {
 			"runtimeBrokerId": "non-existent",
 		}
 		rec := doRequest(t, srv, http.MethodPost, "/api/v1/agents", body)
-		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+		// A broker that does not exist at all is a 404, not a 503
+		// (ptone/scion#2715).
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+		var errResp ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+		assert.Equal(t, ErrCodeRuntimeBrokerNotFound, errResp.Error.Code)
 	})
 }
 
@@ -444,6 +472,7 @@ func TestAgentCreate_BrokerResolution(t *testing.T) {
 // input must store the value lowercased, because GCP SA emails are
 // case-insensitive and downstream actAs checks compare by exact string match.
 func TestBrokerUpdate_HostSAEmail_NormalizedToLowercase(t *testing.T) {
+	t.Parallel()
 	srv, s, alice, _, _, _, broker := setupBrokerAuthzTest(t)
 	ctx := context.Background()
 

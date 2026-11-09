@@ -79,6 +79,29 @@ func TestMessageInvalidInput(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrInvalidInput)
 }
 
+// An attachment-only chat message has no text, so the store accepts an
+// empty body and reads it back unchanged (ptone/scion#6146). The send
+// handlers decide whether a body is required.
+func TestCreateMessage_EmptyBodyRoundTrips(t *testing.T) {
+	s := newTestMessageStore(t)
+	ctx := context.Background()
+	msg := newTestMessage(uuid.NewString(), "agent-1")
+	msg.Msg = ""
+	msg.Type = "chat"
+
+	require.NoError(t, s.CreateMessage(ctx, msg))
+
+	got, err := s.GetMessage(ctx, msg.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "", got.Msg)
+	assert.Equal(t, "chat", got.Type)
+
+	// The identifiers stay required.
+	noProject := newTestMessage("", "agent-1")
+	noProject.Msg = ""
+	assert.ErrorIs(t, s.CreateMessage(ctx, noProject), store.ErrInvalidInput)
+}
+
 func TestMarkMessageRead(t *testing.T) {
 	s := newTestMessageStore(t)
 	ctx := context.Background()
@@ -145,36 +168,29 @@ func TestListMessagesFilters(t *testing.T) {
 	assert.Equal(t, 1, res.TotalCount)
 }
 
-func TestPurgeOldMessages(t *testing.T) {
+func TestListMessagesExcludeTypeAndSkipCount(t *testing.T) {
 	s := newTestMessageStore(t)
 	ctx := context.Background()
 	projectID := uuid.NewString()
-
-	oldRead := newTestMessage(projectID, "agent-1")
-	oldRead.Read = true
-	oldRead.CreatedAt = time.Now().Add(-72 * time.Hour).UTC().Truncate(time.Second)
-	require.NoError(t, s.CreateMessage(ctx, oldRead))
-
-	oldUnread := newTestMessage(projectID, "agent-1")
-	oldUnread.CreatedAt = time.Now().Add(-72 * time.Hour).UTC().Truncate(time.Second)
-	require.NoError(t, s.CreateMessage(ctx, oldUnread))
-
-	recent := newTestMessage(projectID, "agent-1")
-	require.NoError(t, s.CreateMessage(ctx, recent))
-
-	// readCutoff 24h ago purges oldRead; unreadCutoff 96h ago keeps oldUnread.
-	readCutoff := time.Now().Add(-24 * time.Hour)
-	unreadCutoff := time.Now().Add(-96 * time.Hour)
-	n, err := s.PurgeOldMessages(ctx, readCutoff, unreadCutoff)
+	for i, kind := range []string{"chat", "instruction", "mention"} {
+		msg := newTestMessage(projectID, "agent-1")
+		msg.Type = kind
+		msg.CreatedAt = time.Now().Add(time.Duration(i) * time.Second)
+		require.NoError(t, s.CreateMessage(ctx, msg))
+	}
+	filter := store.MessageFilter{ExcludeType: "mention"}
+	page, err := s.ListMessages(ctx, filter, store.ListOptions{Limit: 1, SkipTotalCount: true})
 	require.NoError(t, err)
-	assert.Equal(t, 1, n)
-
-	_, err = s.GetMessage(ctx, oldRead.ID)
-	assert.ErrorIs(t, err, store.ErrNotFound)
-	_, err = s.GetMessage(ctx, oldUnread.ID)
+	require.Len(t, page.Items, 1)
+	assert.Equal(t, "instruction", page.Items[0].Type)
+	assert.Zero(t, page.TotalCount)
+	require.NotEmpty(t, page.NextCursor)
+	next, err := s.ListMessages(ctx, filter, store.ListOptions{Limit: 1, Cursor: page.NextCursor})
 	require.NoError(t, err)
-	_, err = s.GetMessage(ctx, recent.ID)
-	require.NoError(t, err)
+	require.Len(t, next.Items, 1)
+	assert.Equal(t, "chat", next.Items[0].Type)
+	assert.Equal(t, 2, next.TotalCount)
+	assert.Empty(t, next.NextCursor)
 }
 
 // fakePublisher records PublishUserMessage calls to verify the LISTEN/NOTIFY
@@ -199,4 +215,238 @@ func TestCreateMessagePublishesEvent(t *testing.T) {
 
 	require.Len(t, pub.published, 1)
 	assert.Equal(t, msg.ID, pub.published[0].ID)
+}
+
+// ---------------------------------------------------------------------------
+// CountUnbackfilledMessages
+// ---------------------------------------------------------------------------
+
+func TestCountUnbackfilledMessages_ZeroWhenAllBackfilled(t *testing.T) {
+	s := newTestMessageStore(t)
+	ctx := context.Background()
+	projectID := uuid.NewString()
+	conversationID := uuid.NewString()
+
+	// Create two messages, then backfill both with a conversation_id.
+	m1 := newTestMessage(projectID, "agent-1")
+	m2 := newTestMessage(projectID, "agent-1")
+	require.NoError(t, s.CreateMessage(ctx, m1))
+	require.NoError(t, s.CreateMessage(ctx, m2))
+	require.NoError(t, s.SetMessageConversationID(ctx, m1.ID, conversationID))
+	require.NoError(t, s.SetMessageConversationID(ctx, m2.ID, conversationID))
+
+	count, err := s.CountUnbackfilledMessages(ctx, projectID)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count)
+}
+
+func TestCountUnbackfilledMessages_SomeUnbackfilled(t *testing.T) {
+	s := newTestMessageStore(t)
+	ctx := context.Background()
+	projectID := uuid.NewString()
+	conversationID := uuid.NewString()
+
+	// Create three messages; backfill only one.
+	m1 := newTestMessage(projectID, "agent-1")
+	m2 := newTestMessage(projectID, "agent-1")
+	m3 := newTestMessage(projectID, "agent-1")
+	require.NoError(t, s.CreateMessage(ctx, m1))
+	require.NoError(t, s.CreateMessage(ctx, m2))
+	require.NoError(t, s.CreateMessage(ctx, m3))
+	require.NoError(t, s.SetMessageConversationID(ctx, m1.ID, conversationID))
+
+	count, err := s.CountUnbackfilledMessages(ctx, projectID)
+	require.NoError(t, err)
+	assert.Equal(t, 2, count)
+}
+
+func TestCountUnbackfilledMessages_ProjectScopingFilters(t *testing.T) {
+	s := newTestMessageStore(t)
+	ctx := context.Background()
+
+	projectA := uuid.NewString()
+	projectB := uuid.NewString()
+	conversationID := uuid.NewString()
+
+	// Project A: 3 messages, backfill 1 → 2 unbackfilled.
+	a1 := newTestMessage(projectA, "agent-1")
+	a2 := newTestMessage(projectA, "agent-1")
+	a3 := newTestMessage(projectA, "agent-1")
+	require.NoError(t, s.CreateMessage(ctx, a1))
+	require.NoError(t, s.CreateMessage(ctx, a2))
+	require.NoError(t, s.CreateMessage(ctx, a3))
+	require.NoError(t, s.SetMessageConversationID(ctx, a1.ID, conversationID))
+
+	// Project B: 2 messages, backfill 0 → 2 unbackfilled.
+	b1 := newTestMessage(projectB, "agent-1")
+	b2 := newTestMessage(projectB, "agent-1")
+	require.NoError(t, s.CreateMessage(ctx, b1))
+	require.NoError(t, s.CreateMessage(ctx, b2))
+
+	// Scoped to project A → must return 2, NOT 4.
+	countA, err := s.CountUnbackfilledMessages(ctx, projectA)
+	require.NoError(t, err)
+	assert.Equal(t, 2, countA, "project A should have exactly 2 unbackfilled messages")
+
+	// Scoped to project B → must return 2, NOT 4.
+	countB, err := s.CountUnbackfilledMessages(ctx, projectB)
+	require.NoError(t, err)
+	assert.Equal(t, 2, countB, "project B should have exactly 2 unbackfilled messages")
+}
+
+func TestCountUnbackfilledMessages_EmptyProjectIDCountsAll(t *testing.T) {
+	s := newTestMessageStore(t)
+	ctx := context.Background()
+
+	projectA := uuid.NewString()
+	projectB := uuid.NewString()
+	conversationID := uuid.NewString()
+
+	// Project A: 2 messages, backfill 1 → 1 unbackfilled.
+	a1 := newTestMessage(projectA, "agent-1")
+	a2 := newTestMessage(projectA, "agent-1")
+	require.NoError(t, s.CreateMessage(ctx, a1))
+	require.NoError(t, s.CreateMessage(ctx, a2))
+	require.NoError(t, s.SetMessageConversationID(ctx, a1.ID, conversationID))
+
+	// Project B: 1 message, no backfill → 1 unbackfilled.
+	b1 := newTestMessage(projectB, "agent-1")
+	require.NoError(t, s.CreateMessage(ctx, b1))
+
+	// Empty projectID → counts all unbackfilled across both projects.
+	count, err := s.CountUnbackfilledMessages(ctx, "")
+	require.NoError(t, err)
+	assert.Equal(t, 2, count, "empty projectID should count unbackfilled messages across all projects")
+}
+
+func TestCountUnbackfilledMessages_InvalidProjectIDReturnsError(t *testing.T) {
+	s := newTestMessageStore(t)
+	ctx := context.Background()
+
+	count, err := s.CountUnbackfilledMessages(ctx, "not-a-uuid")
+	assert.Error(t, err)
+	assert.Equal(t, 0, count)
+}
+
+// TestMessageProjectProvenanceRoundTrip pins ptone/scion#2282: the
+// server-derived SenderProjectID / RecipientProjectID stamps must survive a
+// CreateMessage -> read round-trip on every read path, and an absent stamp
+// (human sender, legacy row) must read back as nil.
+func TestMessageProjectProvenanceRoundTrip(t *testing.T) {
+	s := newTestMessageStore(t)
+	ctx := context.Background()
+	projectID := uuid.NewString()
+	senderProj := uuid.NewString()
+	recipientProj := projectID
+
+	stamped := newTestMessage(projectID, "agent-1")
+	stamped.Sender = "agent:peer"
+	stamped.SenderProjectID = &senderProj
+	stamped.RecipientProjectID = &recipientProj
+	require.NoError(t, s.CreateMessage(ctx, stamped))
+
+	unstamped := newTestMessage(projectID, "agent-1")
+	require.NoError(t, s.CreateMessage(ctx, unstamped))
+
+	emptyStr := ""
+	emptyStamp := newTestMessage(projectID, "agent-1")
+	emptyStamp.SenderProjectID = &emptyStr
+	require.NoError(t, s.CreateMessage(ctx, emptyStamp))
+
+	assertStamped := func(t *testing.T, got *store.Message) {
+		t.Helper()
+		require.NotNil(t, got.SenderProjectID, "SenderProjectID must be persisted")
+		require.NotNil(t, got.RecipientProjectID, "RecipientProjectID must be persisted")
+		assert.Equal(t, senderProj, *got.SenderProjectID)
+		assert.Equal(t, recipientProj, *got.RecipientProjectID)
+	}
+
+	t.Run("GetMessage", func(t *testing.T) {
+		got, err := s.GetMessage(ctx, stamped.ID)
+		require.NoError(t, err)
+		assertStamped(t, got)
+
+		got, err = s.GetMessage(ctx, unstamped.ID)
+		require.NoError(t, err)
+		assert.Nil(t, got.SenderProjectID)
+		assert.Nil(t, got.RecipientProjectID)
+
+		got, err = s.GetMessage(ctx, emptyStamp.ID)
+		require.NoError(t, err)
+		assert.Nil(t, got.SenderProjectID, "an empty stamp persists as NULL")
+	})
+
+	t.Run("GetMessagesByIDs", func(t *testing.T) {
+		got, err := s.GetMessagesByIDs(ctx, []string{stamped.ID, unstamped.ID})
+		require.NoError(t, err)
+		require.Contains(t, got, stamped.ID)
+		assertStamped(t, got[stamped.ID])
+		assert.Nil(t, got[unstamped.ID].SenderProjectID)
+	})
+
+	t.Run("ListMessages", func(t *testing.T) {
+		res, err := s.ListMessages(ctx, store.MessageFilter{ProjectID: projectID}, store.ListOptions{Limit: 10})
+		require.NoError(t, err)
+		var found bool
+		for i := range res.Items {
+			if res.Items[i].ID == stamped.ID {
+				found = true
+				assertStamped(t, &res.Items[i])
+			}
+		}
+		assert.True(t, found)
+	})
+}
+
+func TestMessageProjectProvenanceRejectsMalformedID(t *testing.T) {
+	s := newTestMessageStore(t)
+	bad := "not-a-uuid"
+	msg := newTestMessage(uuid.NewString(), "agent-1")
+	msg.RecipientProjectID = &bad
+	assert.ErrorIs(t, s.CreateMessage(context.Background(), msg), store.ErrInvalidInput)
+}
+
+// TestMessageDelegationAttribution_RoundTrip: the authorizing user and the
+// grant of a message sent with an agent delegated credential
+// (.design/agent-delegation.md §14.5) are stored and read back; a message
+// without them reads back empty. Runs on both backends (enttest).
+func TestMessageDelegationAttribution_RoundTrip(t *testing.T) {
+	s := newTestMessageStore(t)
+	ctx := context.Background()
+	projectID := uuid.NewString()
+
+	delegated := newTestMessage(projectID, "agent-b")
+	delegated.Sender, delegated.SenderID = "agent:agent-a", "agent-a"
+	delegated.AuthorizingUserID = uuid.NewString()
+	delegated.DelegationGrantID = uuid.NewString()
+	require.NoError(t, s.CreateMessage(ctx, delegated))
+	plain := newTestMessage(projectID, "agent-b")
+	require.NoError(t, s.CreateMessage(ctx, plain))
+
+	got, err := s.GetMessage(ctx, delegated.ID)
+	require.NoError(t, err)
+	assert.Equal(t, delegated.AuthorizingUserID, got.AuthorizingUserID)
+	assert.Equal(t, delegated.DelegationGrantID, got.DelegationGrantID)
+	assert.Equal(t, "agent:agent-a", got.Sender, "the sender stays the agent")
+
+	got, err = s.GetMessage(ctx, plain.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got.AuthorizingUserID)
+	assert.Empty(t, got.DelegationGrantID)
+
+	list, err := s.ListMessages(ctx, store.MessageFilter{RecipientID: "agent-b"}, store.ListOptions{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, list.Items, 2)
+	attributed := 0
+	for _, m := range list.Items {
+		if m.ID == delegated.ID {
+			attributed++
+			assert.Equal(t, delegated.AuthorizingUserID, m.AuthorizingUserID)
+			assert.Equal(t, delegated.DelegationGrantID, m.DelegationGrantID)
+		} else {
+			assert.Empty(t, m.AuthorizingUserID)
+			assert.Empty(t, m.DelegationGrantID)
+		}
+	}
+	assert.Equal(t, 1, attributed)
 }

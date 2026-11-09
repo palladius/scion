@@ -31,14 +31,10 @@ import (
 func setupStalledTestServer(t *testing.T) (*Server, store.Store, *trackingEventPublisher) {
 	t.Helper()
 
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
-	if err := s.Migrate(context.Background()); err != nil {
-		t.Fatalf("failed to migrate test store: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
 
 	ep := &trackingEventPublisher{}
 
@@ -58,10 +54,9 @@ func TestAgentStalledDetectionHandler_MarksStalledAgents(t *testing.T) {
 	ctx := context.Background()
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Name:       "Stalled Detection Project",
-		Slug:       "stalled-detect-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Name: "Stalled Detection Project",
+		Slug: "stalled-detect-project",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
@@ -69,13 +64,12 @@ func TestAgentStalledDetectionHandler_MarksStalledAgents(t *testing.T) {
 
 	// Create a running agent with stale activity but recent heartbeat
 	agent := &store.Agent{
-		ID:         api.NewUUID(),
-		Slug:       "stalled-runner",
-		Name:       "Stalled Runner",
-		Template:   "claude",
-		ProjectID:  project.ID,
-		Phase:      string(state.PhaseCreated),
-		Visibility: store.VisibilityPrivate,
+		ID:        api.NewUUID(),
+		Slug:      "stalled-runner",
+		Name:      "Stalled Runner",
+		Template:  "claude",
+		ProjectID: project.ID,
+		Phase:     string(state.PhaseCreated),
 	}
 	if err := s.CreateAgent(ctx, agent); err != nil {
 		t.Fatalf("failed to create agent: %v", err)
@@ -144,23 +138,21 @@ func TestAgentStalledDetectionHandler_ClearedByActivityEvent(t *testing.T) {
 	ctx := context.Background()
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Name:       "Recovery Stalled Project",
-		Slug:       "recovery-stalled-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Name: "Recovery Stalled Project",
+		Slug: "recovery-stalled-project",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
 	}
 
 	agent := &store.Agent{
-		ID:         api.NewUUID(),
-		Slug:       "stalled-recovery",
-		Name:       "Stalled Recovery",
-		Template:   "claude",
-		ProjectID:  project.ID,
-		Phase:      string(state.PhaseCreated),
-		Visibility: store.VisibilityPrivate,
+		ID:        api.NewUUID(),
+		Slug:      "stalled-recovery",
+		Name:      "Stalled Recovery",
+		Template:  "claude",
+		ProjectID: project.ID,
+		Phase:     string(state.PhaseCreated),
 	}
 	if err := s.CreateAgent(ctx, agent); err != nil {
 		t.Fatalf("failed to create agent: %v", err)
@@ -205,23 +197,21 @@ func TestAgentStalledDetectionHandler_StalledFromActivityIsPreserved(t *testing.
 	ctx := context.Background()
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Name:       "Stalled Preserved Project",
-		Slug:       "stalled-preserved-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Name: "Stalled Preserved Project",
+		Slug: "stalled-preserved-project",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
 	}
 
 	agent := &store.Agent{
-		ID:         api.NewUUID(),
-		Slug:       "stalled-preserved",
-		Name:       "Stalled Preserved",
-		Template:   "claude",
-		ProjectID:  project.ID,
-		Phase:      string(state.PhaseCreated),
-		Visibility: store.VisibilityPrivate,
+		ID:        api.NewUUID(),
+		Slug:      "stalled-preserved",
+		Name:      "Stalled Preserved",
+		Template:  "claude",
+		ProjectID: project.ID,
+		Phase:     string(state.PhaseCreated),
 	}
 	if err := s.CreateAgent(ctx, agent); err != nil {
 		t.Fatalf("failed to create agent: %v", err)
@@ -286,23 +276,21 @@ func TestAgentStalledDetectionHandler_BlockedAgentNotStalled(t *testing.T) {
 	ctx := context.Background()
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Name:       "Blocked Not Stalled Project",
-		Slug:       "blocked-not-stalled-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Name: "Blocked Not Stalled Project",
+		Slug: "blocked-not-stalled-project",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
 	}
 
 	agent := &store.Agent{
-		ID:         api.NewUUID(),
-		Slug:       "blocked-agent",
-		Name:       "Blocked Agent",
-		Template:   "claude",
-		ProjectID:  project.ID,
-		Phase:      string(state.PhaseCreated),
-		Visibility: store.VisibilityPrivate,
+		ID:        api.NewUUID(),
+		Slug:      "blocked-agent",
+		Name:      "Blocked Agent",
+		Template:  "claude",
+		ProjectID: project.ID,
+		Phase:     string(state.PhaseCreated),
 	}
 	if err := s.CreateAgent(ctx, agent); err != nil {
 		t.Fatalf("failed to create agent: %v", err)
@@ -350,23 +338,21 @@ func TestAgentStalledDetectionHandler_IdleAgentMarkedStalled(t *testing.T) {
 	ctx := context.Background()
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Name:       "Idle Stalled Project",
-		Slug:       "working-stalled-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Name: "Idle Stalled Project",
+		Slug: "working-stalled-project",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
 	}
 
 	agent := &store.Agent{
-		ID:         api.NewUUID(),
-		Slug:       "working-agent",
-		Name:       "Idle Agent",
-		Template:   "claude",
-		ProjectID:  project.ID,
-		Phase:      string(state.PhaseCreated),
-		Visibility: store.VisibilityPrivate,
+		ID:        api.NewUUID(),
+		Slug:      "working-agent",
+		Name:      "Idle Agent",
+		Template:  "claude",
+		ProjectID: project.ID,
+		Phase:     string(state.PhaseCreated),
 	}
 	if err := s.CreateAgent(ctx, agent); err != nil {
 		t.Fatalf("failed to create agent: %v", err)
@@ -416,17 +402,13 @@ func TestAgentStalledDetectionHandler_IdleAgentMarkedStalled(t *testing.T) {
 }
 
 func TestNew_DefaultsStalledThresholdWhenZero(t *testing.T) {
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
-	if err := s.Migrate(context.Background()); err != nil {
-		t.Fatalf("failed to migrate test store: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
 
 	// Create server with zero StalledThreshold (simulates cmd/server.go omission)
-	srv, err := New(ServerConfig{}, s)
+	srv, err := newTestHubServer(t, ServerConfig{}, s)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
@@ -437,17 +419,13 @@ func TestNew_DefaultsStalledThresholdWhenZero(t *testing.T) {
 }
 
 func TestNew_ClampsStalledThresholdBelowMinimum(t *testing.T) {
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
-	if err := s.Migrate(context.Background()); err != nil {
-		t.Fatalf("failed to migrate test store: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
 
 	// Create server with StalledThreshold below the 2-minute minimum.
-	srv, err := New(ServerConfig{StalledThreshold: 30 * time.Second}, s)
+	srv, err := newTestHubServer(t, ServerConfig{StalledThreshold: 30 * time.Second}, s)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
@@ -459,17 +437,13 @@ func TestNew_ClampsStalledThresholdBelowMinimum(t *testing.T) {
 }
 
 func TestNew_PreservesValidStalledThreshold(t *testing.T) {
-	s, err := newTestStore(":memory:")
+	s, err := newTestStore(t, ":memory:")
 	if err != nil {
 		t.Fatalf("failed to create test store: %v", err)
 	}
-	if err := s.Migrate(context.Background()); err != nil {
-		t.Fatalf("failed to migrate test store: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
 
 	// Create server with a valid StalledThreshold (>= 2 minutes).
-	srv, err := New(ServerConfig{StalledThreshold: 10 * time.Minute}, s)
+	srv, err := newTestHubServer(t, ServerConfig{StalledThreshold: 10 * time.Minute}, s)
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
@@ -483,23 +457,21 @@ func TestAgentStalledDetectionHandler_AutoSuspendDisabled(t *testing.T) {
 	ctx := context.Background()
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Name:       "AutoSuspend Disabled Project",
-		Slug:       "autosuspend-disabled-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Name: "AutoSuspend Disabled Project",
+		Slug: "autosuspend-disabled-project",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
 	}
 
 	agent := &store.Agent{
-		ID:         api.NewUUID(),
-		Slug:       "autosuspend-disabled-agent",
-		Name:       "AutoSuspend Disabled Agent",
-		Template:   "claude",
-		ProjectID:  project.ID,
-		Phase:      string(state.PhaseCreated),
-		Visibility: store.VisibilityPrivate,
+		ID:        api.NewUUID(),
+		Slug:      "autosuspend-disabled-agent",
+		Name:      "AutoSuspend Disabled Agent",
+		Template:  "claude",
+		ProjectID: project.ID,
+		Phase:     string(state.PhaseCreated),
 	}
 	if err := s.CreateAgent(ctx, agent); err != nil {
 		t.Fatalf("failed to create agent: %v", err)
@@ -550,23 +522,21 @@ func TestAgentStalledDetectionHandler_AutoSuspendEnabled(t *testing.T) {
 	ctx := context.Background()
 
 	project := &store.Project{
-		ID:         api.NewUUID(),
-		Name:       "AutoSuspend Enabled Project",
-		Slug:       "autosuspend-enabled-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   api.NewUUID(),
+		Name: "AutoSuspend Enabled Project",
+		Slug: "autosuspend-enabled-project",
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
 	}
 
 	agent := &store.Agent{
-		ID:         api.NewUUID(),
-		Slug:       "autosuspend-enabled-agent",
-		Name:       "AutoSuspend Enabled Agent",
-		Template:   "claude",
-		ProjectID:  project.ID,
-		Phase:      string(state.PhaseCreated),
-		Visibility: store.VisibilityPrivate,
+		ID:        api.NewUUID(),
+		Slug:      "autosuspend-enabled-agent",
+		Name:      "AutoSuspend Enabled Agent",
+		Template:  "claude",
+		ProjectID: project.ID,
+		Phase:     string(state.PhaseCreated),
 	}
 	if err := s.CreateAgent(ctx, agent); err != nil {
 		t.Fatalf("failed to create agent: %v", err)
@@ -589,8 +559,10 @@ func TestAgentStalledDetectionHandler_AutoSuspendEnabled(t *testing.T) {
 	}
 
 	// AutoSuspendStalled is true — agent should be stalled AND then auto-suspended
+	// by the auto-suspend worker the tick hands it to.
 	handler := srv.agentStalledDetectionHandler()
 	handler(ctx)
+	srv.waitAutoSuspendIdle()
 
 	a, err := s.GetAgent(ctx, agent.ID)
 	if err != nil {

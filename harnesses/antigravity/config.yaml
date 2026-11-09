@@ -17,6 +17,14 @@ provisioner:
 config_dir: .gemini/antigravity-cli
 skills_dir: .gemini/antigravity-cli/skills
 interrupt_key: C-c
+# Readiness and message delivery; see the authoring guide.
+ready:
+  strategy: delay
+  settle: 8s
+delivery:
+  submit_keys: [Enter]
+  extra_submits: 2
+  extra_submit_delay: 300ms
 instructions_file: .gemini/GEMINI.md
 system_prompt_file: GEMINI.md
 system_prompt_mode: prepend_to_instructions
@@ -32,9 +40,19 @@ env_template:
 
 model_aliases:
   small: "Gemini 3.1 Flash Lite"
-  medium: "Gemini 3.7 Flash (Medium)"
-  large: "Gemini 3.1 Pro (Low)"
-  extra-large: "Gemini 3.1 Pro (Low)"
+  medium: "Gemini 3.8 Flash (Medium)"
+  large: "Gemini 4 Argon (Medium)"
+  extra-large: "Gemini 4 Argon (High)"
+
+# SCION_THINKING_LEVEL (0-100) -> `agy --effort <value>` in agy-wrapper.sh.
+# Applied by scion_harness.resolve_thinking in provision.py. Each level maps
+# to the value of the first entry whose max (inclusive) is >= the level.
+# No default: when the level is unset, no --effort is passed and AGY's default applies.
+thinking:
+  levels:
+    - {max: 25,  value: low}
+    - {max: 50,  value: medium}
+    - {max: 100, value: high}
 
 mcp:
   global_config_file: .gemini/config/mcp_config.json
@@ -57,7 +75,7 @@ capabilities:
     system_prompt: { support: "partial", reason: "System prompt is downgraded to GEMINI.md preamble" }
     agent_instructions: { support: "yes" }
   auth:
-    api_key: { support: "no", reason: "AGY uses OAuth, not API keys" }
+    api_key: { support: "yes", reason: "Via GEMINI_API_KEY with modelProvider=gemini in settings.json" }
     auth_file: { support: "yes", reason: "Via AGY_TOKEN file secret at ~/.gemini/antigravity-cli/antigravity-oauth-token" }
     oauth_token: { support: "no", reason: "AGY uses file-based OAuth token, not raw token injection" }
     vertex_ai: { support: "yes", reason: "GCP mode via ADC (GOOGLE_APPLICATION_CREDENTIALS) + GOOGLE_CLOUD_PROJECT, requires AGY CLI >= 1.1.10" }
@@ -80,6 +98,9 @@ auth:
           type: file
           description: "Antigravity OAuth token JSON file"
           target_suffix: "/.gemini/antigravity-cli/antigravity-oauth-token"
+    api-key:
+      required_env:
+        - any_of: ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
     vertex-ai:
       required_env:
         - any_of: ["GOOGLE_CLOUD_PROJECT"]
@@ -94,6 +115,8 @@ auth:
           required: true
   autodetect:
     env:
+      GEMINI_API_KEY: api-key
+      GOOGLE_API_KEY: api-key
       AGY_TOKEN: oauth-token
       GOOGLE_CLOUD_PROJECT: vertex-ai
     files:

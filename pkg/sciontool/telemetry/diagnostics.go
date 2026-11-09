@@ -1,0 +1,241 @@
+package telemetry
+
+import (
+	"context"
+	"fmt"
+	"sync/atomic"
+	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/sciontool/log"
+)
+
+const diagnosticSnapshotInterval = 60 * time.Second
+
+// metricRejectReasonLimit bounds the reject reasons in the snapshot line.
+const metricRejectReasonLimit = 16
+
+// DeliverySnapshot is a bounded, local diagnostic view. Counters count records
+// or metric points, except Attempts, Failed and Retries, which count export
+// calls (WP3 design section 1.2). Attempts counts every exporter call,
+// including retries; Retries counts the calls after the first for the same
+// batch. Failed counts failed calls for metrics (one call per flush slot)
+// and batches whose bounded retry was exhausted for spans and logs.
+type DeliverySnapshot struct {
+	Accepted, Filtered, Rejected, Queued, Delivered, Dropped, Unconfirmed int64
+	Permanent, Partial, AttemptLimit, AgeLimit, Canceled                  int64
+	BackendRejected                                                       int64
+	Attempts, Failed, Retries                                             int64
+	SDKErrors                                                             int64
+	LastSuccess                                                           time.Time
+}
+
+type QueueDepth struct{ Bytes, Records, Entries int }
+
+func (p *Pipeline) QueueDepth() QueueDepth {
+	if p == nil {
+		return QueueDepth{}
+	}
+	p.budget.mu.Lock()
+	defer p.budget.mu.Unlock()
+	return QueueDepth{p.budget.bytes, p.budget.records, p.budget.entries}
+}
+
+type signalDiagnostics struct {
+	accepted, filtered, rejected, queued, delivered, dropped, unconfirmed atomic.Int64
+	permanent, partial, attemptLimit, ageLimit, canceled                  atomic.Int64
+	backendRejected                                                       atomic.Int64
+	attempts, failed, retries, lastSuccess                                atomic.Int64
+	sdkErrors                                                             atomic.Int64
+}
+
+// countedAttempt wraps one exporter call of a retried batch: it counts the
+// call and, after the first, the retry.
+func (d *signalDiagnostics) countedAttempt(fn func() error) func() error {
+	first := true
+	return func() error {
+		d.attempts.Add(1)
+		if !first {
+			d.retries.Add(1)
+		}
+		first = false
+		return fn()
+	}
+}
+
+func (d *signalDiagnostics) snapshot() DeliverySnapshot {
+	result := DeliverySnapshot{
+		Accepted: d.accepted.Load(), Filtered: d.filtered.Load(), Rejected: d.rejected.Load(),
+		Queued: d.queued.Load(), Delivered: d.delivered.Load(), Dropped: d.dropped.Load(), Unconfirmed: d.unconfirmed.Load(),
+		Permanent: d.permanent.Load(), Partial: d.partial.Load(), AttemptLimit: d.attemptLimit.Load(), AgeLimit: d.ageLimit.Load(), Canceled: d.canceled.Load(),
+		BackendRejected: d.backendRejected.Load(),
+		Attempts:        d.attempts.Load(), Failed: d.failed.Load(), Retries: d.retries.Load(),
+		SDKErrors: d.sdkErrors.Load(),
+	}
+	if timestamp := d.lastSuccess.Load(); timestamp != 0 {
+		result.LastSuccess = time.Unix(0, timestamp)
+	}
+	return result
+}
+
+type terminalReason uint8
+
+const (
+	terminalPermanent terminalReason = iota
+	terminalPartial
+	terminalAttemptLimit
+	terminalAgeLimit
+	terminalCanceled
+)
+
+func (d *signalDiagnostics) terminal(records int, reason terminalReason, knownRejected int64) {
+	if knownRejected < 0 {
+		knownRejected = 0
+	}
+	if knownRejected > int64(records) {
+		knownRejected = int64(records)
+	}
+	d.unconfirmed.Add(int64(records))
+	switch reason {
+	case terminalPermanent:
+		d.permanent.Add(int64(records))
+	case terminalPartial:
+		d.partial.Add(int64(records))
+	case terminalAttemptLimit:
+		d.attemptLimit.Add(int64(records))
+	case terminalAgeLimit:
+		d.ageLimit.Add(int64(records))
+	case terminalCanceled:
+		d.canceled.Add(int64(records))
+	}
+	d.backendRejected.Add(knownRejected)
+}
+
+func (d *signalDiagnostics) success(records int) {
+	d.delivered.Add(int64(records))
+	d.lastSuccess.Store(time.Now().UnixNano())
+}
+
+// Diagnostics returns fixed-cardinality local counters. It never includes
+// request content or destination error strings.
+func (p *Pipeline) Diagnostics() map[string]DeliverySnapshot {
+	if p == nil {
+		return nil
+	}
+	return map[string]DeliverySnapshot{
+		"spans":   p.spanDiagnostics.snapshot(),
+		"metrics": p.metricDiagnostics.snapshot(),
+		"logs":    p.logDiagnostics.snapshot(),
+	}
+}
+
+// UsageDiagnostics returns the usage deriver's fixed-cardinality counters
+// (design §3.3 "Diagnostics"). Safe to call before Start or when usage
+// derivation is inactive: it returns a zero value.
+func (p *Pipeline) UsageDiagnostics() UsageDiagnostics {
+	if p == nil {
+		return UsageDiagnostics{}
+	}
+	return p.usageDeriver.Load().Diagnostics()
+}
+
+// Snapshots use the local logger only. They are fixed-cardinality and do not
+// traverse the telemetry exporter whose failure they describe.
+func (p *Pipeline) logDeliverySnapshot(force bool) {
+	p.logDeliverySnapshotDisk(force, false)
+}
+
+// logDeliverySnapshotDisk is logDeliverySnapshot with an explicit choice of
+// whether the outbox ledger may be read. Only the periodic ticker passes
+// readDisk=true; every inline caller (Start, Stop, export-failure and
+// degraded paths) passes false, so none of them ever waits on the outbox
+// flock. The ledger read happens before diagnosticMu is taken, so an inline
+// snapshot never waits behind a periodic ledger read either.
+func (p *Pipeline) logDeliverySnapshotDisk(force, readDisk bool) {
+	if p == nil {
+		return
+	}
+	var analytics string
+	if readDisk {
+		// Rate-limit check first, so a skipped tick does no ledger read.
+		p.diagnosticMu.Lock()
+		limited := !force && time.Since(p.diagnosticLast) < diagnosticSnapshotInterval
+		p.diagnosticMu.Unlock()
+		if limited {
+			return
+		}
+		analytics = p.analyticsSnapshotLine(true) // outside diagnosticMu
+	}
+	p.diagnosticMu.Lock()
+	defer p.diagnosticMu.Unlock()
+	if !force && time.Since(p.diagnosticLast) < diagnosticSnapshotInterval {
+		return
+	}
+	p.diagnosticLast = time.Now()
+	if !readDisk {
+		analytics = p.analyticsSnapshotLine(false)
+	}
+	depth := p.QueueDepth()
+	diagnostics := p.Diagnostics()
+	log.Info("Telemetry delivery snapshot state=%s queue_bytes=%d queue_records=%d queue_entries=%d spans=%+v metrics=%+v logs=%+v usage=%+v analytics=%s metric_reject_reasons=%s",
+		p.DeliveryState(), depth.Bytes, depth.Records, depth.Entries,
+		diagnostics["spans"], diagnostics["metrics"], diagnostics["logs"],
+		p.UsageDiagnostics(), analytics, p.metricRejectReasons(metricRejectReasonLimit))
+}
+
+// analyticsSnapshotLine formats the analytics part of the snapshot line:
+// the in-memory counters always, and the ledger only when readDisk.
+func (p *Pipeline) analyticsSnapshotLine(readDisk bool) string {
+	h := &p.health
+	h.mu.Lock()
+	handles := h.analyticsHandles
+	h.mu.Unlock()
+	if !handles.enabled() {
+		if handles.disabledReason != "" {
+			return "disabled(" + handles.disabledReason + ")"
+		}
+		return "disabled"
+	}
+	mem := handles.memory()
+	if !readDisk {
+		return fmt.Sprintf("%+v disk=not_read", mem)
+	}
+	c := handles.counters(time.Now())
+	if c.StatsFailed {
+		return fmt.Sprintf("%+v disk=unknown(stats_failed)", mem)
+	}
+	age := "none"
+	if c.OldestPendingFileAgeMs != nil {
+		age = fmt.Sprintf("%d", *c.OldestPendingFileAgeMs)
+	}
+	return fmt.Sprintf("%+v disk={Epoch:%s LastSeq:%d PendingBytes:%d RetainedBytes:%d Held:%v OverflowTotal:%d OversizeTotal:%d AppendFailedTotal:%d DeadLettersTotal:%d SyncUncertainTotal:%d CommitDeferredTotal:%d OldestPendingFileAgeMs:%s}",
+		mem, c.ProducerEpoch, c.ProducerSeqLast, c.PendingBytes, c.RetainedBytes, c.Held, c.OverflowTotal, c.OversizeTotal,
+		c.AppendFailedTotal, c.DeadLettersTotal, c.SyncUncertainTotal, c.CommitDeferredTotal, age)
+}
+
+func (p *Pipeline) markDeliveryDegraded() {
+	if p == nil {
+		return
+	}
+	previous := p.deliveryState.Swap("degraded")
+	// Inline on export-failure paths: never reads the outbox ledger.
+	p.logDeliverySnapshotDisk(previous != "degraded", false)
+}
+
+func (p *Pipeline) startDiagnosticSnapshots(ctx context.Context) {
+	localCtx, cancel := context.WithCancel(ctx)
+	p.diagnosticCancel = cancel
+	p.diagnosticDone = make(chan struct{})
+	go func() {
+		defer close(p.diagnosticDone)
+		ticker := time.NewTicker(diagnosticSnapshotInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-localCtx.Done():
+				return
+			case <-ticker.C:
+				p.logDeliverySnapshotDisk(false, true) // the only ledger reader
+			}
+		}
+	}()
+}

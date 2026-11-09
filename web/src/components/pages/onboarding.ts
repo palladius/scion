@@ -17,26 +17,74 @@
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 
+import {
+  TestHubBannerController,
+  renderTestHubBanner,
+  standaloneTestHubBannerStyles,
+  testHubBannerStyles,
+} from '../shared/test-hub-banner.js';
+
 import { apiFetch, extractApiError } from '../../client/api.js';
+import { dispatchMembershipChanged } from '../../utils/membership-events.js';
+import { loadPage } from '../../client/navigation.js';
 import type { HarnessConfig } from '../../shared/types.js';
 import '../shared/dir-browser.js';
 
 const ONBOARDING_STATUS_KEY = 'onboardingStatus';
 const TOTAL_STEPS = 6;
 
+/**
+ * Shown when the server has no embedded runtime broker. A workstation server
+ * started without an image registry skips its broker, and the broker cannot
+ * start in place once the registry is saved, so the fix is a restart.
+ */
+export const BROKER_RESTART_HINT = "Run 'scion server restart' to start the broker.";
+
 interface OnboardingStatus {
   initialized: boolean;
   identitySet: boolean;
   runtimeOK: boolean;
   harnessesSeeded: boolean;
-  imagesPresent: boolean;
   hasWorkspace: boolean;
   complete: boolean;
+  embeddedBrokerID?: string;
   imageRegistry?: string;
+  /** Layer imageRegistry comes from: node_env, hub_db, file or default. */
+  imageRegistrySource?: string;
+  /** The value the wizard may pre-fill and save; never a node env. */
+  imageRegistrySaveable?: string;
   gitVersion?: string;
   gitVersionOK?: boolean;
   gcloudADCAvailable?: boolean;
   autoInjectGcloudADC?: boolean;
+}
+
+/** Default registry suggested when nothing is configured. */
+const DEFAULT_REGISTRY_SUGGESTION = 'ghcr.io/homebrew-scion';
+
+/**
+ * How the registry step starts from the server's setup status
+ * (ptone/scion#3916): `effective` is the registry the hub resolves, `input`
+ * pre-fills the field and is what a save stores, and `fromNodeEnv` is true
+ * when SCION_IMAGE_REGISTRY on the server sets it, in which case nothing
+ * needs saving. The field never pre-fills a node env value, so a save
+ * cannot copy one server's environment into the shared setting. A hub that
+ * does not report the saveable value falls back to `imageRegistry`.
+ */
+export function registryPrefill(
+  status: Pick<
+    OnboardingStatus,
+    'imageRegistry' | 'imageRegistrySource' | 'imageRegistrySaveable'
+  > | null
+): { effective: string; input: string; fromNodeEnv: boolean } {
+  const effective = status?.imageRegistry ?? '';
+  const reportsSaveable = status?.imageRegistrySource !== undefined;
+  const saveable = reportsSaveable ? (status?.imageRegistrySaveable ?? '') : effective;
+  return {
+    effective,
+    input: saveable || DEFAULT_REGISTRY_SUGGESTION,
+    fromNodeEnv: status?.imageRegistrySource === 'node_env',
+  };
 }
 
 interface DiagnosticResult {
@@ -62,6 +110,8 @@ export class ScionPageOnboarding extends LitElement {
   @state() private currentStep = 0;
   @state() private loading = true;
   @state() private stepLoading = false;
+  /** The last harness config list request failed; the step offers a retry. */
+  @state() private harnessLoadFailed = false;
   @state() private error: string | null = null;
 
   // Step 0: Identity
@@ -84,7 +134,11 @@ export class ScionPageOnboarding extends LitElement {
   // Step 3: Registry
   @state() private imageRegistry = '';
   @state() private registryInput = '';
+  /** The server's SCION_IMAGE_REGISTRY sets the registry; no save needed. */
+  @state() private registryFromNodeEnv = false;
   @state() private registrySaving = false;
+  /** Set after a registry save when the server reports no embedded broker. */
+  @state() private brokerRestartNeeded = false;
 
   // Step 4: Harnesses + Images (merged)
   @state() private harnessConfigs: HarnessConfig[] = [];
@@ -121,7 +175,13 @@ export class ScionPageOnboarding extends LitElement {
   @state() private wsCreating = false;
   @state() private wsEmbeddedBrokerID = '';
 
+  /** The test-hub banner's status (shared/test-hub-banner.ts). */
+  private _testHubBanner = new TestHubBannerController(this, { standalone: true });
+
   static override styles = css`
+    ${testHubBannerStyles}
+    ${standaloneTestHubBannerStyles}
+
     :host {
       display: flex;
       align-items: center;
@@ -522,12 +582,10 @@ export class ScionPageOnboarding extends LitElement {
         }
       }
 
-      if (status?.imageRegistry) {
-        this.imageRegistry = status.imageRegistry;
-        this.registryInput = status.imageRegistry;
-      } else {
-        this.registryInput = 'ghcr.io/homebrew-scion';
-      }
+      const prefill = registryPrefill(status ?? null);
+      this.imageRegistry = prefill.effective;
+      this.registryInput = prefill.input;
+      this.registryFromNodeEnv = prefill.fromNodeEnv;
       if (status?.gitVersion !== undefined) this.gitVersion = status.gitVersion;
       if (status?.gitVersionOK !== undefined) this.gitVersionOK = status.gitVersionOK;
       if (status?.gcloudADCAvailable) this.gcloudADCAvailable = true;
@@ -542,6 +600,9 @@ export class ScionPageOnboarding extends LitElement {
         if (status.harnessesSeeded && this.currentStep <= 3)
           this.currentStep = Math.max(this.currentStep, 4);
       }
+      // A resume that lands on the harness step loads its list like every
+      // other way into the step.
+      if (this.currentStep === 4) await this.enterHarnessStep();
 
       // Prefill identity from current user
       try {
@@ -562,6 +623,7 @@ export class ScionPageOnboarding extends LitElement {
   override render() {
     if (this.loading) {
       return html`
+        ${renderTestHubBanner(this._testHubBanner.status)}
         <div class="wizard">
           <div class="loading-state">
             <sl-spinner></sl-spinner>
@@ -572,6 +634,7 @@ export class ScionPageOnboarding extends LitElement {
     }
 
     return html`
+      ${renderTestHubBanner(this._testHubBanner.status)}
       <div class="wizard">
         ${this.currentStep < TOTAL_STEPS
           ? html`
@@ -585,6 +648,11 @@ export class ScionPageOnboarding extends LitElement {
           : nothing}
         ${this.error ? html`<div class="error-banner">${this.error}</div>` : nothing}
         ${this.dnsWarning ? html`<div class="warning-banner">${this.dnsWarning}</div>` : nothing}
+        ${this.brokerRestartNeeded
+          ? html`<div class="warning-banner">
+              The runtime broker is not running. ${BROKER_RESTART_HINT}
+            </div>`
+          : nothing}
         ${this.renderStep()}
       </div>
     `;
@@ -712,7 +780,7 @@ export class ScionPageOnboarding extends LitElement {
                       <span class="pill warn">warn</span>
                       <span class="name">Git version</span>
                       <span class="message">
-                        Git 2.47+ is required for agent worktrees. Detected: ${this.gitVersion}. Run
+                        Git 2.48+ is required for agent worktrees. Detected: ${this.gitVersion}. Run
                         <code>brew install git</code> to upgrade.
                       </span>
                     </div>
@@ -900,6 +968,9 @@ export class ScionPageOnboarding extends LitElement {
   // ── Step 3: Registry ──
 
   private renderRegistry() {
+    if (this.registryFromNodeEnv) {
+      return this.renderRegistryFromNodeEnv();
+    }
     return html`
       <h2>Image Registry</h2>
       <p>
@@ -932,8 +1003,7 @@ export class ScionPageOnboarding extends LitElement {
           <sl-button
             variant="default"
             @click=${() => {
-              this.currentStep = 4;
-              void this.loadHarnessConfigs();
+              void this.enterHarnessStep();
             }}
             >Skip for now</sl-button
           >
@@ -949,11 +1019,40 @@ export class ScionPageOnboarding extends LitElement {
     `;
   }
 
+  /** The registry step when SCION_IMAGE_REGISTRY on the server sets it. */
+  private renderRegistryFromNodeEnv() {
+    return html`
+      <h2>Image Registry</h2>
+      <p>
+        The server's <code>SCION_IMAGE_REGISTRY</code> environment variable sets the registry:
+        <code>${this.imageRegistry}</code>. It overrides any saved value on this server, so nothing
+        needs to be saved here.
+      </p>
+      <div class="footer">
+        <sl-button
+          variant="text"
+          @click=${() => {
+            this.currentStep = 2;
+          }}
+          >Back</sl-button
+        >
+        <div class="footer-right">
+          <sl-button
+            variant="primary"
+            @click=${() => {
+              void this.enterHarnessStep();
+            }}
+            >Next</sl-button
+          >
+        </div>
+      </div>
+    `;
+  }
+
   private async handleSaveRegistryAndNext(): Promise<void> {
     await this.handleSaveRegistry();
     if (!this.error) {
-      this.currentStep = 4;
-      void this.loadHarnessConfigs();
+      void this.enterHarnessStep();
     }
   }
 
@@ -989,6 +1088,19 @@ export class ScionPageOnboarding extends LitElement {
                     <sl-progress-bar
                       value=${Math.round((this.pullIndex / this.pullTotal) * 100)}
                     ></sl-progress-bar>
+                  </div>
+                `
+              : nothing}
+            ${this.harnessLoadFailed
+              ? html`
+                  <div style="margin-bottom:1rem;">
+                    <sl-button
+                      variant="default"
+                      size="small"
+                      class="harness-load-retry"
+                      @click=${() => void this.loadHarnessConfigs()}
+                      >Retry</sl-button
+                    >
                   </div>
                 `
               : nothing}
@@ -1126,9 +1238,19 @@ export class ScionPageOnboarding extends LitElement {
     `;
   }
 
+  /**
+   * Shows the harness step and loads the hub's harness configs it lists.
+   * Every way into the step goes through here, including a resume.
+   */
+  private enterHarnessStep(): Promise<void> {
+    this.currentStep = 4;
+    return this.loadHarnessConfigs();
+  }
+
   private async loadHarnessConfigs(): Promise<void> {
     this.stepLoading = true;
     this.error = null;
+    this.harnessLoadFailed = false;
     try {
       const res = await apiFetch('/api/v1/harness-configs?scope=global&status=active');
       if (res.ok) {
@@ -1144,9 +1266,14 @@ export class ScionPageOnboarding extends LitElement {
           this.selectedHarnesses = preselected;
         }
         void this.checkStaleImageStatuses();
+      } else {
+        this.harnessLoadFailed = true;
+        const message = await extractApiError(res, 'Failed to load harness configurations');
+        this.error = `${message} (HTTP ${res.status}). Retry, or check the server log.`;
       }
     } catch {
-      this.error = 'Failed to load harness configurations.';
+      this.harnessLoadFailed = true;
+      this.error = 'Failed to load harness configurations. Retry, or check the server log.';
     } finally {
       this.stepLoading = false;
     }
@@ -1213,15 +1340,26 @@ export class ScionPageOnboarding extends LitElement {
         this.error = await extractApiError(res, 'Failed to initialize harnesses');
         return;
       }
-      // Save gcloud ADC injection preference if the option was shown
+      // Save gcloud ADC injection preference if the option was shown.
+      // auto_inject_gcloud_adc is a file-only workstation setting, so it goes
+      // through the workstation-settings endpoint, which writes settings.yaml
+      // on every DB driver. The admin server-config PUT is DB-backed whenever
+      // the hub has operational settings and has no home for this key.
       if (this.gcloudADCAvailable) {
-        await apiFetch('/api/v1/admin/server-config', {
-          method: 'PUT',
+        const adcRes = await apiFetch('/api/v1/system/workstation-settings', {
+          method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             auto_inject_gcloud_adc: this.autoInjectGcloudADC,
           }),
         });
+        if (!adcRes.ok) {
+          this.error = await extractApiError(
+            adcRes,
+            'Failed to save the gcloud credentials preference'
+          );
+          return;
+        }
       }
       this.cleanupImageEvents();
       this.currentStep = 5;
@@ -1295,7 +1433,7 @@ export class ScionPageOnboarding extends LitElement {
     es.addEventListener('update', (event: Event) => {
       lastEventTime = Date.now();
       try {
-        const wrapper = JSON.parse((event as MessageEvent).data) as {
+        const wrapper = JSON.parse((event as MessageEvent<string>).data) as {
           subject: string;
           data?: Record<string, unknown>;
         };
@@ -1311,8 +1449,8 @@ export class ScionPageOnboarding extends LitElement {
             typeof d['index'] === 'number' &&
             typeof d['total'] === 'number'
           ) {
-            this.pullIndex = d['index'] as number;
-            this.pullTotal = d['total'] as number;
+            this.pullIndex = d['index'];
+            this.pullTotal = d['total'];
           }
 
           if (status === 'done' || status === 'exists' || status === 'error') {
@@ -1379,10 +1517,42 @@ export class ScionPageOnboarding extends LitElement {
         return;
       }
       this.imageRegistry = this.registryInput.trim();
+      await this.checkBrokerAfterRegistrySave();
     } catch {
       this.error = 'Failed to connect to the server.';
     } finally {
       this.registrySaving = false;
+    }
+  }
+
+  /**
+   * After the registry is saved, ask the server whether its embedded broker is
+   * running. A workstation server started without a registry has none, and
+   * needs a restart to start it. A failed status read leaves the hint unset.
+   */
+  private async checkBrokerAfterRegistrySave(): Promise<void> {
+    const brokerID = await this.fetchEmbeddedBrokerID();
+    if (brokerID === null) return;
+    if (brokerID) {
+      this.wsEmbeddedBrokerID = brokerID;
+      this.brokerRestartNeeded = false;
+    } else {
+      this.brokerRestartNeeded = true;
+    }
+  }
+
+  /**
+   * Reads the server's embedded broker ID from the system status: '' when the
+   * server has no embedded broker, null when the status could not be read.
+   */
+  private async fetchEmbeddedBrokerID(): Promise<string | null> {
+    try {
+      const res = await apiFetch('/api/v1/system/status');
+      if (!res.ok) return null;
+      const data = (await res.json()) as OnboardingStatus;
+      return data.embeddedBrokerID ?? '';
+    } catch {
+      return null;
     }
   }
 
@@ -1417,7 +1587,7 @@ export class ScionPageOnboarding extends LitElement {
         <div
           class="ws-card"
           @click=${() => {
-            window.location.href = '/projects/new';
+            loadPage('/projects/new');
           }}
         >
           <sl-icon name="git"></sl-icon>
@@ -1449,7 +1619,7 @@ export class ScionPageOnboarding extends LitElement {
         <sl-button
           variant="text"
           @click=${() => {
-            this.currentStep = 4;
+            void this.enterHarnessStep();
           }}
           >Back</sl-button
         >
@@ -1517,11 +1687,20 @@ export class ScionPageOnboarding extends LitElement {
       const res = await apiFetch('/api/v1/projects', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: this.wsProjectName.trim(), visibility: 'private' }),
+        body: JSON.stringify({ name: this.wsProjectName.trim() }),
       });
       if (!res.ok) {
         this.error = await extractApiError(res, 'Failed to create project');
         return;
+      }
+      const data = (await res.json().catch(() => null)) as {
+        project?: { id: string };
+        id?: string;
+      } | null;
+      const projectId = data?.project?.id || data?.id;
+      // A 200 names a project that already existed; only a new one changes membership.
+      if (projectId && res.status !== 200) {
+        dispatchMembershipChanged({ kind: 'project', id: projectId });
       }
       this.currentStep = 6;
     } catch {
@@ -1636,14 +1815,8 @@ export class ScionPageOnboarding extends LitElement {
 
   private async loadWsBrokerID(): Promise<void> {
     if (this.wsEmbeddedBrokerID) return;
-    try {
-      const res = await apiFetch('/api/v1/system/status');
-      if (!res.ok) return;
-      const data = (await res.json()) as { embeddedBrokerID?: string };
-      if (data.embeddedBrokerID) this.wsEmbeddedBrokerID = data.embeddedBrokerID;
-    } catch {
-      /* ignore */
-    }
+    const brokerID = await this.fetchEmbeddedBrokerID();
+    if (brokerID) this.wsEmbeddedBrokerID = brokerID;
   }
 
   private async wsValidatePath(path: string): Promise<void> {
@@ -1666,7 +1839,7 @@ export class ScionPageOnboarding extends LitElement {
 
   private async handleWsLinkedCreate(): Promise<void> {
     if (!this.wsEmbeddedBrokerID) {
-      this.error = 'No embedded broker available.';
+      this.error = `No embedded broker available. ${BROKER_RESTART_HINT}`;
       return;
     }
     this.error = null;
@@ -1675,7 +1848,7 @@ export class ScionPageOnboarding extends LitElement {
       const projRes = await apiFetch('/api/v1/projects', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: this.wsProjectName.trim(), visibility: 'private' }),
+        body: JSON.stringify({ name: this.wsProjectName.trim() }),
       });
       if (!projRes.ok) {
         this.error = await extractApiError(projRes, 'Failed to create project');
@@ -1687,6 +1860,9 @@ export class ScionPageOnboarding extends LitElement {
         this.error = 'No project ID in response';
         return;
       }
+      // A new project exists from here, even if linking the directory fails.
+      // A 200 names a project that already existed.
+      if (projRes.status !== 200) dispatchMembershipChanged({ kind: 'project', id: projectId });
 
       const provRes = await apiFetch(`/api/v1/projects/${projectId}/providers`, {
         method: 'POST',
@@ -1727,7 +1903,7 @@ export class ScionPageOnboarding extends LitElement {
           variant="primary"
           size="large"
           @click=${() => {
-            window.location.href = '/';
+            loadPage('/');
           }}
         >
           Go to Dashboard

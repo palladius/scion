@@ -165,16 +165,20 @@ func TestHandleGitHubAppInstallations_ValidationErrors(t *testing.T) {
 	rec := doRequest(t, srv, http.MethodPost, "/api/v1/github-app/installations", map[string]interface{}{
 		"account_login": "acme",
 	})
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for missing installation_id, got %d", rec.Code)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("expected 422 for missing installation_id, got %d", rec.Code)
+	} else if e := settingsErrorEntries(t, rec); e[0].Field != "installation_id" {
+		t.Errorf("field = %q, want installation_id", e[0].Field)
 	}
 
 	// Missing account_login
 	rec = doRequest(t, srv, http.MethodPost, "/api/v1/github-app/installations", map[string]interface{}{
 		"installation_id": 123,
 	})
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for missing account_login, got %d", rec.Code)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Errorf("expected 422 for missing account_login, got %d", rec.Code)
+	} else if e := settingsErrorEntries(t, rec); e[0].Field != "account_login" {
+		t.Errorf("field = %q, want account_login", e[0].Field)
 	}
 }
 
@@ -188,13 +192,12 @@ func TestHandleProjectGitHubInstallation(t *testing.T) {
 
 	// Create a project
 	project := &store.Project{
-		ID:         tid("project_gh_test"),
-		Slug:       "gh-test-project",
-		Name:       "GH Test Project",
-		GitRemote:  "https://github.com/acme/widgets",
-		Created:    time.Now(),
-		Updated:    time.Now(),
-		Visibility: "private",
+		ID:        tid("project_gh_test"),
+		Slug:      "gh-test-project",
+		Name:      "GH Test Project",
+		GitRemote: "https://github.com/acme/widgets",
+		Created:   time.Now(),
+		Updated:   time.Now(),
 	}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
@@ -261,8 +264,7 @@ func TestHandleProjectGitHubStatus_PostNoInstallation(t *testing.T) {
 	project := &store.Project{
 		ID: tid("project_gh_status_check"), Slug: "gh-status-check", Name: "GH Status Check",
 		GitRemote: "https://github.com/acme/widgets",
-		Created:   time.Now(), Updated: time.Now(), Visibility: "private",
-	}
+		Created:   time.Now(), Updated: time.Now()}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
 	}
@@ -294,8 +296,7 @@ func TestHandleProjectGitHubStatus_PostWithInstallation(t *testing.T) {
 	project := &store.Project{
 		ID: tid("project_gh_status_check2"), Slug: "gh-status-check2", Name: "GH Status Check 2",
 		GitRemote: "https://github.com/acme/widgets",
-		Created:   time.Now(), Updated: time.Now(), Visibility: "private",
-	}
+		Created:   time.Now(), Updated: time.Now()}
 	project.GitHubInstallationID = &instID
 	project.GitHubAppStatus = &store.GitHubAppProjectStatus{
 		State:       store.GitHubAppStateUnchecked,
@@ -339,8 +340,7 @@ func TestHandleProjectGitHubInstallation_NotFoundInstallation(t *testing.T) {
 
 	project := &store.Project{
 		ID: tid("project_gh_notfound"), Slug: "gh-nf", Name: "GH NF",
-		Created: time.Now(), Updated: time.Now(), Visibility: "private",
-	}
+		Created: time.Now(), Updated: time.Now()}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
 	}
@@ -363,8 +363,7 @@ func TestHandleProjectGitHubPermissions(t *testing.T) {
 
 	project := &store.Project{
 		ID: tid("project_gh_perms"), Slug: "gh-perms", Name: "GH Perms",
-		Created: time.Now(), Updated: time.Now(), Visibility: "private",
-	}
+		Created: time.Now(), Updated: time.Now()}
 	if err := s.CreateProject(ctx, project); err != nil {
 		t.Fatalf("failed to create project: %v", err)
 	}

@@ -21,14 +21,24 @@
  */
 
 import { LitElement, html, css } from 'lit';
-import { customElement, property } from 'lit/decorators.js';
+import { customElement, property, state } from 'lit/decorators.js';
 
 import type { User } from '../../shared/types.js';
+import { loadAdminStatus } from '../../client/admin-status.js';
+import { ARTIFACTS_FLAG } from '../../client/artifacts-flag.js';
+import { isFeatureEnabled } from '../../utils/feature-flags.js';
+import {
+  type AdminStatus,
+  hasAnyPermission,
+  NAV_PERMISSION_MAP,
+} from '../../lib/admin-permissions.js';
 
 interface NavItem {
   path: string;
   label: string;
   icon: string;
+  /** Feature flag the item needs; the item is hidden while it is off. */
+  flag?: string;
 }
 
 interface NavSection {
@@ -51,30 +61,50 @@ const NAV_SECTIONS: NavSection[] = [
       { path: '/agents', label: 'Agents', icon: 'cpu' },
       { path: '/brokers', label: 'Brokers', icon: 'hdd-rack' },
       { path: '/skills', label: 'Skills', icon: 'lightning-charge' },
-      { path: '/metrics', label: 'Metrics', icon: 'graph-up' },
+      {
+        path: '/artifacts',
+        label: 'Artifacts',
+        icon: 'file-earmark-richtext',
+        flag: ARTIFACTS_FLAG,
+      },
     ],
   },
 ];
 
+/** The items whose feature flag, if any, is on. */
+function visibleItems(items: NavItem[]): NavItem[] {
+  return items.filter((item) => !item.flag || isFeatureEnabled(item.flag));
+}
+
 /**
- * Admin-only navigation section, shown at the bottom of the sidebar
+ * Admin nav items visible to both hub-admin and super-admin users.
+ * These cover scopeable resources that hub-admins can manage.
  */
-const ADMIN_SECTION: NavSection = {
-  title: 'Admin',
-  items: [
-    { path: '/settings', label: 'Hub Resources', icon: 'gear' },
-    { path: '/admin/server-config', label: 'Server Config', icon: 'sliders' },
-    { path: '/admin/federation', label: 'Federation', icon: 'globe' },
-    { path: '/admin/integrations', label: 'Integrations', icon: 'plug' },
-    { path: '/admin/scheduler', label: 'Scheduler', icon: 'clock' },
-    { path: '/admin/users', label: 'Users', icon: 'people' },
-    { path: '/admin/groups', label: 'Groups', icon: 'diagram-3' },
-    { path: '/admin/diagnostics', label: 'Diagnostics', icon: 'journal-text' },
-    { path: '/health', label: 'Health', icon: 'heart-pulse' },
-    { path: '/admin/maintenance', label: 'Maintenance', icon: 'wrench-adjustable' },
-    { path: '/admin/skill-registries', label: 'Skill Registries', icon: 'cloud-arrow-down' },
-  ],
-};
+const ADMIN_SCOPEABLE_ITEMS: NavItem[] = [
+  { path: '/settings', label: 'Hub Resources', icon: 'gear' },
+  { path: '/admin/server-config', label: 'Server Config', icon: 'sliders' },
+  { path: '/admin/federation', label: 'Federation', icon: 'globe' },
+  { path: '/admin/integrations', label: 'Integrations', icon: 'plug' },
+  { path: '/admin/scheduler', label: 'Scheduler', icon: 'clock' },
+  { path: '/admin/users', label: 'Users', icon: 'people' },
+  { path: '/admin/groups', label: 'Groups', icon: 'diagram-3' },
+  { path: '/admin/roles', label: 'Roles', icon: 'shield-lock' },
+  { path: '/admin/role-bindings', label: 'Role Bindings', icon: 'link-45deg' },
+  { path: '/admin/access-boundaries', label: 'Access Constraints', icon: 'shield-check' },
+  { path: '/admin/quotas', label: 'Quotas', icon: 'speedometer2' },
+  { path: '/health', label: 'Health', icon: 'heart-pulse' },
+  { path: '/metrics', label: 'Metrics', icon: 'graph-up' },
+  { path: '/admin/skill-registries', label: 'Skill Registries', icon: 'cloud-arrow-down' },
+];
+
+/**
+ * Admin nav items visible ONLY to super-admin users.
+ * These cover system-level operations that require full admin privileges.
+ */
+const ADMIN_SUPERADMIN_ITEMS: NavItem[] = [
+  { path: '/admin/diagnostics', label: 'Diagnostics', icon: 'journal-text' },
+  { path: '/admin/maintenance', label: 'Maintenance', icon: 'wrench-adjustable' },
+];
 
 @customElement('scion-nav')
 export class ScionNav extends LitElement {
@@ -101,6 +131,64 @@ export class ScionNav extends LitElement {
    */
   @property({ type: Boolean })
   hideCollapse = false;
+
+  /**
+   * The current user's admin status including per-resource permissions.
+   * null when there is no user or the status has not been loaded.
+   * The nav uses this to show only the admin items the user has permissions for.
+   */
+  @state()
+  private adminStatus: AdminStatus | null = null;
+
+  /** Tracks the user ID for which admin capabilities were last checked. */
+  private adminCheckUserId: string | null = null;
+
+  override updated(changedProperties: Map<PropertyKey, unknown>): void {
+    if (changedProperties.has('user')) {
+      void this.checkAdminCapabilities();
+    }
+  }
+
+  /**
+   * Load the current user's admin status from the dedicated admin-status
+   * endpoint, which returns hub-admin and super-admin flags plus the
+   * user's system-scoped permissions.
+   *
+   * Super-admin users are detected directly via `user.role === 'admin'`
+   * and skip the API call. For everyone else the permissions array alone
+   * decides which admin nav items are visible: isAdmin is true only for
+   * hub admins and super admins, while a member can hold permissions
+   * that open individual admin sections.
+   */
+  private async checkAdminCapabilities(): Promise<void> {
+    const userId = this.user?.id ?? null;
+
+    // Skip if we already checked for this user
+    if (userId === this.adminCheckUserId) return;
+    this.adminCheckUserId = userId;
+
+    // Super-admins always have admin capabilities — create an AdminStatus
+    // with isSuperAdmin: true so hasAnyPermission() short-circuits.
+    if (this.user?.role === 'admin') {
+      this.adminStatus = { isAdmin: true, isSuperAdmin: true, permissions: [] };
+      return;
+    }
+
+    // No user = no admin access
+    if (!this.user) {
+      this.adminStatus = null;
+      return;
+    }
+
+    // The admin-status permissions decide which admin items show for
+    // hub-admin and custom-role users. The request is shared with the
+    // other nav instance and the startup code (client/admin-status.ts).
+    const status = await loadAdminStatus(userId);
+    // Only apply the result if the user hasn't changed during the fetch.
+    if (this.adminCheckUserId === userId) {
+      this.adminStatus = status;
+    }
+  }
 
   static override styles = css`
     :host {
@@ -175,6 +263,7 @@ export class ScionNav extends LitElement {
       padding: 1rem 0.75rem;
       overflow-y: auto;
       overflow-x: hidden;
+      overscroll-behavior: contain;
     }
 
     .nav-section {
@@ -331,7 +420,7 @@ export class ScionNav extends LitElement {
   `;
 
   override render() {
-    const isAdmin = this.user?.role === 'admin';
+    const isSuperAdmin = this.user?.role === 'admin';
 
     return html`
       <div class="logo">
@@ -348,32 +437,16 @@ export class ScionNav extends LitElement {
             <div class="nav-section">
               <div class="nav-section-title">${section.title}</div>
               <ul class="nav-list">
-                ${section.items.map(
+                ${visibleItems(section.items).map(
                   (item) => html`
                     <li class="nav-item">
-                      <a
-                        href="${item.path}"
-                        class="nav-link ${this.isActive(item.path) ? 'active' : ''}"
-                        @click=${(e: Event) => this.handleNavClick(e, item.path)}
+                      <sl-tooltip
+                        style="display: block;"
+                        content="${item.label}"
+                        placement="right"
+                        ?disabled=${!this.collapsed}
+                        hoist
                       >
-                        <sl-icon name="${item.icon}"></sl-icon>
-                        <span class="nav-link-text">${item.label}</span>
-                      </a>
-                    </li>
-                  `
-                )}
-              </ul>
-            </div>
-          `
-        )}
-        ${isAdmin
-          ? html`
-              <div class="nav-section admin-section">
-                <div class="nav-section-title">${ADMIN_SECTION.title}</div>
-                <ul class="nav-list">
-                  ${ADMIN_SECTION.items.map(
-                    (item) => html`
-                      <li class="nav-item">
                         <a
                           href="${item.path}"
                           class="nav-link ${this.isActive(item.path) ? 'active' : ''}"
@@ -382,9 +455,75 @@ export class ScionNav extends LitElement {
                           <sl-icon name="${item.icon}"></sl-icon>
                           <span class="nav-link-text">${item.label}</span>
                         </a>
+                      </sl-tooltip>
+                    </li>
+                  `
+                )}
+              </ul>
+            </div>
+          `
+        )}
+        ${this.adminStatus &&
+        (isSuperAdmin ||
+          ADMIN_SCOPEABLE_ITEMS.some(
+            (item) =>
+              NAV_PERMISSION_MAP[item.path] &&
+              hasAnyPermission(this.adminStatus, NAV_PERMISSION_MAP[item.path])
+          ))
+          ? html`
+              <div class="nav-section admin-section">
+                <div class="nav-section-title">Admin</div>
+                <ul class="nav-list">
+                  ${ADMIN_SCOPEABLE_ITEMS.filter(
+                    (item) =>
+                      NAV_PERMISSION_MAP[item.path] &&
+                      hasAnyPermission(this.adminStatus, NAV_PERMISSION_MAP[item.path])
+                  ).map(
+                    (item) => html`
+                      <li class="nav-item">
+                        <sl-tooltip
+                          style="display: block;"
+                          content="${item.label}"
+                          placement="right"
+                          ?disabled=${!this.collapsed}
+                          hoist
+                        >
+                          <a
+                            href="${item.path}"
+                            class="nav-link ${this.isActive(item.path) ? 'active' : ''}"
+                            @click=${(e: Event) => this.handleNavClick(e, item.path)}
+                          >
+                            <sl-icon name="${item.icon}"></sl-icon>
+                            <span class="nav-link-text">${item.label}</span>
+                          </a>
+                        </sl-tooltip>
                       </li>
                     `
                   )}
+                  ${isSuperAdmin
+                    ? ADMIN_SUPERADMIN_ITEMS.map(
+                        (item) => html`
+                          <li class="nav-item">
+                            <sl-tooltip
+                              style="display: block;"
+                              content="${item.label}"
+                              placement="right"
+                              ?disabled=${!this.collapsed}
+                              hoist
+                            >
+                              <a
+                                href="${item.path}"
+                                class="nav-link ${this.isActive(item.path) ? 'active' : ''}"
+                                @click=${(e: Event) => this.handleNavClick(e, item.path)}
+                              >
+                                <sl-icon name="${item.icon}"></sl-icon>
+                                <span class="nav-link-text">${item.label}</span>
+                              </a>
+                            </sl-tooltip>
+                          </li>
+                        `
+                      )
+                    : ''}
                 </ul>
               </div>
             `

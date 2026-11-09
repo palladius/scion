@@ -17,57 +17,17 @@
 package hub
 
 import (
-	"bytes"
 	"encoding/json"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/go-jose/go-jose/v4/jwt"
 )
 
 // Helpers in this file are prefixed authzHelper to avoid colliding with the
 // fixtures other tests in package hub define.
-
-const (
-	authzHelperProjectA = "authz-project-a"
-	authzHelperProjectB = "authz-project-b"
-	authzHelperAgentID  = "authz-caller-agent"
-)
-
-// authzHelperCaptureLogs redirects the default slog logger into a buffer for the
-// duration of the test and returns the buffer. The denial log line is a
-// deliverable of #591, not decoration, so it is asserted on directly.
-func authzHelperCaptureLogs(t *testing.T) *bytes.Buffer {
-	t.Helper()
-	buf := &bytes.Buffer{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
-	return buf
-}
-
-// authzHelperDenialRecord returns the first "authorization denied" record in the
-// captured log output, or nil if there is none.
-func authzHelperDenialRecord(t *testing.T, buf *bytes.Buffer) map[string]any {
-	t.Helper()
-	for _, line := range strings.Split(buf.String(), "\n") {
-		if line == "" {
-			continue
-		}
-		var rec map[string]any
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			continue
-		}
-		if rec["msg"] == "authorization denied" {
-			return rec
-		}
-	}
-	return nil
-}
 
 // authzHelperRequest builds a request carrying the given identity. A nil
 // identity produces an unauthenticated request.
@@ -79,40 +39,13 @@ func authzHelperRequest(identity Identity) *http.Request {
 	return req
 }
 
-// authzHelperAgent builds an agent identity in the given project with the given scopes.
-func authzHelperAgent(projectID string, scopes ...AgentTokenScope) AgentIdentity {
-	return &agentIdentityWrapper{&AgentTokenClaims{
-		Claims:    jwt.Claims{Subject: authzHelperAgentID},
-		ProjectID: projectID,
-		Scopes:    scopes,
-	}}
-}
-
-func authzHelperAdmin() UserIdentity {
-	return NewAuthenticatedUser("authz-admin", "admin@test.com", "Admin", store.UserRoleAdmin, "api")
-}
-
-func authzHelperMember() UserIdentity {
-	return NewAuthenticatedUser("authz-member", "member@test.com", "Member", "member", "api")
-}
-
-// authzHelperTargetAgent is the agent acted upon in lifecycle tests.
-func authzHelperTargetAgent() *store.Agent {
-	return &store.Agent{
-		ID:        "authz-target-agent",
-		Name:      "target",
-		Slug:      "target",
-		ProjectID: authzHelperProjectA,
-		OwnerID:   "some-other-user",
-	}
-}
-
 // ---------------------------------------------------------------------------
 // authorize / authorizeMsg
 // ---------------------------------------------------------------------------
 
 func TestAuthorize_IdentityKinds(t *testing.T) {
-	srv, _ := testServer(t)
+	srv, s := testServer(t)
+	authzHelperSeedAdmin(t, s)
 
 	// An agent passes on ancestry: the caller agent is listed in the target
 	// resource's ancestor chain.
@@ -159,7 +92,7 @@ func TestAuthorize_IdentityKinds(t *testing.T) {
 		},
 		{
 			name:      "agent allowed by policy",
-			identity:  authzHelperAgent(authzHelperProjectA),
+			identity:  authzHelperAgent(authzHelperProjectA, ScopeAgentLifecycle),
 			resource:  allowedForAgent,
 			wantAllow: true,
 		},
@@ -236,8 +169,19 @@ func TestAuthorize_DenialIsLogged(t *testing.T) {
 }
 
 func TestAuthorize_NoDenialLogWhenAllowed(t *testing.T) {
-	srv, _ := testServer(t)
+	// authzHelperCaptureLogs must run before testServer: testServer's New()
+	// call binds the Server's subsystem loggers (logging.Subsystem) to
+	// whatever slog.Default() is at that moment, and that binding does not
+	// follow a later slog.SetDefault swap. Capturing afterward could leave
+	// logs written through a subsystem logger unobserved by buf.
 	buf := authzHelperCaptureLogs(t)
+	srv, s := testServer(t)
+	authzHelperSeedAdmin(t, s)
+
+	// Positive control: New() unconditionally logs during construction, so
+	// the capture must have observed something. This guards against a
+	// misrouted capture making the "no denial" check below pass vacuously.
+	requireLogCaptureLive(t, buf, serverConstructionLogLine)
 
 	rec := httptest.NewRecorder()
 	if !srv.authorize(rec, authzHelperRequest(authzHelperAdmin()), Resource{Type: "agent", ID: "x"}, ActionRead) {
@@ -266,6 +210,195 @@ func TestAuthorizeMsg_DenialBodyCarriesMessage(t *testing.T) {
 	}
 }
 
+// TestAuthorize_StructuredDenialDetail asserts that the central authorization
+// path (authorizeWithMessage) returns structured denial detail in the error
+// envelope's details map, so the frontend can render a two-line toast.
+func TestAuthorize_StructuredDenialDetail(t *testing.T) {
+	srv, _ := testServer(t)
+
+	resource := Resource{
+		Type:       "agent",
+		ID:         "secret-id-that-must-not-leak",
+		ParentType: "project",
+		ParentID:   authzHelperProjectA,
+	}
+
+	rec := httptest.NewRecorder()
+	req := authzHelperRequest(authzHelperMember())
+	if srv.authorize(rec, req, resource, ActionDelete) {
+		t.Fatal("expected denial")
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+
+	var resp ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("cannot parse 403 body: %v", err)
+	}
+	// Verify structured details are present.
+	if resp.Error.Details == nil {
+		t.Fatal("expected error.details in 403 response, got nil")
+	}
+	if got, ok := resp.Error.Details["resource_type"]; !ok || got != "agent" {
+		t.Errorf("details.resource_type = %v, want %q", got, "agent")
+	}
+	if got, ok := resp.Error.Details["denied_action"]; !ok || got != string(ActionDelete) {
+		t.Errorf("details.denied_action = %v, want %q", got, string(ActionDelete))
+	}
+	// The resource ID must NOT appear in the response body (redaction).
+	if strings.Contains(rec.Body.String(), "secret-id-that-must-not-leak") {
+		t.Error("resource ID leaked in 403 response body")
+	}
+}
+
+// TestAuthorize_StructuredDenialWithMessage verifies that authorizeMsg also
+// carries structured details alongside the custom message.
+func TestAuthorize_StructuredDenialWithMessage(t *testing.T) {
+	srv, _ := testServer(t)
+
+	const msg = "Custom guidance for the user"
+	rec := httptest.NewRecorder()
+	req := authzHelperRequest(authzHelperMember())
+	if srv.authorizeMsg(rec, req, Resource{Type: "project", ID: "p-1"}, ActionManage, msg) {
+		t.Fatal("expected denial")
+	}
+
+	var resp ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("cannot parse 403 body: %v", err)
+	}
+	if resp.Error.Message != msg {
+		t.Errorf("error.message = %q, want %q", resp.Error.Message, msg)
+	}
+	if resp.Error.Details == nil {
+		t.Fatal("expected error.details in 403 response, got nil")
+	}
+	if got := resp.Error.Details["resource_type"]; got != "project" {
+		t.Errorf("details.resource_type = %v, want %q", got, "project")
+	}
+	if got := resp.Error.Details["denied_action"]; got != string(ActionManage) {
+		t.Errorf("details.denied_action = %v, want %q", got, string(ActionManage))
+	}
+}
+
+// TestWriteForbidden_LegacyNoDetails verifies that the original writeForbidden
+// (used by 40+ call sites) does NOT include structured details, ensuring
+// backward compatibility and graceful degradation on the frontend.
+func TestWriteForbidden_LegacyNoDetails(t *testing.T) {
+	// Empty message → generic Forbidden.
+	rec := httptest.NewRecorder()
+	writeForbidden(rec, "")
+	var resp ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("cannot parse body: %v", err)
+	}
+	if resp.Error.Details != nil {
+		t.Errorf("expected nil details for legacy writeForbidden, got %v", resp.Error.Details)
+	}
+
+	// Non-empty message → still no details.
+	rec = httptest.NewRecorder()
+	writeForbidden(rec, "custom msg")
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("cannot parse body: %v", err)
+	}
+	if resp.Error.Details != nil {
+		t.Errorf("expected nil details for legacy writeForbidden with message, got %v", resp.Error.Details)
+	}
+}
+
+// TestWriteForbiddenStructured_DetailShape verifies the shape and redaction
+// properties of writeForbiddenStructured.
+func TestWriteForbiddenStructured_DetailShape(t *testing.T) {
+	tests := []struct {
+		name         string
+		msg          string
+		resourceType string
+		action       Action
+		wantMessage  string
+		wantDetails  map[string]interface{}
+	}{
+		{
+			name:         "full detail",
+			msg:          "",
+			resourceType: "agent",
+			action:       ActionDelete,
+			wantMessage:  "Insufficient permissions",
+			wantDetails:  map[string]interface{}{"resource_type": "agent", "denied_action": "delete"},
+		},
+		{
+			name:         "custom message with detail",
+			msg:          "You cannot do this",
+			resourceType: "project",
+			action:       ActionManage,
+			wantMessage:  "You cannot do this",
+			wantDetails:  map[string]interface{}{"resource_type": "project", "denied_action": "manage"},
+		},
+		{
+			name:         "only resource type",
+			msg:          "",
+			resourceType: "secret",
+			action:       "",
+			wantMessage:  "Insufficient permissions",
+			wantDetails:  map[string]interface{}{"resource_type": "secret"},
+		},
+		{
+			name:         "only action",
+			msg:          "",
+			resourceType: "",
+			action:       ActionCreate,
+			wantMessage:  "Insufficient permissions",
+			wantDetails:  map[string]interface{}{"denied_action": "create"},
+		},
+		{
+			name:         "no detail at all",
+			msg:          "",
+			resourceType: "",
+			action:       "",
+			wantMessage:  "Insufficient permissions",
+			wantDetails:  nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			writeForbiddenStructured(rec, tc.msg, tc.resourceType, tc.action)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403", rec.Code)
+			}
+
+			var resp ErrorResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("cannot parse body: %v", err)
+			}
+			if resp.Error.Code != ErrCodeForbidden {
+				t.Errorf("code = %q, want %q", resp.Error.Code, ErrCodeForbidden)
+			}
+			if resp.Error.Message != tc.wantMessage {
+				t.Errorf("message = %q, want %q", resp.Error.Message, tc.wantMessage)
+			}
+
+			if tc.wantDetails == nil {
+				if resp.Error.Details != nil {
+					t.Errorf("expected nil details, got %v", resp.Error.Details)
+				}
+				return
+			}
+			if resp.Error.Details == nil {
+				t.Fatal("expected details, got nil")
+			}
+			for key, want := range tc.wantDetails {
+				if got := resp.Error.Details[key]; got != want {
+					t.Errorf("details[%q] = %v, want %v", key, got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestAuthorizeMsg_UnauthenticatedStillGets401(t *testing.T) {
 	srv, _ := testServer(t)
 
@@ -283,7 +416,8 @@ func TestAuthorizeMsg_UnauthenticatedStillGets401(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAuthorizeAgentCreate_IdentityKinds(t *testing.T) {
-	srv, _ := testServer(t)
+	srv, s := testServer(t)
+	authzHelperSeedAdmin(t, s)
 
 	tests := []struct {
 		name       string
@@ -310,9 +444,13 @@ func TestAuthorizeAgentCreate_IdentityKinds(t *testing.T) {
 			wantStatus: http.StatusForbidden,
 		},
 		{
-			name:      "agent with create scope in its own project",
-			identity:  authzHelperAgent(authzHelperProjectA, ScopeAgentCreate),
-			wantAllow: true,
+			// The identity names no stored agent, so it has no good
+			// standing (ptone/scion#3433) and the create is refused like
+			// any other chain refusal.
+			name:       "agent with create scope in its own project but no stored row",
+			identity:   authzHelperAgent(authzHelperProjectA, ScopeAgentCreate),
+			wantAllow:  false,
+			wantStatus: http.StatusForbidden,
 		},
 		{
 			name:       "agent with create scope in a different project",
@@ -365,6 +503,26 @@ func TestAuthorizeAgentCreate_IdentityKinds(t *testing.T) {
 			}
 		})
 	}
+
+	// The allow case for an agent identity: a stored agent whose root user
+	// is a member of its project (good standing, ptone/scion#3433), with
+	// create scope in its own project.
+	t.Run("agent with a stored row and standing, create scope in its own project", func(t *testing.T) {
+		f := newMSFixture(t, "authz-create-allow")
+		identity := &agentIdentityWrapper{&AgentTokenClaims{
+			Claims:    jwt.Claims{Subject: f.agentA.ID},
+			ProjectID: f.projectID,
+			Scopes:    []AgentTokenScope{ScopeAgentCreate},
+			Ancestry:  f.agentA.Ancestry,
+		}}
+		rec := httptest.NewRecorder()
+		if !f.srv.authorizeAgentCreate(rec, authzHelperRequest(identity), f.projectID) {
+			t.Fatalf("authorizeAgentCreate() = false, want true (body: %s)", rec.Body.String())
+		}
+		if rec.Body.Len() != 0 {
+			t.Errorf("expected no response body on allow, got %q", rec.Body.String())
+		}
+	})
 }
 
 func TestAuthorizeAgentCreate_DenialIsLogged(t *testing.T) {
@@ -391,7 +549,8 @@ func TestAuthorizeAgentCreate_DenialIsLogged(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestAuthorizeAgentLifecycle_IdentityKinds(t *testing.T) {
-	srv, _ := testServer(t)
+	srv, s := testServer(t)
+	authzHelperSeedAdmin(t, s)
 	target := authzHelperTargetAgent()
 
 	tests := []struct {
@@ -445,27 +604,29 @@ func TestAuthorizeAgentLifecycle_IdentityKinds(t *testing.T) {
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			rec := httptest.NewRecorder()
-			got := srv.authorizeAgentLifecycle(rec, authzHelperRequest(tc.identity), target)
+	for _, action := range []Action{ActionLifecycle, ActionAttach} {
+		for _, tc := range tests {
+			t.Run(string(action)+"/"+tc.name, func(t *testing.T) {
+				rec := httptest.NewRecorder()
+				got := srv.authorizeAgentLifecycle(rec, authzHelperRequest(tc.identity), target, action)
 
-			if got != tc.wantAllow {
-				t.Fatalf("authorizeAgentLifecycle() = %v, want %v (body: %s)", got, tc.wantAllow, rec.Body.String())
-			}
-			if tc.wantAllow {
-				if rec.Body.Len() != 0 {
-					t.Errorf("expected no response body on allow, got %q", rec.Body.String())
+				if got != tc.wantAllow {
+					t.Fatalf("authorizeAgentLifecycle() = %v, want %v (body: %s)", got, tc.wantAllow, rec.Body.String())
 				}
-				return
-			}
-			if rec.Code != tc.wantStatus {
-				t.Errorf("status = %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
-			}
-			if tc.wantBody != "" && !strings.Contains(rec.Body.String(), tc.wantBody) {
-				t.Errorf("body %q does not contain %q", rec.Body.String(), tc.wantBody)
-			}
-		})
+				if tc.wantAllow {
+					if rec.Body.Len() != 0 {
+						t.Errorf("expected no response body on allow, got %q", rec.Body.String())
+					}
+					return
+				}
+				if rec.Code != tc.wantStatus {
+					t.Errorf("status = %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+				}
+				if tc.wantBody != "" && !strings.Contains(rec.Body.String(), tc.wantBody) {
+					t.Errorf("body %q does not contain %q", rec.Body.String(), tc.wantBody)
+				}
+			})
+		}
 	}
 }
 
@@ -478,7 +639,7 @@ func TestAuthorizeAgentLifecycle_PeerWithinProject(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := authzHelperRequest(authzHelperAgent(authzHelperProjectA, ScopeAgentLifecycle))
-	if !srv.authorizeAgentLifecycle(rec, req, peer) {
+	if !srv.authorizeAgentLifecycle(rec, req, peer, ActionLifecycle) {
 		t.Fatalf("expected a scoped agent to reach a project peer, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
@@ -488,7 +649,7 @@ func TestAuthorizeAgentLifecycle_NilAgentDenied(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := authzHelperRequest(authzHelperAdmin())
-	if srv.authorizeAgentLifecycle(rec, req, nil) {
+	if srv.authorizeAgentLifecycle(rec, req, nil, ActionLifecycle) {
 		t.Fatal("expected a nil agent to be denied")
 	}
 	if rec.Code != http.StatusForbidden {
@@ -502,7 +663,7 @@ func TestAuthorizeAgentLifecycle_DenialIsLogged(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := authzHelperRequest(NewBrokerIdentity("authz-broker"))
-	if srv.authorizeAgentLifecycle(rec, req, authzHelperTargetAgent()) {
+	if srv.authorizeAgentLifecycle(rec, req, authzHelperTargetAgent(), ActionLifecycle) {
 		t.Fatal("expected a broker identity to be denied")
 	}
 
@@ -520,7 +681,18 @@ func TestAuthorizeAgentLifecycle_DenialIsLogged(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRequireAdmin_IdentityKinds(t *testing.T) {
+	// authzHelperCaptureLogs must run before testServer: testServer's New()
+	// call binds the Server's subsystem loggers (logging.Subsystem) to
+	// whatever slog.Default() is at that moment, and that binding does not
+	// follow a later slog.SetDefault swap. Capturing afterward could leave
+	// logs written through a subsystem logger unobserved by buf.
+	buf := authzHelperCaptureLogs(t)
 	srv, _ := testServer(t)
+
+	// Positive control: New() unconditionally logs during construction, so
+	// the capture must have observed something. This guards against a
+	// misrouted capture making the "no denial" checks below pass vacuously.
+	requireLogCaptureLive(t, buf, serverConstructionLogLine)
 
 	tests := []struct {
 		name       string
@@ -545,6 +717,10 @@ func TestRequireAdmin_IdentityKinds(t *testing.T) {
 			wantOK: false, wantStatus: http.StatusForbidden, wantPrincipalType: "user",
 		},
 		{
+			name: "federated admin user is forbidden", identity: NewFederatedUserIdentity("https://issuer.example", "admin", "admin@example.com", "Admin", "admin", nil),
+			wantOK: false, wantStatus: http.StatusForbidden, wantPrincipalType: "federated_user",
+		},
+		{
 			name: "dev-auth identity is treated as a user", identity: NewDevUser(DevUserConfig{Username: "dev"}),
 			wantOK: true,
 		},
@@ -567,7 +743,9 @@ func TestRequireAdmin_IdentityKinds(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := authzHelperCaptureLogs(t)
+			// The subtests run sequentially (none call t.Parallel), so a
+			// shared buffer reset at the start of each case is safe.
+			buf.Reset()
 			rec := httptest.NewRecorder()
 
 			_, ok := srv.requireAdmin(rec, authzHelperRequest(tc.identity))
@@ -641,136 +819,69 @@ func TestRequireAdmin_DenialReasons(t *testing.T) {
 	}
 }
 
-func TestRequireAdmin_ScopedAdminForbiddenAtAllRoleOnlyGates(t *testing.T) {
-	srv, _ := testServer(t)
-	scopedAdmin := NewScopedUserIdentity(authzHelperAdmin(), "project-1", []string{"project:read", "agent:manage"})
+// ---------------------------------------------------------------------------
+// authorizeRead
+// ---------------------------------------------------------------------------
+
+// TestAuthorizeRead_IdentityKinds mirrors TestAuthorize_IdentityKinds for
+// authorizeRead: nil identity is 401, and a denial is 404 rather than 403 so
+// a resource the caller may not read is indistinguishable from a nonexistent
+// one on the wire.
+func TestAuthorizeRead_IdentityKinds(t *testing.T) {
+	srv, s := testServer(t)
+	authzHelperSeedAdmin(t, s)
+
+	deniedResource := Resource{
+		Type:       "agent",
+		ID:         "authz-read-unrelated",
+		ParentType: "project",
+		ParentID:   authzHelperProjectA,
+	}
 
 	tests := []struct {
-		name    string
-		method  string
-		path    string
-		body    string
-		handler func(http.ResponseWriter, *http.Request)
+		name       string
+		identity   Identity
+		wantAllow  bool
+		wantStatus int
 	}{
-		{
-			name:    "policy collection list",
-			method:  http.MethodGet,
-			path:    "/api/v1/policies",
-			handler: srv.handlePolicies,
-		},
-		{
-			name:    "policy collection create",
-			method:  http.MethodPost,
-			path:    "/api/v1/policies",
-			body:    `{"name":"deny-uat","scopeType":"hub","actions":["read"],"effect":"allow"}`,
-			handler: srv.handlePolicies,
-		},
-		{
-			name:    "policy detail get",
-			method:  http.MethodGet,
-			path:    "/api/v1/policies/policy-1",
-			handler: srv.handlePolicyRoutes,
-		},
-		{
-			name:    "policy detail update",
-			method:  http.MethodPatch,
-			path:    "/api/v1/policies/policy-1",
-			body:    `{"name":"updated"}`,
-			handler: srv.handlePolicyRoutes,
-		},
-		{
-			name:    "policy detail delete",
-			method:  http.MethodDelete,
-			path:    "/api/v1/policies/policy-1",
-			handler: srv.handlePolicyRoutes,
-		},
-		{
-			name:    "policy bindings list",
-			method:  http.MethodGet,
-			path:    "/api/v1/policies/policy-1/bindings",
-			handler: srv.handlePolicyRoutes,
-		},
-		{
-			name:    "policy bindings create",
-			method:  http.MethodPost,
-			path:    "/api/v1/policies/policy-1/bindings",
-			body:    `{"principalType":"user","principalId":"user-1"}`,
-			handler: srv.handlePolicyRoutes,
-		},
-		{
-			name:    "policy binding delete",
-			method:  http.MethodDelete,
-			path:    "/api/v1/policies/policy-1/bindings/user/user-1",
-			handler: srv.handlePolicyRoutes,
-		},
-		{
-			name:    "skill registry list",
-			method:  http.MethodGet,
-			path:    "/api/v1/skill-registries",
-			handler: srv.handleSkillRegistries,
-		},
-		{
-			name:    "skill registry create",
-			method:  http.MethodPost,
-			path:    "/api/v1/skill-registries",
-			body:    `{"name":"reg","endpoint":"https://registry.example.com"}`,
-			handler: srv.handleSkillRegistries,
-		},
-		{
-			name:    "skill registry get",
-			method:  http.MethodGet,
-			path:    "/api/v1/skill-registries/reg",
-			handler: srv.handleSkillRegistryByID,
-		},
-		{
-			name:    "skill registry update",
-			method:  http.MethodPatch,
-			path:    "/api/v1/skill-registries/reg",
-			body:    `{"status":"disabled"}`,
-			handler: srv.handleSkillRegistryByID,
-		},
-		{
-			name:    "skill registry delete",
-			method:  http.MethodDelete,
-			path:    "/api/v1/skill-registries/reg",
-			handler: srv.handleSkillRegistryByID,
-		},
-		{
-			name:    "skill registry pin",
-			method:  http.MethodPost,
-			path:    "/api/v1/skill-registries/reg/pin",
-			body:    `{"uri":"skill://reg/core/test@1.0","hash":"sha256:abc123"}`,
-			handler: srv.handleSkillRegistryByID,
-		},
-		{
-			name:    "skill registry pins list",
-			method:  http.MethodGet,
-			path:    "/api/v1/skill-registries/reg/pins",
-			handler: srv.handleSkillRegistryByID,
-		},
-		{
-			name:    "skill registry unpin",
-			method:  http.MethodPost,
-			path:    "/api/v1/skill-registries/reg/unpin",
-			body:    `{"uri":"skill://reg/core/test@1.0"}`,
-			handler: srv.handleSkillRegistryByID,
-		},
+		{"nil identity is unauthenticated", nil, false, http.StatusUnauthorized},
+		{"user allowed by policy", authzHelperAdmin(), true, 0},
+		{"user denied by policy reads as 404", authzHelperMember(), false, http.StatusNotFound},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
-			if tc.body != "" {
-				req.Header.Set("Content-Type", "application/json")
+			got := srv.authorizeRead(rec, authzHelperRequest(tc.identity), deniedResource, "Thing")
+
+			if got != tc.wantAllow {
+				t.Fatalf("authorizeRead() = %v, want %v (body: %s)", got, tc.wantAllow, rec.Body.String())
 			}
-			req = req.WithContext(contextWithIdentity(req.Context(), scopedAdmin))
-
-			tc.handler(rec, req)
-
-			if rec.Code != http.StatusForbidden {
-				t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusForbidden, rec.Body.String())
+			if tc.wantAllow {
+				return
+			}
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
 			}
 		})
+	}
+}
+
+// TestAuthorizeRead_NilAuthzServiceFailsClosed is the ptone/scion#1936
+// gemini-review regression: a nil s.authzService must deny with a 404 (the
+// same shape as an ordinary denial), not panic with a nil pointer
+// dereference on the CheckAccess call.
+func TestAuthorizeRead_NilAuthzServiceFailsClosed(t *testing.T) {
+	srv, _ := testServer(t)
+	srv.authzService = nil
+
+	rec := httptest.NewRecorder()
+	got := srv.authorizeRead(rec, authzHelperRequest(authzHelperAdmin()), Resource{Type: "thing", ID: "x"}, "Thing")
+
+	if got {
+		t.Fatal("expected authorizeRead to deny when authzService is nil")
+	}
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d (body: %s)", rec.Code, http.StatusNotFound, rec.Body.String())
 	}
 }

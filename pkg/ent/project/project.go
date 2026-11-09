@@ -3,6 +3,7 @@
 package project
 
 import (
+	"fmt"
 	"time"
 
 	"entgo.io/ent/dialect/sql"
@@ -15,6 +16,10 @@ const (
 	Label = "project"
 	// FieldID holds the string denoting the id field in the database.
 	FieldID = "id"
+	// FieldFixtureRootID holds the string denoting the fixture_root_id field in the database.
+	FieldFixtureRootID = "fixture_root_id"
+	// FieldFixtureIssuerID holds the string denoting the fixture_issuer_id field in the database.
+	FieldFixtureIssuerID = "fixture_issuer_id"
 	// FieldName holds the string denoting the name field in the database.
 	FieldName = "name"
 	// FieldSlug holds the string denoting the slug field in the database.
@@ -37,8 +42,6 @@ const (
 	FieldCreatedBy = "created_by"
 	// FieldOwnerID holds the string denoting the owner_id field in the database.
 	FieldOwnerID = "owner_id"
-	// FieldVisibility holds the string denoting the visibility field in the database.
-	FieldVisibility = "visibility"
 	// FieldGithubInstallationID holds the string denoting the github_installation_id field in the database.
 	FieldGithubInstallationID = "github_installation_id"
 	// FieldGithubPermissions holds the string denoting the github_permissions field in the database.
@@ -47,6 +50,10 @@ const (
 	FieldGithubAppStatus = "github_app_status"
 	// FieldGitIdentity holds the string denoting the git_identity field in the database.
 	FieldGitIdentity = "git_identity"
+	// FieldCrossProjectInbound holds the string denoting the cross_project_inbound field in the database.
+	FieldCrossProjectInbound = "cross_project_inbound"
+	// FieldCrossProjectInboundRevision holds the string denoting the cross_project_inbound_revision field in the database.
+	FieldCrossProjectInboundRevision = "cross_project_inbound_revision"
 	// EdgeAgents holds the string denoting the agents edge name in mutations.
 	EdgeAgents = "agents"
 	// Table holds the table name of the project in the database.
@@ -63,6 +70,8 @@ const (
 // Columns holds all SQL columns for project fields.
 var Columns = []string{
 	FieldID,
+	FieldFixtureRootID,
+	FieldFixtureIssuerID,
 	FieldName,
 	FieldSlug,
 	FieldGitRemote,
@@ -74,11 +83,12 @@ var Columns = []string{
 	FieldUpdated,
 	FieldCreatedBy,
 	FieldOwnerID,
-	FieldVisibility,
 	FieldGithubInstallationID,
 	FieldGithubPermissions,
 	FieldGithubAppStatus,
 	FieldGitIdentity,
+	FieldCrossProjectInbound,
+	FieldCrossProjectInboundRevision,
 }
 
 // ValidColumn reports if the column name is valid (part of the table columns).
@@ -102,11 +112,38 @@ var (
 	DefaultUpdated func() time.Time
 	// UpdateDefaultUpdated holds the default value on update for the "updated" field.
 	UpdateDefaultUpdated func() time.Time
-	// DefaultVisibility holds the default value on creation for the "visibility" field.
-	DefaultVisibility string
+	// DefaultCrossProjectInboundRevision holds the default value on creation for the "cross_project_inbound_revision" field.
+	DefaultCrossProjectInboundRevision int64
 	// DefaultID holds the default value on creation for the "id" field.
 	DefaultID func() uuid.UUID
 )
+
+// CrossProjectInbound defines the type for the "cross_project_inbound" enum field.
+type CrossProjectInbound string
+
+// CrossProjectInboundNone is the default value of the CrossProjectInbound enum.
+const DefaultCrossProjectInbound = CrossProjectInboundNone
+
+// CrossProjectInbound values.
+const (
+	CrossProjectInboundNone    CrossProjectInbound = "none"
+	CrossProjectInboundMembers CrossProjectInbound = "members"
+	CrossProjectInboundAny     CrossProjectInbound = "any"
+)
+
+func (cpi CrossProjectInbound) String() string {
+	return string(cpi)
+}
+
+// CrossProjectInboundValidator is a validator for the "cross_project_inbound" field enum values. It is called by the builders before save.
+func CrossProjectInboundValidator(cpi CrossProjectInbound) error {
+	switch cpi {
+	case CrossProjectInboundNone, CrossProjectInboundMembers, CrossProjectInboundAny:
+		return nil
+	default:
+		return fmt.Errorf("project: invalid enum value for cross_project_inbound field: %q", cpi)
+	}
+}
 
 // OrderOption defines the ordering options for the Project queries.
 type OrderOption func(*sql.Selector)
@@ -114,6 +151,16 @@ type OrderOption func(*sql.Selector)
 // ByID orders the results by the id field.
 func ByID(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldID, opts...).ToFunc()
+}
+
+// ByFixtureRootID orders the results by the fixture_root_id field.
+func ByFixtureRootID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldFixtureRootID, opts...).ToFunc()
+}
+
+// ByFixtureIssuerID orders the results by the fixture_issuer_id field.
+func ByFixtureIssuerID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldFixtureIssuerID, opts...).ToFunc()
 }
 
 // ByName orders the results by the name field.
@@ -161,11 +208,6 @@ func ByOwnerID(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldOwnerID, opts...).ToFunc()
 }
 
-// ByVisibility orders the results by the visibility field.
-func ByVisibility(opts ...sql.OrderTermOption) OrderOption {
-	return sql.OrderByField(FieldVisibility, opts...).ToFunc()
-}
-
 // ByGithubInstallationID orders the results by the github_installation_id field.
 func ByGithubInstallationID(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldGithubInstallationID, opts...).ToFunc()
@@ -184,6 +226,16 @@ func ByGithubAppStatus(opts ...sql.OrderTermOption) OrderOption {
 // ByGitIdentity orders the results by the git_identity field.
 func ByGitIdentity(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldGitIdentity, opts...).ToFunc()
+}
+
+// ByCrossProjectInbound orders the results by the cross_project_inbound field.
+func ByCrossProjectInbound(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldCrossProjectInbound, opts...).ToFunc()
+}
+
+// ByCrossProjectInboundRevision orders the results by the cross_project_inbound_revision field.
+func ByCrossProjectInboundRevision(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldCrossProjectInboundRevision, opts...).ToFunc()
 }
 
 // ByAgentsCount orders the results by agents count.

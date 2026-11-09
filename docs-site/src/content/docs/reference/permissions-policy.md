@@ -1,20 +1,19 @@
 ---
-title: Policy & Permissions Reference
-description: Technical reference for the Scion policy language and permission system.
+title: Permissions & Access Constraints Reference
+description: Technical reference for the Scion role-binding and access constraint authorization architecture.
 ---
-
-:::caution[Draft Specification]
-The policy and permissions system described here is currently in **active design and development**. Interfaces and data structures are subject to change.
-:::
 
 ## Overview
 
-Scion employs a rigorous, claim-based access control system to secure the interactions between Agents, Users, and the Hub. This system goes beyond simple role-based access control (RBAC) by allowing policies to evaluate cryptographically signed claims embedded in an agent's identity token.
+Scion employs a rigorous, positive-authority authorization architecture with monotonic restrictions to secure interactions between agents, users, and the Hub. 
 
-This enables sophisticated security postures, such as:
-*   "An agent can only read secrets belonging to the user who created it."
-*   "Agents created from the `security-auditor` template have read-only access to the codebase."
-*   "Only agents running on trusted brokers can access production database credentials."
+The legacy YAML/JSON `Policy` and `PolicyBinding` resource paths have been fully removed. Instead, authorization is governed by two complementary constructs:
+1. **Positive Authority (RoleBindings)**: Additive grants that map a principal (user, group, or agent) to a `RoleDefinition` within a specific scope.
+2. **Monotonic Restrictions (AccessConstraints)**: Absolute maximum-permissions boundaries that can only reduce (never widen) the authority granted by positive RoleBindings.
+
+This architecture ensures a deterministic, fail-closed evaluation model, and includes robust safety features such as delegation protection and an offline maintenance recovery path.
+
+---
 
 ## Agent Identity
 
@@ -45,85 +44,136 @@ The agent identity token contains standard JWT claims alongside Scion-specific m
 
 Crucially, the identity token includes **provenance claims** that attest to the agent's origin. These claims are signed by the Hub and cannot be forged by the agent or the user.
 
-| Claim | Description | Usage in Policy |
+| Claim | Description | Usage in Evaluation |
 | :--- | :--- | :--- |
-| `creator_user_id` | The ID of the user who requested the agent's creation. | Restrict agent access to resources owned by the creator. |
-| `template_id` | The ID and version of the template used. | Enforce least-privilege based on the agent's role (e.g., QA vs. Dev). |
-| `project_id` | The project workspace the agent belongs to. | Isolate agents to their specific project scope. |
-| `broker_id` | The identity of the Runtime Broker executing the agent. | Restrict sensitive tasks to trusted hardware/locations. |
+| `creator_user_id` | The ID of the user who requested the agent's creation. | Restricts agent access to resources owned by the creator. |
+| `template_id` | The ID and version of the template used. | Restricts capabilities (e.g. baseline vs. full) based on template roles. |
+| `project_id` | The project workspace the agent belongs to. | Restricts agent operations to its specific project scope. |
+| `broker_id` | The identity of the Runtime Broker executing the agent. | Validates that execution occurs in a trusted environment. |
 
-## Policy Language
+---
 
-Scion policies are defined in JSON or YAML and are evaluated at the Hub whenever an API request is made. A policy binds a **Principal** (User or Agent) to a set of allowed **Actions** on a **Resource**, subject to **Conditions**.
+## RoleBindings (Positive Authority)
 
-### Policy Structure
+Access to any resource or operation in Scion must be explicitly authorized by a **RoleBinding**. RoleBindings are strictly positive-only grants; there are no explicit "deny" bindings.
 
-```yaml
-apiVersion: scion.dev/v1alpha1
-kind: Policy
-metadata:
-  name: "limit-auditor-agents"
-spec:
-  # The scope of the policy (e.g., global, project-specific)
-  scope: "project:12345"
-  
-  # Who is being regulated?
-  principal:
-    type: "agent"
-    match:
-      # Match agents created from the 'security-auditor' template
-      claims.template_id: "template:security-auditor:*"
+A `RoleBinding` contains the following fields:
 
-  # What are they allowed to do?
-  allow:
-    - action: "secret.read"
-      resource: "secret:prod-db-*"
-      condition:
-        # CEL (Common Expression Language) expression
-        expression: "request.auth.claims.creator_user_id == resource.owner"
+* **Role Definition ID**: The UUID of the `RoleDefinition` being granted. Role definitions contain specific permission IDs (e.g., `agent.create`, `project.read`). The built-in project membership roles are `project-owner`, `project-admin`, `project-member`, and `project-viewer` (`agent.list`, `agent.read`, `project.list`, `project.read`). At startup, any non-system custom role in `project` scope named `project-viewer` is renamed by appending `-custom-` and the first eight characters of its role ID, recording a `builtin_role_name_custom_role_renamed` mutation audit event. See [User Roles](/scion/hosted/ha/permissions/#user-roles) and [Chat posting](/scion/hosted/ha/permissions/#chat-posting).
+* **Principal Type**: The category of principal (`user`, `agent`, or `group`).
+* **Principal ID**: The identifier of the specific principal.
+* **Scope Type**: The scope bounds, either `system` (global permissions) or `project` (project-restricted permissions).
+* **Scope ID**: Empty for `system` scope, or the specific project ID for `project` scope.
+* **Activation Window (`not_before` / `expires_at`)**: Optional time bounds during which the binding is active. Outside its window a binding grants nothing, and membership checks (for example who counts as a project member for access and messaging) count only bindings inside their window. The project members list still shows bindings outside their window, so they can be managed. For a user principal, a binding (direct or via group membership) also grants authority only while the user's account is `active`; bindings held by an `invited` user take effect when the user signs in and the account becomes `active`, and bindings held by an `invited`, `suspended`, or removed user grant nothing.
+
+### Agent Synthetic RoleBindings
+At runtime, agents do not require static RoleBindings to be manually created. Instead, the authorization engine dynamically extracts the agent's JWT claims and scopes and constructs **synthetic project-scoped role bindings** so that agent actions can be evaluated through the unified authorization pipeline.
+
+---
+
+## AccessConstraints (Monotonic Restrictions)
+
+An **AccessConstraint** is the underlying database and API representation of a user-facing **Access Boundary**. It acts as a monotonic restriction defining a **maximum-permissions boundary** (permission ceiling). It can only reduce (never widen) the authority granted by positive RoleBindings.
+
+An `AccessConstraint` contains the following fields:
+
+* **Name**: A unique name per scope.
+* **Subject Kind**: Specifies who is constrained:
+  - `principal`: A single user, agent, or group. Requires setting `subject_principal_type` and `subject_principal_id`.
+  - `group_closure`: A group and all its nested subgroups. Requires setting `subject_group_id`.
+  - `all_principals`: Constrains every principal across the targeted scope.
+* **Scope Type / Scope ID**: Can be `system` (system-wide boundary) or `project` (restricting actions within a single project).
+* **Maximum Permissions**: A JSON array of permission IDs that targeted principals are allowed to hold. If a permission is not listed in this array, targeted principals **cannot** exercise it, regardless of their positive RoleBindings.
+* **Time Bounds (`not_before` / `expires_at`)**: Optional time window during which the constraint is active.
+* **Disabled**: A boolean flag (`true`/`false`) used to deactivate the constraint. This is primarily used for **offline recovery** in lockout scenarios.
+
+### Security Gates & Backend Subsystems
+
+The AccessConstraint system relies on several backend subsystems to ensure secure, correct, and high-performance operations:
+
+* **Canonical Evaluator**: Built into the core AK1 Kernel, the evaluator computes the intersection of active role permissions and monotonic ceilings at wire-speed on every request.
+* **Typed Constraint Model**: A strictly typed and schema-validated structural model. It validates all inputs before persistence, ensuring permission lists only refer to valid, registered permission IDs.
+* **Preview Engine & Provenance/Explain API**: An interactive dry-run service (`POST /api/v1/admin/access-constraint-previews`) that evaluates the effective permissions of a targeted principal. It provides high-fidelity **provenance/explain data** showcasing exactly which positive permissions are restricted by active boundaries, which rules caused the ceiling to apply, and what the final resolved permissions set is.
+* **Transactional Governance & Audit History**: To prevent partial policy writes or split-brain configurations, all updates are fully transaction-bound. Creating or updating a boundary writes its history entry in the same transaction as the change; the history is readable at `GET /api/v1/admin/access-constraints/{id}/audit` while the boundary exists, and the newest 1,000 entries are kept. Deleting a boundary deletes its history: the delete emits only a best-effort structured log event and has no persisted audit record.
+* **HTTP API and Error Contract**: Standardized REST endpoints govern AccessConstraints. The API features a strict error contract, validating payloads and returning detailed error diagnostics—such as `422 Unprocessable Entity` with a validation error matrix for invalid scopes or permissions, or `403 Forbidden` for delegation and access-denial scenarios.
+
+---
+
+## Authorization Evaluation Logic (AK1 Kernel)
+
+Whenever an API request is made, the Hub's `Decide` endpoint processes the authorization request using the **AK1 Kernel** to resolve the effective permissions:
+
+```
+[Principal Identity] ─► [Active RoleBindings] ─► [Positive Permission Set]
+                                                          │
+                                                (Calculate Intersection) ◄─── [AccessConstraints (Ceilings)]
+                                                          │
+                                                          ▼
+                                              [Effective Permissions]
 ```
 
-### Evaluation Logic
+1. **Authentication**: The caller is authenticated, establishing their principal type, principal ID, group memberships, and credentials (such as token type/scope).
+2. **Retrieve Positive Grants**: The engine retrieves all active, time-valid RoleBindings that apply to the principal directly, or to any groups they belong to (for a user principal, only when the user's account is `active`; a federated user with no account record is decided by its bindings alone).
+3. **Union Allowed Permissions**: The union of all permission IDs granted by these bindings forms the positive "allowed permissions" set.
+4. **Load Applicable AccessConstraints**: The engine queries all active, non-disabled AccessConstraints that match the principal (by principal ID, group closure, or `all_principals`) within the targeted scope.
+5. **Intersect Permissions**: The effective permission set is calculated as the intersection of the positive set and the maximum permitted ceilings.
+6. **Verdict**: If the requested permission is present in the final intersection set, access is **Allowed**. If it is missing from the positive set, or excluded by an active AccessConstraint, access is **Denied** (fail-closed).
 
-1.  **Authentication**: The request is validated. If the requester is an Agent, its JWT is verified and unpacked.
-2.  **Policy Matching**: The Hub retrieves all active policies relevant to the request's Scope (Global + Project).
-3.  **Condition Check**: For each matching policy, the `condition` expression is evaluated against the request context.
-4.  **Decision**:
-    *   **Deny Override**: If *any* matching policy explicitly denies the action, the request is rejected.
-    *   **Allow**: If at least one policy allows the action (and no denies exist), the request proceeds.
-    *   **Default Deny**: If no policies match, the request is rejected.
+---
 
-## Access Scenarios
+## Adding Permissions (Developer Conventions)
 
-### Scenario 1: User-Bound Secrets
+Permission IDs are defined in one registry, `pkg/hub/permissions/registry.go`. Follow these rules when you add a row or change an agent scope bundle:
 
-**Goal:** Allow an agent to access a secret only if the agent was created by the secret's owner.
+* **Every row is enforced or reserved.** A row must either record where code checks it (`Enforcement` for a route or handler check, `NonRouteUse` for any other consumer) or set `Reserved` to the reason nothing checks it yet. It cannot do both. To wire up a reserved permission:
+  1. Audit existing custom role definitions for the permission. The hub rejects reserved permissions when a custom role is created, updated, copied or imported, but roles created before the permission was reserved may still carry it. Once you un-reserve the row, those roles grant it.
+  2. Decide whether agent chains with no recorded delegation ceiling may hold it. While a row is reserved, such chains are denied it. If they must stay denied after you un-reserve it, cover it with a ceiling-optional agent scope or add it to `legacyChainExcludedPermissions` explicitly.
+  3. Add the check, clear `Reserved`, and record the check in `Enforcement`.
 
-**Policy:**
-```yaml
-principal: { type: "agent" }
-action: "secret.access"
-condition: "request.auth.claims.creator_user_id == resource.labels.owner_id"
+  Once `Reserved` is cleared, the permission goes back to super-admin automatically, because super-admin's role is built from every registry row that isn't reserved. Adding it to any other role, agent scope bundle or token scope list is a separate, deliberate change.
+* **Nothing grants a reserved permission.** Don't put a reserved permission in any role, agent scope bundle or token scope list. The hub leaves reserved permissions out of manage aliases and out of the scopes it offers when you create a token. The token scope for a reserved permission is still accepted, so existing tokens that carry it keep working. `TestPermissionRegistryRowsEnforcedOrReserved` fails a row that is neither enforced nor reserved, and fails any role, agent scope bundle, manage alias or token scope picker that carries a reserved permission.
+* **Point `Enforcement` at the real check.** If several permissions go through one shared function (for example, the artifact service's `Authorize`), that function alone doesn't show that a given permission is checked. Also name the call site that passes the permission. For artifact rows, `TestArtifactPermissionsConsumedUnlessReserved` requires each non-reserved row to be used in `pkg/artifacts` or `pkg/hub` (through its `pkg/artifacts` constant or its ID as a string), and each reserved row to be unused.
+* **New agent scopes in an existing bundle are ceiling-optional.** If you add a new agent scope to an existing agent role bundle (`ScopesForRole`), list it in `ceilingOptionalRoleScopes`. The exception is a scope already within the authority of the principal that creates the agent. A ceiling-optional scope never decides whether a role fits a creator's ceiling. A mint drops the scope when the source ceiling lacks its permission. This way, a token that fit a role before the scope was added still fits it.
+
+### Last constraint admin protection
+
+The Hub refuses to suspend or delete a user when that would leave a scope with no active user holding `access_constraint.admin`, now or once scheduled constraints activate. The refusal is `409` with code `constraint_admin_lockout`; grant the permission to another user first. Only active users count as constraint admins, so a suspended user never keeps a scope administrable. The same check refuses deleting or downgrading a role binding, and removing a project member or changing their role, when that would leave the scope with no active constraint admin (`409` `constraint_admin_lockout`).
+
+---
+
+## Offline Authorization Recovery
+
+If an administrator misconfigures an AccessConstraint (e.g., applying an overly restrictive `all_principals` constraint at `system` scope), all administrators may become locked out of the Hub API.
+
+To resolve this without performing risky database edits, Scion provides an **Offline Authorization Recovery** command.
+
+### The `recover-authz` Utility
+
+The `scion server recover-authz` command allows a platform operator to bypass the active HTTP server and de-escalate access constraints directly via the storage adapter.
+
+#### Security Safeguards
+* **Direct Database Connection**: The command bypasses the active HTTP authorization checks by communicating directly with the database.
+* **Exclusive Maintenance Lock**: It acquires an exclusive lock and will fail to execute if an active Scion Hub server or another recovery process is running.
+* **Nuclear Warning**: Disabling all constraints requires passing a specific confirmation phrase.
+* **Audit Trail**: Every recovery action records a permanent mutation audit log entry.
+* **Grants Prevention**: The command **never** creates users, roles, or RoleBindings. It only removes restrictive boundaries so that pre-existing positive grants can function.
+
+#### Usage Examples
+
+**Deactivate a specific constraint by ID:**
+```bash
+scion server recover-authz --disable-constraint "36f9036a-2ea2-4a0b-936d-978118b518bc"
 ```
-**Mechanism:** The Hub compares the `creator_user_id` claim from the agent's signed JWT against the `owner_id` label on the stored Secret resource.
 
-### Scenario 2: Immutable Audit Logs
-
-**Goal:** Ensure `audit-logger` agents can write logs but never read or delete them.
-
-**Policy:**
-```yaml
-principal:
-  match: { claims.template_id: "template:audit-logger" }
-allow:
-  - action: "log.write"
-deny:
-  - action: "log.read"
-  - action: "log.delete"
+**Deactivate all access constraints (the nuclear recovery option):**
+```bash
+scion server recover-authz --disable-all-constraints \
+  --confirm "I understand this disables all access constraints"
 ```
 
-## Future Work
-
-*   **Runtime Attestation**: Integrating lower-level hardware attestation (TPM/Enclave) into the `broker_id` claim.
-*   **Just-in-Time Grants**: Generating short-lived policies for specific user sessions (e.g., "Allow this agent to deploy for the next 5 minutes").
-*   **Policy Simulation**: Tooling to test policy changes against historical traffic before enforcement.
+**Specify database URL and operator manually:**
+```bash
+scion server recover-authz --disable-constraint "36f9036a-2ea2-4a0b-936d-978118b518bc" \
+  --db "postgres://localhost:5432/scion" \
+  --operator "admin-recovery@example.com"
+```

@@ -36,6 +36,14 @@ func TestClassifySource(t *testing.T) {
 			expected: "messages",
 		},
 		{
+			name: "scion-artifacts log name",
+			entry: CloudLogEntry{
+				LogName: "projects/my-project/logs/scion-artifacts",
+				Labels:  map[string]string{"component": "scion-hub"},
+			},
+			expected: "artifacts",
+		},
+		{
 			name: "scion-agents log name",
 			entry: CloudLogEntry{
 				LogName: "projects/my-project/logs/scion-agents",
@@ -232,6 +240,16 @@ func TestBuildLogFilter_Sources(t *testing.T) {
 			},
 		},
 		{
+			name: "artifacts source filter",
+			opts: LogQueryOptions{
+				Sources: []string{"artifacts"},
+			},
+			projectID: "my-project",
+			expected: []string{
+				` AND (logName = "projects/my-project/logs/scion-artifacts")`,
+			},
+		},
+		{
 			name: "multiple source filters",
 			opts: LogQueryOptions{
 				Sources: []string{"hub", "agent"},
@@ -323,30 +341,10 @@ func TestBuildLogFilter_Search(t *testing.T) {
 // Handler-level tests for handleDiagnosticsLogs
 // ---------------------------------------------------------------------------
 
-func TestHandleDiagnosticsLogs_Unauthenticated(t *testing.T) {
-	srv := &Server{}
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/diagnostics/logs", nil)
-	// No identity in context
-	rr := httptest.NewRecorder()
-	srv.handleDiagnosticsLogs(rr, req)
-
-	if rr.Code != http.StatusForbidden {
-		t.Errorf("expected 403, got %d: %s", rr.Code, rr.Body.String())
-	}
-}
-
-func TestHandleDiagnosticsLogs_NonAdmin(t *testing.T) {
-	srv := &Server{}
-	member := NewAuthenticatedUser("u1", "member@example.com", "Member", "member", "cli")
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/diagnostics/logs", nil)
-	req = req.WithContext(contextWithIdentity(req.Context(), member))
-	rr := httptest.NewRecorder()
-	srv.handleDiagnosticsLogs(rr, req)
-
-	if rr.Code != http.StatusForbidden {
-		t.Errorf("expected 403, got %d: %s", rr.Code, rr.Body.String())
-	}
-}
+// TestHandleDiagnosticsLogs_Unauthenticated and TestHandleDiagnosticsLogs_NonAdmin
+// were removed: authorization is now enforced by the routeGuard via the
+// hub.diagnostics.read permission (PR-A4). The handler no longer performs
+// inline admin checks. Authorization is tested in TestRouteGuardOpsPermissions.
 
 func TestHandleDiagnosticsLogs_NoLogQueryService(t *testing.T) {
 	srv := &Server{} // logQueryService is nil
@@ -390,29 +388,10 @@ func TestHandleDiagnosticsLogs_MethodNotAllowed(t *testing.T) {
 // Handler-level tests for handleDiagnosticsLogsStream
 // ---------------------------------------------------------------------------
 
-func TestHandleDiagnosticsLogsStream_Unauthenticated(t *testing.T) {
-	srv := &Server{}
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/diagnostics/logs/stream", nil)
-	rr := httptest.NewRecorder()
-	srv.handleDiagnosticsLogsStream(rr, req)
-
-	if rr.Code != http.StatusForbidden {
-		t.Errorf("expected 403, got %d: %s", rr.Code, rr.Body.String())
-	}
-}
-
-func TestHandleDiagnosticsLogsStream_NonAdmin(t *testing.T) {
-	srv := &Server{}
-	member := NewAuthenticatedUser("u1", "member@example.com", "Member", "member", "cli")
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/diagnostics/logs/stream", nil)
-	req = req.WithContext(contextWithIdentity(req.Context(), member))
-	rr := httptest.NewRecorder()
-	srv.handleDiagnosticsLogsStream(rr, req)
-
-	if rr.Code != http.StatusForbidden {
-		t.Errorf("expected 403, got %d: %s", rr.Code, rr.Body.String())
-	}
-}
+// TestHandleDiagnosticsLogsStream_Unauthenticated and TestHandleDiagnosticsLogsStream_NonAdmin
+// were removed: authorization is now enforced by the routeGuard via the
+// hub.diagnostics.read permission (PR-A4). The handler no longer performs
+// inline admin checks. Authorization is tested in TestRouteGuardOpsPermissions.
 
 func TestHandleDiagnosticsLogsStream_NoLogQueryService(t *testing.T) {
 	srv := &Server{}

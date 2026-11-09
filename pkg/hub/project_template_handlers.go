@@ -28,37 +28,43 @@ type SetTemplateRequest struct {
 
 // handleSetTemplate marks or unmarks a project as a template.
 // POST /api/v1/projects/{id}/set-template
-// Requires admin role + ActionUpdate on the project.
+//
+// Marking a project as a template changes the project and makes it a clone
+// source, so the caller needs both project.update and project.clone on the
+// project itself. Only user identities may call it.
 func (s *Server) handleSetTemplate(w http.ResponseWriter, r *http.Request, projectID string) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
-	// Admin check
-	user := GetUserIdentityFromContext(r.Context())
-	if user == nil || user.Role() != "admin" {
+	identity := GetIdentityFromContext(r.Context())
+	if identity == nil {
+		Unauthorized(w)
+		return
+	}
+	if _, ok := identity.(UserIdentity); !ok {
 		Forbidden(w)
 		return
 	}
 
-	var req SetTemplateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid request body", nil)
-		return
-	}
-
-	// Load the project
 	project, err := s.store.GetProject(r.Context(), projectID)
 	if err != nil {
 		writeErrorFromErr(w, err, "")
 		return
 	}
 
-	// Check ActionUpdate permission on the project
-	decision := s.authzService.CheckAccess(r.Context(), user, projectResource(project), ActionUpdate)
-	if !decision.Allowed {
-		Forbidden(w)
+	target := projectResource(project)
+	if !s.authorize(w, r, target, ActionUpdate) {
+		return
+	}
+	if !s.authorize(w, r, target, ActionClone) {
+		return
+	}
+
+	var req SetTemplateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid request body", nil)
 		return
 	}
 

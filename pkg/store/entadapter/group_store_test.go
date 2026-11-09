@@ -19,7 +19,9 @@ package entadapter
 import (
 	"context"
 	"testing"
+	"time"
 
+	"entgo.io/ent/dialect"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/store/enttest"
 	"github.com/google/uuid"
@@ -81,6 +83,48 @@ func TestCreateGroup(t *testing.T) {
 	assert.False(t, g.Created.IsZero())
 	assert.False(t, g.Updated.IsZero())
 	assert.Equal(t, store.GroupTypeExplicit, g.GroupType)
+}
+
+func TestListGroupsKeysetPagination(t *testing.T) {
+	gs := newTestGroupStore(t)
+	ctx := context.Background()
+	for _, id := range []string{
+		uuid.MustParse("00000000-0000-0000-0000-000000000011").String(),
+		uuid.MustParse("00000000-0000-0000-0000-000000000012").String(),
+		uuid.MustParse("00000000-0000-0000-0000-000000000013").String(),
+	} {
+		require.NoError(t, gs.CreateGroup(ctx, &store.Group{ID: id, Name: "group-" + id, Slug: "group-" + id}))
+	}
+
+	first, err := gs.ListGroups(ctx, store.GroupFilter{}, store.ListOptions{Limit: 2})
+	require.NoError(t, err)
+	require.Len(t, first.Items, 2)
+	require.NotEmpty(t, first.NextCursor)
+	second, err := gs.ListGroups(ctx, store.GroupFilter{}, store.ListOptions{Limit: 2, Cursor: first.NextCursor})
+	require.NoError(t, err)
+	require.Len(t, second.Items, 1)
+	assert.NotEqual(t, first.Items[0].ID, second.Items[0].ID)
+	assert.NotEqual(t, first.Items[1].ID, second.Items[0].ID)
+	require.NoError(t, gs.DeleteGroup(ctx, first.Items[1].ID))
+	afterDeletedCursor, err := gs.ListGroups(ctx, store.GroupFilter{}, store.ListOptions{Limit: 2, Cursor: first.NextCursor})
+	require.NoError(t, err)
+	assert.Equal(t, second.Items[0].ID, afterDeletedCursor.Items[0].ID, "cursor must survive deletion of its source row")
+
+	_, err = gs.ListGroups(ctx, store.GroupFilter{}, store.ListOptions{Limit: 1, Cursor: "not-a-cursor"})
+	assert.Error(t, err)
+}
+
+func TestListGroupsCursorBindingAndSkipTotalCount(t *testing.T) {
+	gs := newTestGroupStore(t)
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		require.NoError(t, gs.CreateGroup(ctx, &store.Group{ID: uuid.NewString(), Name: uuid.NewString(), Slug: uuid.NewString(), Created: time.Now()}))
+	}
+	page, err := gs.ListGroups(ctx, store.GroupFilter{}, store.ListOptions{Limit: 1, SkipTotalCount: true, CursorBinding: "groups-filter-a"})
+	require.NoError(t, err)
+	assert.Zero(t, page.TotalCount)
+	_, err = gs.ListGroups(ctx, store.GroupFilter{}, store.ListOptions{Limit: 1, Cursor: page.NextCursor, CursorBinding: "groups-filter-b"})
+	assert.Error(t, err)
 }
 
 func TestCreateGroupDuplicate(t *testing.T) {
@@ -802,6 +846,105 @@ func TestGetEffectiveGroups(t *testing.T) {
 	assert.True(t, found[c.ID], "expected group C")
 }
 
+// addChildGroup makes child a member group of parent via the store's own
+// AddGroupMember path (which does not itself reject cycles; the hub checks
+// WouldCreateCycle before calling it).
+func addChildGroup(t *testing.T, gs *GroupStore, parent, child *store.Group) {
+	t.Helper()
+	require.NoError(t, gs.AddGroupMember(context.Background(), &store.GroupMember{
+		GroupID: parent.ID, MemberType: store.GroupMemberTypeGroup, MemberID: child.ID, Role: store.GroupMemberRoleMember,
+	}))
+}
+
+// TestGetParentGroups covers the recursive ancestor walk: no parents, a
+// direct parent, transitive ancestors, and siblings/descendants that must not
+// appear (ptone/scion#1585).
+func TestGetParentGroups(t *testing.T) {
+	gs := newTestGroupStore(t)
+	ctx := context.Background()
+
+	// A contains B, B contains C, C contains D. S is an unrelated sibling of B
+	// under A.
+	a := &store.Group{ID: uuid.New().String(), Name: "A", Slug: "par-a"}
+	b := &store.Group{ID: uuid.New().String(), Name: "B", Slug: "par-b"}
+	c := &store.Group{ID: uuid.New().String(), Name: "C", Slug: "par-c"}
+	d := &store.Group{ID: uuid.New().String(), Name: "D", Slug: "par-d"}
+	s := &store.Group{ID: uuid.New().String(), Name: "S", Slug: "par-s"}
+	for _, g := range []*store.Group{a, b, c, d, s} {
+		require.NoError(t, gs.CreateGroup(ctx, g))
+	}
+	addChildGroup(t, gs, a, b)
+	addChildGroup(t, gs, b, c)
+	addChildGroup(t, gs, c, d)
+	addChildGroup(t, gs, a, s)
+
+	parents, err := gs.GetParentGroups(ctx, a.ID)
+	require.NoError(t, err)
+	assert.Empty(t, parents, "a root group has no parents")
+
+	parents, err = gs.GetParentGroups(ctx, b.ID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{a.ID}, parents, "single-level parent")
+
+	parents, err = gs.GetParentGroups(ctx, d.ID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{a.ID, b.ID, c.ID}, parents, "transitive ancestors, without descendants or siblings")
+
+	parents, err = gs.GetParentGroups(ctx, uuid.New().String())
+	require.NoError(t, err)
+	assert.Empty(t, parents, "an unknown group has no parents")
+
+	_, err = gs.GetParentGroups(ctx, "not-a-uuid")
+	assert.Error(t, err)
+}
+
+// TestGetParentGroups_ExcludesSelfOnCycle pins the self-exclusion filter: when
+// the child-group graph contains a cycle through the queried group (or a
+// self-edge), the walk reaches the group itself, which must not be reported
+// as its own parent. The recursive UNION also has to terminate on the cycle.
+func TestGetParentGroups_ExcludesSelfOnCycle(t *testing.T) {
+	gs := newTestGroupStore(t)
+	ctx := context.Background()
+
+	// A contains B, B contains C, C contains A: a three-group cycle.
+	a := &store.Group{ID: uuid.New().String(), Name: "A", Slug: "cyc-a"}
+	b := &store.Group{ID: uuid.New().String(), Name: "B", Slug: "cyc-b"}
+	c := &store.Group{ID: uuid.New().String(), Name: "C", Slug: "cyc-c"}
+	for _, g := range []*store.Group{a, b, c} {
+		require.NoError(t, gs.CreateGroup(ctx, g))
+	}
+	addChildGroup(t, gs, a, b)
+	addChildGroup(t, gs, b, c)
+	addChildGroup(t, gs, c, a)
+
+	for _, tc := range []struct {
+		group *store.Group
+		want  []string
+	}{
+		{a, []string{b.ID, c.ID}},
+		{b, []string{a.ID, c.ID}},
+		{c, []string{a.ID, b.ID}},
+	} {
+		parents, err := gs.GetParentGroups(ctx, tc.group.ID)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, tc.want, parents, "parents of %s", tc.group.Name)
+	}
+
+	// A self-edge: the group is its own direct parent in the edge table, but
+	// GetParentGroups still excludes it.
+	self := &store.Group{ID: uuid.New().String(), Name: "Self", Slug: "cyc-self"}
+	require.NoError(t, gs.CreateGroup(ctx, self))
+	addChildGroup(t, gs, self, self)
+
+	direct, err := gs.GetDirectParentGroupIDs(ctx, self.ID)
+	require.NoError(t, err)
+	require.Equal(t, []string{self.ID}, direct, "precondition: the self-edge exists")
+
+	parents, err := gs.GetParentGroups(ctx, self.ID)
+	require.NoError(t, err)
+	assert.Empty(t, parents)
+}
+
 func TestGetEffectiveGroupsNoMemberships(t *testing.T) {
 	gs := newTestGroupStore(t)
 	ctx := context.Background()
@@ -1066,185 +1209,10 @@ func TestProjectGroupLifecycle(t *testing.T) {
 }
 
 // =============================================================================
-// Phase 4: CheckDelegatedAccess and GetGroupsByIDs
+// Phase 4: GetGroupsByIDs
 // =============================================================================
-
-func TestCheckDelegatedAccess_Enabled(t *testing.T) {
-	gs := newTestGroupStore(t)
-	ctx := context.Background()
-
-	// Enable delegation on the test agent and set creator
-	_, err := gs.client.Agent.UpdateOneID(testAgentUID).
-		SetDelegationEnabled(true).
-		SetCreatedBy(testUserUID).
-		Save(ctx)
-	require.NoError(t, err)
-
-	// Check with matching DelegatedFrom condition
-	conditions := &store.PolicyConditions{
-		DelegatedFrom: &store.DelegatedFromCondition{
-			PrincipalType: "user",
-			PrincipalID:   testUserUID.String(),
-		},
-	}
-	result, err := gs.CheckDelegatedAccess(ctx, testAgentUID.String(), conditions)
-	require.NoError(t, err)
-	assert.True(t, result)
-}
-
-func TestCheckDelegatedAccess_Disabled(t *testing.T) {
-	gs := newTestGroupStore(t)
-	ctx := context.Background()
-
-	// Creator is set but delegation is disabled (default)
-	_, err := gs.client.Agent.UpdateOneID(testAgentUID).
-		SetCreatedBy(testUserUID).
-		Save(ctx)
-	require.NoError(t, err)
-
-	conditions := &store.PolicyConditions{
-		DelegatedFrom: &store.DelegatedFromCondition{
-			PrincipalType: "user",
-			PrincipalID:   testUserUID.String(),
-		},
-	}
-	result, err := gs.CheckDelegatedAccess(ctx, testAgentUID.String(), conditions)
-	require.NoError(t, err)
-	assert.False(t, result)
-}
-
-func TestCheckDelegatedAccess_SuspendedCreator(t *testing.T) {
-	gs := newTestGroupStore(t)
-	ctx := context.Background()
-
-	// Suspend the creator
-	_, err := gs.client.User.UpdateOneID(testUserUID).
-		SetStatus("suspended").
-		Save(ctx)
-	require.NoError(t, err)
-
-	// Enable delegation
-	_, err = gs.client.Agent.UpdateOneID(testAgentUID).
-		SetDelegationEnabled(true).
-		SetCreatedBy(testUserUID).
-		Save(ctx)
-	require.NoError(t, err)
-
-	conditions := &store.PolicyConditions{
-		DelegatedFrom: &store.DelegatedFromCondition{
-			PrincipalType: "user",
-			PrincipalID:   testUserUID.String(),
-		},
-	}
-	result, err := gs.CheckDelegatedAccess(ctx, testAgentUID.String(), conditions)
-	require.NoError(t, err)
-	assert.False(t, result)
-}
-
-func TestCheckDelegatedAccess_NoCreator(t *testing.T) {
-	gs := newTestGroupStore(t)
-	ctx := context.Background()
-
-	// Enable delegation but don't set a creator
-	_, err := gs.client.Agent.UpdateOneID(testAgentUID).
-		SetDelegationEnabled(true).
-		Save(ctx)
-	require.NoError(t, err)
-
-	conditions := &store.PolicyConditions{
-		DelegatedFrom: &store.DelegatedFromCondition{
-			PrincipalType: "user",
-			PrincipalID:   testUserUID.String(),
-		},
-	}
-	result, err := gs.CheckDelegatedAccess(ctx, testAgentUID.String(), conditions)
-	require.NoError(t, err)
-	assert.False(t, result)
-}
-
-func TestCheckDelegatedAccess_GroupCondition(t *testing.T) {
-	gs := newTestGroupStore(t)
-	ctx := context.Background()
-
-	// Create a group and add the user to it
-	g := &store.Group{
-		ID:   uuid.New().String(),
-		Name: "Platform Team",
-		Slug: "platform-team-deleg",
-	}
-	require.NoError(t, gs.CreateGroup(ctx, g))
-	require.NoError(t, gs.AddGroupMember(ctx, &store.GroupMember{
-		GroupID:    g.ID,
-		MemberType: store.GroupMemberTypeUser,
-		MemberID:   testUserUID.String(),
-		Role:       store.GroupMemberRoleMember,
-	}))
-
-	// Enable delegation and set creator
-	_, err := gs.client.Agent.UpdateOneID(testAgentUID).
-		SetDelegationEnabled(true).
-		SetCreatedBy(testUserUID).
-		Save(ctx)
-	require.NoError(t, err)
-
-	// Check with DelegatedFromGroup matching the creator's group
-	conditions := &store.PolicyConditions{
-		DelegatedFromGroup: g.ID,
-	}
-	result, err := gs.CheckDelegatedAccess(ctx, testAgentUID.String(), conditions)
-	require.NoError(t, err)
-	assert.True(t, result)
-}
-
-func TestCheckDelegatedAccess_GroupCondition_NotMember(t *testing.T) {
-	gs := newTestGroupStore(t)
-	ctx := context.Background()
-
-	// Create a group but DON'T add the user to it
-	g := &store.Group{
-		ID:   uuid.New().String(),
-		Name: "Other Team",
-		Slug: "other-team-deleg",
-	}
-	require.NoError(t, gs.CreateGroup(ctx, g))
-
-	// Enable delegation and set creator
-	_, err := gs.client.Agent.UpdateOneID(testAgentUID).
-		SetDelegationEnabled(true).
-		SetCreatedBy(testUserUID).
-		Save(ctx)
-	require.NoError(t, err)
-
-	// Check with DelegatedFromGroup — creator is NOT a member
-	conditions := &store.PolicyConditions{
-		DelegatedFromGroup: g.ID,
-	}
-	result, err := gs.CheckDelegatedAccess(ctx, testAgentUID.String(), conditions)
-	require.NoError(t, err)
-	assert.False(t, result)
-}
-
-func TestCheckDelegatedAccess_NilConditions(t *testing.T) {
-	gs := newTestGroupStore(t)
-	ctx := context.Background()
-
-	result, err := gs.CheckDelegatedAccess(ctx, testAgentUID.String(), nil)
-	require.NoError(t, err)
-	assert.False(t, result)
-}
-
-func TestCheckDelegatedAccess_NoDelegationConditions(t *testing.T) {
-	gs := newTestGroupStore(t)
-	ctx := context.Background()
-
-	// Conditions exist but no delegation fields
-	conditions := &store.PolicyConditions{
-		Labels: map[string]string{"env": "prod"},
-	}
-	result, err := gs.CheckDelegatedAccess(ctx, testAgentUID.String(), conditions)
-	require.NoError(t, err)
-	assert.False(t, result)
-}
+// NOTE: CheckDelegatedAccess tests removed in CO1 cutover — the method was
+// part of the legacy Policy-based delegation system and no longer exists.
 
 func TestGetGroupsByIDs(t *testing.T) {
 	gs := newTestGroupStore(t)
@@ -1457,4 +1425,87 @@ func TestListGroupsWithProjectIDFilter(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.TotalCount)
 	assert.Equal(t, g1.ID, result.Items[0].ID)
+}
+
+// TestDeleteGroup_CascadesRoleBindings verifies that deleting a group also
+// removes all role bindings where the group is the bound principal, preventing
+// orphan role bindings.  This is the R1 hard-gate integration test.
+func TestDeleteGroup_CascadesRoleBindings(t *testing.T) {
+	client := enttest.NewClient(t)
+	gs := NewGroupStore(client)
+	rs := NewRoleStore(client)
+	ctx := context.Background()
+
+	// Create two role definitions that can be bound to a group principal.
+	rd1, err := rs.CreateRoleDefinition(ctx, &store.RoleDefinition{
+		Name:        "test-cascade-role-a",
+		Description: "role A for cascade test",
+		ScopeType:   store.RoleScopeSystem,
+		Permissions: []string{"test.cascade.a"},
+	})
+	require.NoError(t, err)
+
+	rd2, err := rs.CreateRoleDefinition(ctx, &store.RoleDefinition{
+		Name:        "test-cascade-role-b",
+		Description: "role B for cascade test",
+		ScopeType:   store.RoleScopeSystem,
+		Permissions: []string{"test.cascade.b"},
+	})
+	require.NoError(t, err)
+
+	// Create a group.
+	groupID := uuid.New().String()
+	err = gs.CreateGroup(ctx, &store.Group{
+		ID:   groupID,
+		Name: "cascade-test-group",
+		Slug: "cascade-test-group",
+	})
+	require.NoError(t, err)
+
+	// Create two role bindings for the group principal (different roles).
+	rb1, err := rs.CreateRoleBinding(ctx, &store.RoleBinding{
+		RoleDefinitionID: rd1.ID,
+		PrincipalType:    store.RoleBindingPrincipalGroup,
+		PrincipalID:      groupID,
+		ScopeType:        store.RoleScopeSystem,
+		ScopeID:          "",
+		CreatedBy:        "test",
+	})
+	require.NoError(t, err)
+
+	rb2, err := rs.CreateRoleBinding(ctx, &store.RoleBinding{
+		RoleDefinitionID: rd2.ID,
+		PrincipalType:    store.RoleBindingPrincipalGroup,
+		PrincipalID:      groupID,
+		ScopeType:        store.RoleScopeSystem,
+		ScopeID:          "",
+		CreatedBy:        "test",
+	})
+	require.NoError(t, err)
+
+	// Verify bindings exist before deletion.
+	bindings, err := rs.ListRoleBindingsForPrincipals(ctx, []store.PrincipalRef{
+		{Type: store.RoleBindingPrincipalGroup, ID: groupID},
+	}, nil, nil)
+	require.NoError(t, err)
+	assert.Len(t, bindings, 2, "expected 2 bindings before group deletion")
+	_ = rb1
+	_ = rb2
+
+	// Delete the group — should cascade to remove role bindings.
+	err = gs.DeleteGroup(ctx, groupID)
+	require.NoError(t, err)
+
+	// Verify zero remaining bindings for the deleted group principal.
+	bindings, err = rs.ListRoleBindingsForPrincipals(ctx, []store.PrincipalRef{
+		{Type: store.RoleBindingPrincipalGroup, ID: groupID},
+	}, nil, nil)
+	require.NoError(t, err)
+	assert.Empty(t, bindings, "expected zero bindings after group deletion")
+}
+
+func TestSQLUUIDPh(t *testing.T) {
+	assert.Equal(t, "$1::uuid", sqlUUIDPh(dialect.Postgres, 1))
+	assert.Equal(t, "$12::uuid", sqlUUIDPh(dialect.Postgres, 12))
+	assert.Equal(t, "?", sqlUUIDPh(dialect.SQLite, 1))
 }

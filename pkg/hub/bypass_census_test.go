@@ -1,0 +1,189 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package hub
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+)
+
+// TestBypassCensus is a regression test that detects new admin bypass patterns
+// in pkg/hub/. It maintains an allowlist of authorized bypass locations. As
+// handlers are converted from inline admin checks to permission-based checks
+// (PR-A2 through PR-A6), entries are removed from the allowlist. Any new
+// bypass appearing outside the allowlist causes this test to fail.
+//
+// The final state (after all D4 conversion PRs) will have only the engine-
+// internal keeps plus the deprecated requireAdmin helper and the routeGuard
+// fallback.
+func TestBypassCensus(t *testing.T) {
+	// Patterns that indicate an admin bypass site.
+	patterns := []*regexp.Regexp{
+		// Category A: inline Role() != "admin" checks in handlers
+		regexp.MustCompile(`\.Role\(\)\s*!=\s*"admin"`),
+		// Category B: IsUnscopedLocalPlatformAdmin calls (outside authorized engine files)
+		regexp.MustCompile(`IsUnscopedLocalPlatformAdmin\(`),
+		// Category C: requireAdmin call sites
+		regexp.MustCompile(`requireAdmin\(`),
+	}
+
+	// Authorized bypass locations. Each entry is "filename:lineContent" where
+	// lineContent is a substring that must appear on the matching line. This
+	// provides both file-level and line-level specificity.
+	//
+	// As handlers are converted to permission-based checks, entries are removed
+	// from this allowlist. The test fails if a new bypass appears that is not
+	// in this list.
+	type allowEntry struct {
+		file        string // path relative to pkg/hub (base filename for pkg/hub itself)
+		lineSubstr  string // substring that must appear on the matching line
+		description string // why this is allowed
+	}
+
+	allowlist := []allowEntry{
+		// These are engine-internal keeps — permanent or deprecating-with-replacement.
+
+		// ─── Engine-internal keeps (permanent) ───────────────────────────
+		// These are part of the authorization engine, not handler-level bypasses.
+		{file: "authz.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "checkAccessForUser admin bypass (KEEP)"},
+		{file: "authz.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "AuthorizeReadBatch short-circuit (KEEP)"},
+		{file: "authz.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "Decide explain trace admin check"},
+		{file: "authz_candelegate.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "CanDelegate super-admin bypass (KEEP)"},
+		{file: "authz_delegation_ceiling.go", lineSubstr: "IsSystemAdmin", description: "delegation ceiling system admin check (KEEP)"},
+
+		// ─── Authorization infrastructure (permanent or deprecating) ─────
+		{file: "authorize.go", lineSubstr: "func (s *Server) requireAdmin(", description: "requireAdmin helper definition (DEPRECATED — fallback only)"},
+		{file: "authorize.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "requireAdmin implementation"},
+		{file: "admin_delegation_adoption.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "delegation-provenance adoption admin check: system admin only, no registered permission exists for it"},
+		{file: "handlers_env_secrets.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(userIdent)", description: "hub-scope env and secret access: session credential plus unscoped admin; no registered permission covers hub-level env and secret material"},
+		{file: "route_metadata.go", lineSubstr: "requireAdmin(w, r)", description: "routeGuard fallback for unconverted routes (temporary)"},
+		{file: "internal/principal/identity.go", lineSubstr: "IsUnscopedLocalPlatformAdmin", description: "IsUnscopedLocalPlatformAdmin definition"},
+		{file: "internal/principal/identity.go", lineSubstr: `user.Role() != "admin"`, description: "IsUnscopedLocalPlatformAdmin implementation"},
+		{file: "authz.go", lineSubstr: "IsUnscopedLocalPlatformAdmin", description: "comment reference"},
+
+		// ─── AdminModeMiddleware bypass (infrastructure, KEEP) ───────────
+		{file: "admin_mode.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "AdminModeMiddleware admin bypass (infrastructure, KEEP)"},
+		{file: "agent_pending_config_authz.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "held-edit fold mirrors AdminModeMiddleware: an admin saver's keys are not deferred during maintenance (infrastructure, KEEP)"},
+
+		// ─── Messaging authorization engine (permanent, D6/D7) ─────────────
+		{file: "authorize_message.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "authorizeAgentMessage super-admin bypass (D6, KEEP)"},
+		{file: "handlers_agent_message_mode.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(userIdent)", description: "handleSetMessageMode project-admin exclusion (D7, KEEP — super-admins must not be blocked by the project-admin deny gate)"},
+		{file: "project_messaging_policy.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(userIdent)", description: "Messaging policy admin bypass (owner-or-admin check)"},
+
+		// ─── Auth/identity infrastructure (non-bypass references) ────────
+		{file: "handlers_auth.go", lineSubstr: "IsUnscopedLocalPlatformAdmin", description: "admin reconciliation comment reference"},
+		{file: "handlers_auth.go", lineSubstr: "IsUnscopedLocalPlatformAdmin", description: "admin reconciliation helper"},
+		{file: "authz_candelegate.go", lineSubstr: "requireAdmin", description: "comment reference in CanDelegate"},
+
+		// ─── Deletion detail visibility (ptone/scion#3122) ───────────────
+		{file: "deletion_redact.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(user)", description: "callerSeesDeletionDetail: decides whether response bodies carry deletion code, error and claim (presentation only, grants no access)"},
+
+		// ─── Perf trace response headers ─────────────────────────────────
+		{file: "perftrace_middleware.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(GetUserIdentityFromContext(r.Context()))", description: "perfHeadersAllowed: decides whether opt-in perf trace response headers are written (presentation only, grants no access)"},
+
+		// ─── Passthrough gate ───────────────────────────────────────────
+		{file: "passthrough_gate.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(userIdent)", description: "the embedded broker counts as owned by an unscoped local platform administrator"},
+
+		// ─── Hub test identities (ptone/scion#4240) ───────────────────────
+		{file: "handlers_test_identities.go", lineSubstr: "IsUnscopedLocalPlatformAdmin(caller)", description: "testIdentityCallerSeesAll: after the test_identity.issue route guard admits the caller, an unscoped admin session sees and re-issues every test identity instead of only its own (result scope only, grants no access)"},
+
+		// ─── Session revocation (admin-only endpoint) ────────────────────
+		{file: "handlers_users_core.go", lineSubstr: "requireAdmin(w, r)", description: "revokeUserSessions: admin-only endpoint for session invalidation"},
+	}
+
+	// Build the allow map: file -> list of allowed substrings with counts
+	type allowKey struct {
+		file       string
+		lineSubstr string
+	}
+	allowCounts := map[allowKey]int{}
+	for _, entry := range allowlist {
+		key := allowKey{file: entry.file, lineSubstr: entry.lineSubstr}
+		allowCounts[key]++
+	}
+
+	// pkg/hub is the current package directory in test context. The
+	// principal types (IsUnscopedLocalPlatformAdmin among them) live in
+	// pkg/hub/internal/principal, so that directory is scanned too, with its
+	// files named by path relative to pkg/hub.
+	var names []string
+	for _, dir := range []string{".", "internal/principal"} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", dir, err)
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+				continue
+			}
+			if dir != "." {
+				name = dir + "/" + name
+			}
+			names = append(names, name)
+		}
+	}
+
+	var violations []string
+	matchCounts := map[allowKey]int{}
+
+	for _, name := range names {
+		data, err := os.ReadFile(filepath.FromSlash(name))
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", name, err)
+		}
+
+		lines := strings.Split(string(data), "\n")
+		for lineNum, line := range lines {
+			for _, pattern := range patterns {
+				if !pattern.MatchString(line) {
+					continue
+				}
+
+				// Check if this match is in the allowlist
+				allowed := false
+				for _, entry := range allowlist {
+					if entry.file == name && strings.Contains(line, entry.lineSubstr) {
+						key := allowKey{file: entry.file, lineSubstr: entry.lineSubstr}
+						if matchCounts[key] < allowCounts[key] {
+							matchCounts[key]++
+							allowed = true
+							break
+						}
+					}
+				}
+
+				if !allowed {
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d: %s\n  matched: %s",
+						name, lineNum+1, strings.TrimSpace(line), pattern.String(),
+					))
+				}
+			}
+		}
+	}
+
+	if len(violations) > 0 {
+		t.Errorf("bypass census: %d unauthorized admin bypass site(s) found.\n"+
+			"Each site below uses an inline admin check instead of the permission-based\n"+
+			"Decide pipeline. Either convert the handler to use route metadata permissions\n"+
+			"(preferred) or add the site to the allowlist in this test with justification.\n\n%s",
+			len(violations), strings.Join(violations, "\n\n"))
+	}
+}

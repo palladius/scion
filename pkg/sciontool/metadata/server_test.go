@@ -1,3 +1,5 @@
+//go:build unix
+
 // Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,9 +25,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -194,6 +198,68 @@ func TestMetadataServer_NumericProjectID(t *testing.T) {
 	}
 	if body != "0" {
 		t.Fatalf("expected numeric-project-id to be \"0\", got %q", body)
+	}
+}
+
+func TestMetadataServer_InstanceDirectoryListing(t *testing.T) {
+	port := freePort(t)
+	srv := New(Config{
+		Mode:      "block",
+		Port:      port,
+		ProjectID: "test-project",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+	time.Sleep(50 * time.Millisecond)
+
+	for _, path := range []string{
+		"/computeMetadata/v1/instance",
+		"/computeMetadata/v1/instance/",
+	} {
+		resp, body := metadataGet(t, port, path)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: expected 200, got %d", path, resp.StatusCode)
+		}
+		if body != "service-accounts/\n" {
+			t.Fatalf("GET %s: expected %q, got %q", path, "service-accounts/\n", body)
+		}
+	}
+}
+
+func TestMetadataServer_ProjectDirectoryListing(t *testing.T) {
+	port := freePort(t)
+	srv := New(Config{
+		Mode:      "block",
+		Port:      port,
+		ProjectID: "test-project",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+	time.Sleep(50 * time.Millisecond)
+
+	for _, path := range []string{
+		"/computeMetadata/v1/project",
+		"/computeMetadata/v1/project/",
+	} {
+		resp, body := metadataGet(t, port, path)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: expected 200, got %d", path, resp.StatusCode)
+		}
+		if body != "project-id\nnumeric-project-id\n" {
+			t.Fatalf("GET %s: expected %q, got %q", path, "project-id\nnumeric-project-id\n", body)
+		}
 	}
 }
 
@@ -867,6 +933,9 @@ func TestMetadataServer_ShutdownEndpoint(t *testing.T) {
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405 for GET, got %d", resp.StatusCode)
 	}
+	if got := resp.Header.Get("Allow"); got != http.MethodPost {
+		t.Fatalf("expected Allow %q for GET, got %q", http.MethodPost, got)
+	}
 
 	// POST without Metadata-Flavor header should be rejected
 	req, _ = http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/_scion/shutdown", port), nil)
@@ -919,6 +988,96 @@ func TestMetadataServer_ShutdownEndpoint(t *testing.T) {
 	// Server should no longer be reachable
 	if srv.probeHealth() {
 		t.Fatal("expected server to be unreachable after shutdown")
+	}
+}
+
+func TestReadShutdownToken_RoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shutdown.token")
+	if err := writeShutdownToken(path, "a-token"); err != nil {
+		t.Fatalf("writeShutdownToken: %v", err)
+	}
+
+	got, err := readShutdownToken(path)
+	if err != nil {
+		t.Fatalf("readShutdownToken: %v", err)
+	}
+	if string(got) != "a-token\n" {
+		t.Errorf("got %q, want %q", got, "a-token\n")
+	}
+}
+
+// TestReadShutdownToken_SymlinkRefused proves that another user who can
+// plant a symlink at the (predictable, shared os.TempDir()) shutdown-token
+// path can't make shutdownExisting read and forward an unrelated file's
+// contents as the shutdown token: readShutdownToken must refuse without
+// following the symlink.
+func TestReadShutdownToken_SymlinkRefused(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "secret")
+	if err := os.WriteFile(target, []byte("do-not-touch"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	path := filepath.Join(dir, "shutdown.token")
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	if _, err := readShutdownToken(path); err == nil {
+		t.Fatal("expected an error reading a symlinked shutdown-token path, got nil")
+	}
+
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(data) != "do-not-touch" {
+		t.Errorf("symlink target was modified: %q", data)
+	}
+}
+
+// TestReadShutdownToken_FIFODoesNotBlock proves that a FIFO planted at the
+// (predictable, shared os.TempDir()) shutdown-token path can't hang
+// shutdownExisting forever: readShutdownToken must return an error
+// promptly instead of blocking in open(2) waiting for a writer.
+func TestReadShutdownToken_FIFODoesNotBlock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shutdown.token")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := readShutdownToken(path)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("expected an error reading a FIFO shutdown-token path, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("readShutdownToken blocked on a FIFO with no writer")
+	}
+}
+
+// TestReadShutdownToken_BoundedRead proves an oversized file at the
+// shutdown-token path is bounded by shutdownTokenMaxBytes rather than read
+// in full: writeShutdownToken never produces a file this large, so
+// anything longer already isn't a token this process wrote.
+func TestReadShutdownToken_BoundedRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shutdown.token")
+	oversized := strings.Repeat("a", shutdownTokenMaxBytes*4)
+	if err := os.WriteFile(path, []byte(oversized), 0o600); err != nil {
+		t.Fatalf("write oversized file: %v", err)
+	}
+
+	got, err := readShutdownToken(path)
+	if err != nil {
+		t.Fatalf("readShutdownToken: %v", err)
+	}
+	if len(got) != shutdownTokenMaxBytes {
+		t.Errorf("read %d bytes, want bounded to %d", len(got), shutdownTokenMaxBytes)
 	}
 }
 
@@ -1010,5 +1169,173 @@ func TestMetadataServer_StartReclaimsPortViaShutdownEndpoint(t *testing.T) {
 	}
 	if body != "new-project" {
 		t.Fatalf("expected new-project from replacement server, got %q", body)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Link-local address selection tests
+// -----------------------------------------------------------------------
+
+func TestSelectLinkLocalAddress_SingleAddress(t *testing.T) {
+	addr, err := selectLinkLocalAddress([]string{"169.254.8.1"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if addr != "169.254.8.1" {
+		t.Fatalf("expected 169.254.8.1, got %q", addr)
+	}
+}
+
+func TestSelectLinkLocalAddress_MultipleAddresses(t *testing.T) {
+	// Cloud Run Instances always have three link-local addresses.
+	// 169.254.169.1 is in the metadata /24 and should be deprioritised;
+	// 169.254.8.1 is the numerically lowest non-metadata candidate.
+	addrs := []string{"169.254.169.1", "169.254.9.1", "169.254.8.1"}
+	addr, err := selectLinkLocalAddress(addrs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if addr != "169.254.8.1" {
+		t.Fatalf("expected 169.254.8.1 (lowest non-metadata-adjacent), got %q", addr)
+	}
+}
+
+func TestSelectLinkLocalAddress_MultipleAddresses_Deterministic(t *testing.T) {
+	// Regardless of input order, the same address must be selected.
+	orders := [][]string{
+		{"169.254.9.1", "169.254.169.1", "169.254.8.1"},
+		{"169.254.8.1", "169.254.9.1", "169.254.169.1"},
+		{"169.254.169.1", "169.254.8.1", "169.254.9.1"},
+	}
+	for _, addrs := range orders {
+		addr, err := selectLinkLocalAddress(addrs)
+		if err != nil {
+			t.Fatalf("unexpected error for %v: %v", addrs, err)
+		}
+		if addr != "169.254.8.1" {
+			t.Fatalf("expected 169.254.8.1 for input %v, got %q", addrs, addr)
+		}
+	}
+}
+
+func TestSelectLinkLocalAddress_PrefersNonMetadataAdjacent(t *testing.T) {
+	// When a future platform hands out 169.254.169.1 and 169.254.200.1,
+	// the non-metadata-adjacent address should be preferred even though
+	// 169.254.169.1 is numerically lower.
+	addrs := []string{"169.254.169.1", "169.254.200.1"}
+	addr, err := selectLinkLocalAddress(addrs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if addr != "169.254.200.1" {
+		t.Fatalf("expected 169.254.200.1 (non-metadata-adjacent), got %q", addr)
+	}
+}
+
+func TestSelectLinkLocalAddress_FallsBackToMetadata(t *testing.T) {
+	// When all candidates are in the metadata /24, still return the lowest.
+	addrs := []string{"169.254.169.10", "169.254.169.1"}
+	addr, err := selectLinkLocalAddress(addrs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if addr != "169.254.169.1" {
+		t.Fatalf("expected 169.254.169.1 (lowest in metadata /24 fallback), got %q", addr)
+	}
+}
+
+func TestSelectLinkLocalAddress_NoAddresses(t *testing.T) {
+	_, err := selectLinkLocalAddress(nil)
+	if err == nil {
+		t.Fatal("expected error for empty address list")
+	}
+	if !strings.Contains(err.Error(), "no IPv4 link-local") {
+		t.Fatalf("expected 'no IPv4 link-local' in error, got: %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Bind address tests — §4.11 S5 security guard
+// -----------------------------------------------------------------------
+
+// TestBindAddress_Never0000 is the durable guard test required by S5 (§4.11):
+// the metadata emulator must never bind to 0.0.0.0, because it does not
+// authenticate callers and would become a credential-minting endpoint
+// reachable by anything that can route to it.
+func TestBindAddress_Never0000(t *testing.T) {
+	_, err := resolveBindAddress("0.0.0.0")
+	if err == nil {
+		t.Fatal("resolveBindAddress(\"0.0.0.0\") must return an error — " +
+			"binding 0.0.0.0 exposes the unauthenticated credential endpoint (§4.11 S5)")
+	}
+	if !strings.Contains(err.Error(), "0.0.0.0") {
+		t.Fatalf("error should mention 0.0.0.0, got: %v", err)
+	}
+}
+
+// TestBindAddress_DefaultIsLoopback verifies that an empty BindAddress
+// defaults to 127.0.0.1, not 0.0.0.0.
+func TestBindAddress_DefaultIsLoopback(t *testing.T) {
+	addr, err := resolveBindAddress("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if addr != "127.0.0.1" {
+		t.Fatalf("expected 127.0.0.1, got %q", addr)
+	}
+}
+
+// TestBindAddress_ExplicitIP passes through a valid explicit address.
+func TestBindAddress_ExplicitIP(t *testing.T) {
+	addr, err := resolveBindAddress("169.254.8.1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if addr != "169.254.8.1" {
+		t.Fatalf("expected 169.254.8.1, got %q", addr)
+	}
+}
+
+// TestBindAddress_StartRejects0000 verifies that Start() itself refuses to
+// proceed when BindAddress is "0.0.0.0", exercising the full code path.
+func TestBindAddress_StartRejects0000(t *testing.T) {
+	srv := New(Config{
+		Mode:        modeBlock,
+		Port:        freePort(t),
+		BindAddress: "0.0.0.0",
+	})
+	err := srv.Start(context.Background())
+	if err == nil {
+		srv.Stop()
+		t.Fatal("Start() must fail when BindAddress is 0.0.0.0")
+	}
+	if !strings.Contains(err.Error(), "0.0.0.0") {
+		t.Fatalf("error should mention 0.0.0.0, got: %v", err)
+	}
+}
+
+// TestBindAddress_CustomBindWorks verifies the server binds to a specific
+// address when configured.
+func TestBindAddress_CustomBindWorks(t *testing.T) {
+	port := freePort(t)
+	srv := New(Config{
+		Mode:        modeBlock,
+		Port:        port,
+		BindAddress: "127.0.0.1", // explicit loopback
+	})
+	if err := srv.Start(context.Background()); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	defer srv.Stop()
+
+	// Verify reachability.
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+	if err != nil {
+		t.Fatalf("could not reach server: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 }

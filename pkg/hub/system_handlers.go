@@ -17,7 +17,10 @@ package hub
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -31,7 +34,6 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/runtime"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/GoogleCloudPlatform/scion/pkg/util"
-	yamlv3 "gopkg.in/yaml.v3"
 )
 
 // --- 2.1: System Check (Doctor) ---
@@ -82,7 +84,7 @@ func GatherDiagnostics(ctx context.Context, cfg *config.VersionedSettings) []Dia
 
 func (s *Server) handleSystemCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet)
 		return
 	}
 
@@ -138,7 +140,7 @@ func (s *Server) handleSystemRuntime(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		s.handlePutRuntime(w, r)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet, http.MethodPut)
 	}
 }
 
@@ -148,8 +150,10 @@ func (s *Server) handleGetRuntime(w http.ResponseWriter, r *http.Request) {
 	allRuntimes := config.DetectAllLocalRuntimes()
 
 	var configured string
-	globalDir, err := config.GetGlobalDir()
-	if err == nil {
+	if ops := s.GetOperationalSettings(); ops != nil {
+		// The DB profiles section is authoritative (see handlePutRuntime).
+		configured = ops.Snapshot().Profiles[activeProfileName()].Runtime
+	} else if globalDir, err := config.GetGlobalDir(); err == nil {
 		if vs, loadErr := config.LoadSingleFileVersioned(globalDir); loadErr == nil && vs != nil {
 			activeProfile := vs.ActiveProfile
 			if activeProfile == "" {
@@ -183,45 +187,88 @@ func (s *Server) handlePutRuntime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Profiles are a Layer-1 section. With OperationalSettings the DB row
+	// (merged over disk through the settings overlay) is authoritative, so a
+	// settings.yaml write would have no effect; write the section instead.
+	if ops := s.GetOperationalSettings(); ops != nil {
+		if err := s.putRuntimeProfileToDB(r.Context(), ops, activeProfileName(), req.Runtime, updatedByFromRequest(r)); err != nil {
+			if errors.Is(err, store.ErrRevisionConflict) {
+				writeError(w, http.StatusConflict, ErrCodeConflict, "runtime setting changed concurrently; retry", nil)
+				return
+			}
+			if errors.Is(err, ErrSectionValidation) {
+				ValidationError(w, fmt.Sprintf("runtime setting rejected: %v", err), nil)
+				return
+			}
+			slog.Error("PUT system/runtime: failed to update profiles section", "error", err)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save runtime setting", nil)
+			return
+		}
+		s.applyRuntimeChange()
+		writeJSON(w, http.StatusOK, systemRuntimeResponse{
+			Detected:   req.Runtime,
+			Configured: req.Runtime,
+			Available:  true,
+		})
+		return
+	}
+
 	globalDir, err := config.GetGlobalDir()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "cannot determine config directory", nil)
 		return
 	}
 
-	vs, err := config.LoadSingleFileVersioned(globalDir)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to load settings", nil)
-		return
-	}
+	// Resolve the effective active profile before taking the settings-file
+	// lock (LoadEffectiveSettings reads the files without it). The
+	// single-file load doesn't merge embedded defaults, so ActiveProfile may
+	// be empty there; update the same profile the server reads at startup
+	// (e.g. "local" from defaults).
+	effectiveActive := activeProfileName()
 
-	activeProfile := vs.ActiveProfile
-	if activeProfile == "" {
-		// The single-file load doesn't merge embedded defaults, so ActiveProfile
-		// may be empty. Resolve the effective active profile so we update the same
-		// profile the server will read at startup (e.g. "local" from defaults).
-		if effective, _, eErr := config.LoadEffectiveSettings(""); eErr == nil && effective != nil && effective.ActiveProfile != "" {
-			activeProfile = effective.ActiveProfile
-		} else {
-			activeProfile = "default"
+	// Load, modify and save under the settings-file lock so a concurrent
+	// writer (server-config PUT, broker token) is not reverted.
+	err = config.LoadModifySaveVersionedSettings(globalDir, func(vs *config.VersionedSettings) error {
+		activeProfile := vs.ActiveProfile
+		if activeProfile == "" {
+			activeProfile = effectiveActive
 		}
-	}
-
-	if vs.Profiles == nil {
-		vs.Profiles = make(map[string]config.V1ProfileConfig)
-	}
-	profile := vs.Profiles[activeProfile]
-	profile.Runtime = req.Runtime
-	vs.Profiles[activeProfile] = profile
-
-	if err := config.SaveVersionedSettings(globalDir, vs); err != nil {
+		if vs.Profiles == nil {
+			vs.Profiles = make(map[string]config.V1ProfileConfig)
+		}
+		profile := vs.Profiles[activeProfile]
+		profile.Runtime = req.Runtime
+		vs.Profiles[activeProfile] = profile
+		return nil
+	})
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save runtime setting", nil)
 		return
 	}
 
-	// Update the image checker and co-located broker runtime so they use
-	// the newly selected runtime instead of the previously configured one.
-	rt := runtime.GetRuntime("", "")
+	s.applyRuntimeChange()
+
+	writeJSON(w, http.StatusOK, systemRuntimeResponse{
+		Detected:   req.Runtime,
+		Configured: req.Runtime,
+		Available:  true,
+	})
+}
+
+// systemRuntimeProjectPath is the project path the system runtime handlers
+// pass to runtime.GetRuntime: the "global" alias, which
+// config.ResolveProjectPath maps to the global settings directory. The
+// co-located broker resolves its default runtime the same way at startup
+// and on a reload (cmd serverRuntimeProjectPath), so the hub never resolves
+// a runtime from a project found from the server's working directory
+// (ptone/scion#5362).
+const systemRuntimeProjectPath = "global"
+
+// applyRuntimeChange updates the image checker and co-located broker runtime
+// so they use the newly selected runtime instead of the previously
+// configured one.
+func (s *Server) applyRuntimeChange() {
+	rt := runtime.GetRuntime(systemRuntimeProjectPath, "")
 	s.SetLocalImageChecker(rt)
 
 	s.mu.RLock()
@@ -230,12 +277,81 @@ func (s *Server) handlePutRuntime(w http.ResponseWriter, r *http.Request) {
 	if reloadFn != nil {
 		reloadFn()
 	}
+}
 
-	writeJSON(w, http.StatusOK, systemRuntimeResponse{
-		Detected:   req.Runtime,
-		Configured: req.Runtime,
-		Available:  true,
-	})
+// activeProfileName returns the profile the server resolves at startup:
+// the effective settings' configured active profile, or "default". It reads
+// ConfiguredActiveProfile, not ActiveProfile, so the settings overlay's
+// single-stored-profile fallback never redirects the system-runtime GET or
+// PUT onto the only stored profile. The settings are the global ones, like
+// the server's startup loads: never a project found from the working
+// directory (ptone/scion#5362).
+func activeProfileName() string {
+	globalDir, err := config.GetGlobalDir()
+	if err != nil {
+		return "default"
+	}
+	if effective, _, err := config.LoadEffectiveSettings(globalDir); err == nil && effective != nil {
+		if active := effective.ConfiguredActiveProfile(); active != "" {
+			return active
+		}
+	}
+	return "default"
+}
+
+// putRuntimeProfileToDB sets the runtime of the profile named by active in
+// the DB-owned profiles section. It merges: the base is the current row, or
+// with no row the effective profiles (bootstrap material), so other
+// profiles and the active profile's other fields are kept. A managed row's
+// image_registry values are kept; a seeded row's or the bootstrap's are
+// file copies and are not carried into the managed row, and a change that
+// leaves that filtered base as it is writes nothing (ptone/scion#3916).
+// The write is CAS on the base revision.
+func (s *Server) putRuntimeProfileToDB(ctx context.Context, ops *OperationalSettings, active, rt, updatedBy string) error {
+	var baseRev int64 // 0 = create-only when there is no row yet
+	var current *store.HubSetting
+	row, err := ops.store.GetHubSetting(ctx, "profiles")
+	switch {
+	case err == nil:
+		current, baseRev = row, row.Revision
+	case errors.Is(err, store.ErrNotFound):
+	default:
+		return fmt.Errorf("reading current profiles row: %w", err)
+	}
+	base, err := profilesFilteredBase(ops, current)
+	if err != nil {
+		return fmt.Errorf("decoding current profiles row: %w", err)
+	}
+	profiles := map[string]config.V1ProfileConfig{}
+	if err := json.Unmarshal(base, &profiles); err != nil {
+		return fmt.Errorf("decoding current profiles row: %w", err)
+	}
+	if profiles == nil {
+		profiles = map[string]config.V1ProfileConfig{}
+	}
+
+	profile := profiles[active]
+	profile.Runtime = rt
+	profiles[active] = profile
+
+	doc, err := json.Marshal(profiles)
+	if err != nil {
+		return fmt.Errorf("encoding profiles section: %w", err)
+	}
+	if sameAsFilteredBase(doc, base) {
+		return nil
+	}
+	_, err = ops.Update(ctx, "profiles", doc, updatedBy, baseRev, "managed")
+	return err
+}
+
+// updatedByFromRequest returns the caller's email for settings audit
+// fields, or "" when the request carries no identity.
+func updatedByFromRequest(r *http.Request) string {
+	if user := GetUserIdentityFromContext(r.Context()); user != nil {
+		return user.Email()
+	}
+	return ""
 }
 
 // --- 2.2b: Registry PUT ---
@@ -250,7 +366,7 @@ type putRegistryResponse struct {
 
 func (s *Server) handleSystemRegistry(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPut)
 		return
 	}
 
@@ -270,28 +386,70 @@ func (s *Server) handleSystemRegistry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// image_registry is a Layer-1 key (endpoints section). With
+	// OperationalSettings the DB row is authoritative and a settings.yaml
+	// write would have no effect, so write the section instead.
+	if ops := s.GetOperationalSettings(); ops != nil {
+		// Merged on the current endpoints row: only image_registry
+		// changes, and the row revision read is the CAS base.
+		value, err := json.Marshal(req.ImageRegistry)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save image registry setting", nil)
+			return
+		}
+		sent := map[string]json.RawMessage{"image_registry": value}
+		reqDoc, err := json.Marshal(sent)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save image registry setting", nil)
+			return
+		}
+		// The image_registry rule applies (ptone/scion#3916): a value
+		// equal to the one GET shows for an unsaved key is not stored, and
+		// a save that leaves the filtered base as it is writes nothing, so
+		// a seeded row keeps its origin and revision.
+		var filteredBase json.RawMessage
+		doc, baseRev, err := mergeSectionOnCurrentWith(r.Context(), ops, "endpoints", reqDoc,
+			&fieldPresence{raw: sent}, endpointsMergeOptions(ops, &filteredBase))
+		if err != nil {
+			slog.Error("PUT system/registry: failed to build endpoints document", "error", err)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save image registry setting", nil)
+			return
+		}
+		if sameAsFilteredBase(doc, filteredBase) {
+			writeJSON(w, http.StatusOK, putRegistryResponse(req))
+			return
+		}
+		if _, err := ops.Update(r.Context(), "endpoints", doc, updatedByFromRequest(r), baseRev, "managed"); err != nil {
+			if errors.Is(err, store.ErrRevisionConflict) {
+				writeError(w, http.StatusConflict, ErrCodeConflict, "image registry setting changed concurrently; retry", nil)
+				return
+			}
+			if errors.Is(err, ErrSectionValidation) {
+				ValidationError(w, fmt.Sprintf("image registry setting rejected: %v", err), nil)
+				return
+			}
+			slog.Error("PUT system/registry: failed to update endpoints section", "error", err)
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save image registry setting", nil)
+			return
+		}
+		writeJSON(w, http.StatusOK, putRegistryResponse(req))
+		return
+	}
+
 	globalDir, err := config.GetGlobalDir()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "cannot determine config directory", nil)
 		return
 	}
 
-	vs, err := config.LoadSingleFileVersioned(globalDir)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to load settings", nil)
-		return
-	}
-
-	vs.ImageRegistry = req.ImageRegistry
-
-	if err := config.SaveVersionedSettings(globalDir, vs); err != nil {
+	// Load, modify and save under the settings-file lock.
+	if err := config.LoadModifySaveVersionedSettings(globalDir, func(vs *config.VersionedSettings) error {
+		vs.ImageRegistry = req.ImageRegistry
+		return nil
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to save image registry setting", nil)
 		return
 	}
-
-	s.mu.Lock()
-	s.config.MaintenanceConfig.ImageRegistry = req.ImageRegistry
-	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, putRegistryResponse(req))
 }
@@ -303,7 +461,6 @@ type OnboardingStatus struct {
 	IdentitySet         bool   `json:"identitySet"`
 	RuntimeOK           bool   `json:"runtimeOK"`
 	HarnessesSeeded     bool   `json:"harnessesSeeded"`
-	ImagesPresent       bool   `json:"imagesPresent"`
 	HasWorkspace        bool   `json:"hasWorkspace"`
 	Complete            bool   `json:"complete"`
 	EmbeddedBrokerID    string `json:"embeddedBrokerID,omitempty"`
@@ -316,6 +473,14 @@ type OnboardingStatus struct {
 	GCloudADCAvailable  bool   `json:"gcloudADCAvailable"`
 	AutoInjectGcloudADC bool   `json:"autoInjectGcloudADC"`
 	Workstation         bool   `json:"workstation"`
+
+	// ImageRegistrySource is the layer ImageRegistry comes from
+	// (config.ImageRegistrySource: node_env, hub_db, file or default).
+	ImageRegistrySource string `json:"imageRegistrySource,omitempty"`
+	// ImageRegistrySaveable is the value the setup wizard may pre-fill and
+	// save: the saved hub value, else the settings-file value, never a node
+	// env (ptone/scion#3916).
+	ImageRegistrySaveable string `json:"imageRegistrySaveable,omitempty"`
 }
 
 func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
@@ -355,9 +520,6 @@ func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 		}
 	}
 
-	// ImagesPresent: best-effort check — skip for now (optional per spec)
-	status.ImagesPresent = false
-
 	// HasWorkspace: at least one project in the store
 	if s.store != nil {
 		result, err := s.store.ListProjects(ctx, store.ProjectFilter{}, store.ListOptions{Limit: 1})
@@ -366,18 +528,21 @@ func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 		}
 	}
 
-	// Complete: all required steps done (ImagesPresent is optional)
+	// Complete: all required steps done
 	status.Complete = status.Initialized && status.IdentitySet && status.RuntimeOK && status.HarnessesSeeded
 
 	status.EmbeddedBrokerID = s.GetEmbeddedBrokerID()
 
-	// ImageRegistry: resolve configured image registry
-	if vs, loadErr := config.LoadSingleFileVersioned(globalDir); loadErr == nil && vs != nil {
-		status.ImageRegistry = vs.ResolveImageRegistry("")
-	}
-	// TODO: use an internal settings API when available (needed for HA/DB-backed settings)
-	if envRegistry := os.Getenv("SCION_IMAGE_REGISTRY"); envRegistry != "" {
-		status.ImageRegistry = envRegistry
+	// ImageRegistry: the hub-scope value and its layer, plus the value the
+	// wizard may save (never a node env).
+	resolved := s.hubScopeImageRegistry()
+	// Shown, never saved from here: redacted (config.RedactImageRegistry).
+	status.ImageRegistry = config.RedactImageRegistry(resolved.Value)
+	status.ImageRegistrySource = string(resolved.Source)
+	if ops := s.GetOperationalSettings(); ops != nil {
+		status.ImageRegistrySaveable = shownImageRegistry(ops)
+	} else {
+		status.ImageRegistrySaveable = fileImageRegistryWithoutOps()
 	}
 
 	// BuildAvailable: true only if the build script can be resolved
@@ -419,7 +584,7 @@ func (s *Server) computeOnboardingStatus(ctx context.Context) OnboardingStatus {
 
 func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet)
 		return
 	}
 
@@ -445,7 +610,7 @@ type systemInitResponse struct {
 
 func (s *Server) handleSystemInit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -581,9 +746,12 @@ type imagePullResponse struct {
 	JobID string `json:"jobId"`
 }
 
+// systemImagePuller is the signature of runtime.PullImages.
+type systemImagePuller func(ctx context.Context, rt runtime.Runtime, harnesses []string, registry, tag string, onEvent func(runtime.PullResult)) error
+
 func (s *Server) handleSystemImagesPull(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -610,17 +778,10 @@ func (s *Server) handleSystemImagesPull(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	var registry string
-	globalDir, err := config.GetGlobalDir()
-	if err == nil {
-		if vs, loadErr := config.LoadSingleFileVersioned(globalDir); loadErr == nil && vs != nil {
-			registry = vs.ResolveImageRegistry("")
-		}
-	}
-	// TODO: use an internal settings API when available (needed for HA/DB-backed settings)
-	if envRegistry := os.Getenv("SCION_IMAGE_REGISTRY"); envRegistry != "" {
-		registry = envRegistry
-	}
+	registry := s.resolveImageRegistry()
+	// The harness images take the hub-scope image_tag (ptone/scion#6625);
+	// "" when none applies (imageTagStateOf).
+	imageTag := s.hubScopeImageTag()
 	if registry == "" {
 		s.imagePullActive.Store(false)
 		writeError(w, http.StatusUnprocessableEntity, ErrCodeUnprocessable, "image_registry is not configured — run 'scion config set --global image_registry <registry>' or reinstall via Homebrew", nil)
@@ -629,13 +790,17 @@ func (s *Server) handleSystemImagesPull(w http.ResponseWriter, r *http.Request) 
 
 	jobID := api.NewUUID()
 
-	rt := runtime.GetRuntime("", "")
+	rt := runtime.GetRuntime(systemRuntimeProjectPath, "")
 
 	requestedHarnesses := req.Harnesses
+	pull := s.systemImagePull
+	if pull == nil {
+		pull = runtime.PullImages
+	}
 
 	go func() {
 		defer s.imagePullActive.Store(false)
-		if err := runtime.PullImages(s.ctx, rt, requestedHarnesses, registry, func(pr runtime.PullResult) {
+		if err := pull(s.ctx, rt, requestedHarnesses, registry, imageTag, func(pr runtime.PullResult) {
 			s.events.PublishRaw("system.images."+jobID, pr)
 		}); err != nil {
 			s.events.PublishRaw("system.images."+jobID, map[string]string{
@@ -661,11 +826,13 @@ func (s *Server) syncImageStatusAfterPull(ctx context.Context, harnesses []strin
 			slog.Error("syncImageStatusAfterPull: list failed", "harness", h, "error", err)
 			continue
 		}
-		for _, hc := range configs.Items {
-			if hc.Config == nil || hc.Config.Image == "" {
+		for i := range configs.Items {
+			hc := &configs.Items[i]
+			image := effectiveHarnessConfigImage(hc)
+			if image == "" {
 				continue
 			}
-			s.checkAndUpdateImageStatus(ctx, hc.ID, hc.Config.Image)
+			s.checkAndUpdateImageStatus(ctx, hc.ID, image)
 		}
 	}
 }
@@ -679,6 +846,72 @@ type imageBuildRequest struct {
 type imageBuildLogEvent struct {
 	Type string `json:"type"` // "log"
 	Line string `json:"line"`
+}
+
+// imageBuildLogMaxLine caps how many bytes of a single build-log line are
+// published. Longer lines are truncated, not fatal: the rest of the line is
+// read and discarded so the build keeps running.
+const imageBuildLogMaxLine = 1 << 20
+
+// imageBuildLogTruncatedFmt is appended (with imageBuildLogMaxLine) to a
+// build-log line that was cut at imageBuildLogMaxLine bytes.
+const imageBuildLogTruncatedFmt = " ... [line truncated at %d bytes]"
+
+// imageBuildLogReadBuf is the bufio.Reader size streamBuildLog reads with;
+// lines longer than this arrive from ReadLine in several fragments.
+const imageBuildLogReadBuf = 4096
+
+// streamBuildLog reads r line by line and calls emit for each line, without
+// the "\n" or "\r\n" terminator (a lone trailing "\r" on a final line with
+// no "\n" is kept). A line longer than imageBuildLogMaxLine is cut at that
+// length and marked as truncated. streamBuildLog reads r until EOF so that a
+// child process writing to r never blocks on a full pipe. On any other read
+// error it emits the pending partial line, makes a best-effort attempt to
+// discard what is left (a reader that keeps failing ends this at once; for a
+// pipe the realistic case is os.ErrClosed) and returns the error.
+func streamBuildLog(r io.Reader, emit func(string)) error {
+	br := bufio.NewReaderSize(r, imageBuildLogReadBuf)
+	var line []byte
+	truncated := false
+	flush := func() {
+		text := string(line)
+		if truncated {
+			text += fmt.Sprintf(imageBuildLogTruncatedFmt, imageBuildLogMaxLine)
+		}
+		emit(text)
+		line = line[:0]
+		truncated = false
+	}
+	for {
+		frag, isPrefix, err := br.ReadLine()
+		if err != nil {
+			if len(line) > 0 || truncated {
+				flush()
+			}
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			_, _ = io.Copy(io.Discard, br)
+			return err
+		}
+		if room := imageBuildLogMaxLine - len(line); len(frag) > room {
+			frag = frag[:room]
+			truncated = true
+		}
+		line = append(line, frag...)
+		if !isPrefix {
+			flush()
+		}
+	}
+}
+
+// imageBuildSubject returns the event subject for an image build's output.
+// Build output is delivered on the requesting user's own subject
+// (user.<userID>.images.<jobID>) rather than a shared system.* subject, so
+// only the session that started the build can subscribe to it: SSE
+// authorization admits user.<id>.* subjects only for that same user.
+func imageBuildSubject(userID, jobID string) string {
+	return "user." + userID + ".images." + jobID
 }
 
 func resolveBuildScript() string {
@@ -699,12 +932,20 @@ func resolveBuildScript() string {
 
 func (s *Server) handleSystemImagesBuild(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
 	if err := assertLoopback(r); err != nil {
 		writeError(w, http.StatusForbidden, ErrCodeForbidden, err.Error(), nil)
+		return
+	}
+
+	// Build output is scoped to the requesting user's subject, so a build
+	// needs a user identity to address it to.
+	requester := GetUserIdentityFromContext(r.Context())
+	if requester == nil || requester.ID() == "" {
+		writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "a user session is required to start an image build", nil)
 		return
 	}
 
@@ -752,50 +993,56 @@ func (s *Server) handleSystemImagesBuild(w http.ResponseWriter, r *http.Request)
 
 	buildStarted = true
 	jobID := api.NewUUID()
-	subject := "system.images." + jobID
+	subject := imageBuildSubject(requester.ID(), jobID)
 	requestedHarnesses := req.Harnesses
 
 	go func() {
 		defer s.imageBuildActive.Store(false)
-		cmd := exec.CommandContext(s.ctx, buildScript, "--target", "harnesses")
-		cmd.Dir = filepath.Dir(buildScript)
-
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			slog.Error("build: stdout pipe failed", "error", err)
-			s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "error: " + err.Error()})
-			return
-		}
-		cmd.Stderr = cmd.Stdout
-
-		if err := cmd.Start(); err != nil {
-			slog.Error("build: start failed", "error", err)
-			s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "error: " + err.Error()})
-			return
-		}
-
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: scanner.Text()})
-		}
-		if err := scanner.Err(); err != nil {
-			s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "error reading build log: " + err.Error()})
-		}
-
-		if err := cmd.Wait(); err != nil {
-			s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build failed: " + err.Error()})
-		} else {
-			for _, h := range requestedHarnesses {
-				s.events.PublishRaw(subject, map[string]string{
-					"image":  "scion-" + h + ":latest",
-					"status": "done",
-				})
-			}
-			s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build complete"})
-		}
+		s.runImageBuild(s.ctx, subject, buildScript, requestedHarnesses)
 	}()
 
 	writeJSON(w, http.StatusOK, imagePullResponse{JobID: jobID})
+}
+
+// runImageBuild runs the build script and publishes its output, line by line,
+// followed by per-image completion events, on subject. It blocks until the
+// script exits.
+func (s *Server) runImageBuild(ctx context.Context, subject, buildScript string, harnesses []string) {
+	cmd := exec.CommandContext(ctx, buildScript, "--target", "harnesses")
+	cmd.Dir = filepath.Dir(buildScript)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		slog.Error("build: stdout pipe failed", "error", err)
+		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "error: " + err.Error()})
+		return
+	}
+	cmd.Stderr = cmd.Stdout
+
+	if err := cmd.Start(); err != nil {
+		slog.Error("build: start failed", "error", err)
+		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "error: " + err.Error()})
+		return
+	}
+
+	if err := streamBuildLog(stdout, func(line string) {
+		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: line})
+	}); err != nil {
+		slog.Error("build: reading build log failed", "error", err)
+		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "error reading build log: " + err.Error()})
+	}
+
+	if err := cmd.Wait(); err != nil {
+		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build failed: " + err.Error()})
+	} else {
+		for _, h := range harnesses {
+			s.events.PublishRaw(subject, map[string]string{
+				"image":  "scion-" + h + ":latest",
+				"status": "done",
+			})
+		}
+		s.events.PublishRaw(subject, imageBuildLogEvent{Type: "log", Line: "build complete"})
+	}
 }
 
 // --- 5.2: Filesystem Endpoints ---
@@ -813,7 +1060,7 @@ type fsListResponse struct {
 
 func (s *Server) handleFSList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet)
 		return
 	}
 
@@ -902,7 +1149,7 @@ type fsMkdirResponse struct {
 
 func (s *Server) handleFSMkdir(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -982,13 +1229,13 @@ type fsValidatePathResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
-// handleFSValidatePath classifies a candidate path for linked-grove creation.
-// Intentionally no home-directory fence: linked groves may reference directories
+// handleFSValidatePath classifies a candidate path for linked-project creation.
+// Intentionally no home-directory fence: linked projects may reference directories
 // anywhere on disk (e.g. external drives, /opt projects). Safety is enforced by
 // ClassifyPath's managed-path overlap check and the assertLoopback guard.
 func (s *Server) handleFSValidatePath(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
@@ -1045,7 +1292,7 @@ func (s *Server) handleAppleDNS(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		s.handleAppleDNSSetup(w, r)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet, http.MethodPost)
 	}
 }
 
@@ -1083,10 +1330,9 @@ type workstationSettingsRequest struct {
 }
 
 // handleWorkstationSettings handles PATCH /api/v1/system/workstation-settings.
-// It allows toggling workstation-level settings without requiring admin role.
 func (s *Server) handleWorkstationSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPatch {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodPatch)
 		return
 	}
 
@@ -1101,44 +1347,40 @@ func (s *Server) handleWorkstationSettings(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	globalDir, err := config.GetGlobalDir()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to resolve settings directory", nil)
 		return
 	}
 
-	settingsPath := filepath.Join(globalDir, "settings.yaml")
-
-	var raw map[string]interface{}
-	if data, readErr := os.ReadFile(settingsPath); readErr == nil {
-		if err := yamlv3.Unmarshal(data, &raw); err != nil {
-			writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to parse settings file", nil)
+	// Edit settings.yaml in place under the settings lock (LockSettingsDir)
+	// (not s.mu: the server-config PUT holds the file lock across DB writes
+	// that take s.mu, so taking them in the other order could deadlock).
+	// false removes the key, matching the server-config PUT's omitempty
+	// handling.
+	edit := config.SettingsPathEdit{Path: []string{"auto_inject_gcloud_adc"}, Value: true}
+	if !*req.AutoInjectGcloudADC {
+		edit = config.SettingsPathEdit{Path: []string{"auto_inject_gcloud_adc"}, Delete: true}
+	}
+	err = func() error {
+		lock, err := config.LockSettingsDir(globalDir)
+		if err != nil {
+			return err
+		}
+		defer lock.Unlock()
+		staged, err := config.PrepareSettingsPathEdits(globalDir, []config.SettingsPathEdit{edit})
+		if err != nil {
+			return err
+		}
+		return staged.Commit(lock)
+	}()
+	if err != nil {
+		slog.Error("Failed to write workstation settings", "error", err)
+		if errors.Is(err, config.ErrSettingsPathEditUnsupported) {
+			writeError(w, http.StatusUnprocessableEntity, ErrCodeValidationError,
+				"settings.yaml cannot be edited in place (it uses YAML anchors/aliases or is JSON); edit the file by hand", nil)
 			return
 		}
-	} else if !os.IsNotExist(readErr) {
-		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to read settings file", nil)
-		return
-	}
-	if raw == nil {
-		raw = make(map[string]interface{})
-	}
-
-	raw["auto_inject_gcloud_adc"] = *req.AutoInjectGcloudADC
-
-	if _, ok := raw["schema_version"]; !ok {
-		raw["schema_version"] = "1"
-	}
-
-	newData, err := yamlv3.Marshal(raw)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to marshal settings", nil)
-		return
-	}
-
-	if err := os.WriteFile(settingsPath, newData, 0644); err != nil {
 		writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "Failed to write settings file", nil)
 		return
 	}

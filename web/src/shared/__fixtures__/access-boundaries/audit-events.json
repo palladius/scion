@@ -1,0 +1,48 @@
+{
+  "$fixture": {
+    "endpoint": "GET /api/v1/admin/access-constraints/ac-42/audit?pageSize=50",
+    "status": 200,
+    "designRef": "audit-update #2405 retained live-constraint history",
+    "notes": "Purpose-specific retained columns only; no rendered audit envelope or credential detail."
+  },
+  "items": [
+    {
+      "id": "aev-91c4",
+      "constraintId": "ac-42",
+      "operation": "update",
+      "actorKind": "user",
+      "actorId": "usr-mori",
+      "correlationId": "req-3c0e91aa",
+      "batchOperationId": "",
+      "beforeRevision": "6",
+      "afterRevision": "7",
+      "classification": "mixed",
+      "previewId": "apv-77b",
+      "draftHash": "sha256-retained-integrity-value",
+      "impactCounts": { "agents": 12, "users": 3, "projects": 1 },
+      "changedFields": ["maximum_permissions", "purpose"],
+      "timestamp": "2026-08-28T11:03:47Z"
+    },
+    {
+      "id": "aev-0041",
+      "constraintId": "ac-42",
+      "operation": "create",
+      "actorKind": "user",
+      "actorId": "usr-lin",
+      "beforeRevision": null,
+      "afterRevision": "1",
+      "classification": "tighten",
+      "previewId": "apv-001",
+      "impactCounts": { "agents": 8, "users": 2, "projects": 1 },
+      "changedFields": ["maximum_permissions"],
+      "timestamp": "2026-06-02T18:14:02Z"
+    }
+  ],
+  "nextPageToken": "opaque-tuple-cursor",
+  "totalCount": 2,
+  "totalCountExact": true,
+  "retention": {
+    "maxRows": 1000,
+    "note": "Current retained rows for this live access constraint; not a lifetime or pagination-snapshot total."
+  }
+}

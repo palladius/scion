@@ -36,11 +36,39 @@ var ErrNoSecretBackend = errors.New("no secret backend is configured; set SCION_
 type PermissionError struct {
 	Operation string // e.g., "create secret", "access secret version"
 	Err       error  // the underlying error
+
+	// HubPrefix and ProjectID, when set, let Error() suggest a least-privilege,
+	// hub-scoped conditioned IAM grant instead of only the broad project-wide
+	// role (ptone/scion#2152). Both are best-effort: GCPBackend fills them in
+	// from what it already knows (its own hub prefix and configured project
+	// ID), so the hint is only omitted if the backend construction path
+	// somehow left them unset.
+	HubPrefix string
+	ProjectID string
 }
 
 func (e *PermissionError) Error() string {
-	return fmt.Sprintf("failed to %s: the Hub service account lacks the required Secret Manager permission. "+
+	msg := fmt.Sprintf("failed to %s: the Hub service account lacks the required Secret Manager permission. "+
 		"Grant roles/secretmanager.admin to the Hub Runner service account", e.Operation)
+	if e.HubPrefix != "" {
+		// PROJECT_NUMBER (not the project ID) is required by the condition
+		// syntax; we only know the project ID here, so the hint names it
+		// separately rather than substituting it into the resource path.
+		msg += fmt.Sprintf(". In a GCP project shared by multiple hubs, prefer a conditioned grant scoped to this "+
+			"hub's own secrets over a project-wide grant: resource.name.startsWith(\"projects/<PROJECT_NUMBER>/secrets/%s\")"+
+			" (PROJECT_NUMBER, not the project ID%s)",
+			e.HubPrefix, projectIDHint(e.ProjectID))
+	}
+	return msg
+}
+
+// projectIDHint formats an optional " for <projectID>, run `gcloud projects
+// describe <projectID> --format='value(projectNumber)'` to find it" clause.
+func projectIDHint(projectID string) string {
+	if projectID == "" {
+		return ""
+	}
+	return fmt.Sprintf(" — for %s, run `gcloud projects describe %s --format='value(projectNumber)'` to find it", projectID, projectID)
 }
 
 func (e *PermissionError) Unwrap() error {
@@ -94,6 +122,20 @@ type SecretWithValue struct {
 	Value string `json:"-"` // Never serialized
 }
 
+// UpdateMetaInput contains fields for a metadata-only secret update.
+// Only non-zero fields are updated. The secret value is never touched.
+type UpdateMetaInput struct {
+	Name          string
+	Scope         string
+	ScopeID       string
+	Description   *string // pointer to distinguish "" (clear) from nil (no change)
+	InjectionMode string  // "" means no change
+	SecretType    string  // "" means no change
+	Target        string  // "" means no change
+	AllowProgeny  *bool   // pointer to distinguish false from nil
+	UpdatedBy     string
+}
+
 // SetSecretInput provides the data needed to create or update a secret.
 type SetSecretInput struct {
 	Name          string // Secret key name
@@ -121,13 +163,88 @@ type ResolveOpts struct {
 	// access via the policy engine. If nil, progeny secrets are not included.
 	// Returns true if access is allowed.
 	AuthzCheck func(secret SecretMeta) bool
+
+	// UserScopeCheck, when non-nil, is called for each user-scope secret
+	// of the userID scope (the owner path, not the progeny path) before its
+	// value is read. A secret it rejects is skipped, so a lower-scope secret
+	// with the same key stays in effect. If nil, no such check is made.
+	UserScopeCheck func(secret SecretMeta) bool
+}
+
+// ErrValueAccess matches (errors.Is) a FetchResult.Err for a value the
+// backend's external secret store (GCP Secret Manager) could not return,
+// other than not found. GCPBackend.Resolve skips such a secret; a caller
+// that selects through FetchValues may do the same.
+var ErrValueAccess = errors.New("secret value could not be read from the external secret store")
+
+// FetchResult holds the outcome of fetching one secret's value by its
+// recorded metadata. Value is meaningful only when Err is nil; a failed item
+// always carries an empty Value, never a partially-successful one. It is
+// returned by LocalBackend.FetchValues and GCPBackend.FetchValues (see their
+// doc comments for the shared contract).
+type FetchResult struct {
+	Value string
+	// Ref is the external reference the value was read from, in the form
+	// Resolve reports as SecretMeta.SecretRef for the same record, so a
+	// caller that delivers fetched values hands brokers the same reference
+	// Resolve did. On the GCP backend it is the Secret Manager resource path
+	// (projects/<project>/secrets/<name>, never the stored "gcpsm:" form),
+	// including the computed name for a record with no stored gcpsm ref; on
+	// the local backend it is the record's stored ref (normally empty).
+	// Empty when Err is set.
+	Ref string
+	// Err is store.ErrNotFound for a record deleted, replaced or
+	// reclassified since its metadata was recorded; a *ResolveDecryptError
+	// (errors.Is ErrResolveDecrypt) for a stored value that cannot be
+	// decrypted; an error matching ErrValueAccess for an external secret
+	// store read failure; otherwise the store read error.
+	Err error
 }
 
 // SecretBackend defines the interface for secret storage operations.
 // Implementations include local (wrapping store.SecretStore) and GCP Secret Manager.
 type SecretBackend interface {
-	// Get retrieves a secret including its value.
+	// Get retrieves a secret including its value, keyed by name/scope/scopeId
+	// rather than a specific recorded metadata version. It exists for the
+	// fixed set of hub-internal callers that read a value directly, outside
+	// the material-selection flow: hub infrastructure secrets (signing keys,
+	// OIDC keys, telemetry credentials), hub-side git clone credentials that
+	// are never delivered to an agent, and the agent material paths that
+	// have not yet switched to FetchValues. On the GCP backend, when no Hub
+	// database record exists, Get still falls back to a Secret Manager
+	// lookup by a computed name, to recover from a database reset; that
+	// fallback is exactly what FetchValues does not do for a *missing*
+	// record. Anything selected for delivery to an agent should use
+	// FetchValues, which resolves a specific recorded metadata version and
+	// never falls back to a by-name lookup when the record is missing or
+	// mismatched (a matched GCP record with no stored ref is read by its
+	// computed name — hub-prefixed, then legacy with a WARN; see
+	// GCPBackend.FetchValues).
+	//
+	// A new caller must be written using one of the receiver names
+	// TestSecretBackendGet_CallersAreHubInternal (backend_test.go) matches —
+	// secretBackend, sb or Backend — or that drift guard must be updated to
+	// see it; it is a name-based regex scan, not a type-aware one.
 	Get(ctx context.Context, name, scope, scopeID string) (*SecretWithValue, error)
+
+	// FetchValues returns values for exactly the given metadata records,
+	// matched by ID, Version, AllowProgeny, CreatedBy and SecretType, keyed
+	// by each record's ID in the returned map. There is no fallback for a
+	// missing or mismatched record: a record that is no longer in the
+	// store, or whose current ID, Version, AllowProgeny, CreatedBy or
+	// SecretType no longer matches the recorded metadata, is reported as
+	// store.ErrNotFound for that item.
+	// The extra AllowProgeny/CreatedBy/SecretType comparison catches a
+	// same-Version metadata race that ID+Version alone would miss, since
+	// UpdateSecretMeta is a read-modify-write with no version predicate (see
+	// recordGenerationChanged in backend.go). A decrypt or backend-access
+	// failure is also reported as a per-item error; a failed item's value is
+	// always empty, never delivered as an empty string in place of an
+	// error. Records whose current SecretType is internal are refused with
+	// store.ErrNotFound, since internal secrets are never candidates for
+	// delivery. The returned outer error reports only a failure of the
+	// whole call, not a per-item failure.
+	FetchValues(ctx context.Context, metas []SecretMeta) (map[string]FetchResult, error)
 
 	// Set creates or updates a secret. Returns whether a new secret was created.
 	Set(ctx context.Context, input *SetSecretInput) (created bool, meta *SecretMeta, err error)
@@ -140,6 +257,10 @@ type SecretBackend interface {
 
 	// GetMeta retrieves secret metadata without the value.
 	GetMeta(ctx context.Context, name, scope, scopeID string) (*SecretMeta, error)
+
+	// UpdateMeta updates only the metadata of an existing secret.
+	// The secret value is not modified. Returns ErrNotFound if the secret doesn't exist.
+	UpdateMeta(ctx context.Context, input *UpdateMetaInput) (*SecretMeta, error)
 
 	// Resolve collects and merges secrets from all applicable scopes for an agent.
 	// Scopes are resolved in order, lowest first: runtime_broker < hub < project < user.

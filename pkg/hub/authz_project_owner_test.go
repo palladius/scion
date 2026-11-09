@@ -30,40 +30,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// addProjectMemberWithRole is a small helper that adds the given user to the
-// project's members group with the requested role.
-func addProjectMemberWithRole(t *testing.T, s store.Store, project *store.Project, userID, role string) {
-	t.Helper()
-	ctx := context.Background()
-	membersGroup, err := s.GetGroupBySlug(ctx, "project:"+project.Slug+":members")
-	require.NoError(t, err)
-	require.NoError(t, s.AddGroupMember(ctx, &store.GroupMember{
-		GroupID:    membersGroup.ID,
-		MemberType: store.GroupMemberTypeUser,
-		MemberID:   userID,
-		Role:       role,
-	}))
-}
-
-// makeProjectMemberUser creates a user, adds them to hub-members, and adds them
-// to the project's members group with the given role.
-func makeProjectMemberUser(t *testing.T, s store.Store, project *store.Project, id, name, role string) *store.User {
-	t.Helper()
-	ctx := context.Background()
-	u := &store.User{
-		ID:          id,
-		Email:       id + "@test.com",
-		DisplayName: name,
-		Role:        store.UserRoleMember,
-		Status:      "active",
-		Created:     time.Now(),
-	}
-	require.NoError(t, s.CreateUser(ctx, u))
-	ensureHubMembership(ctx, s, u.ID)
-	addProjectMemberWithRole(t, s, project, u.ID, role)
-	return u
-}
-
 // =============================================================================
 // AuthzService.CheckAccess: project owner/admin bypass
 // =============================================================================
@@ -78,7 +44,9 @@ func TestAuthz_ProjectOwnerBypass_NonCreatorOwnerCanUpdateProject(t *testing.T) 
 	user := NewAuthenticatedUser(bob.ID, bob.Email, bob.DisplayName, "member", "api")
 	decision := srv.authzService.CheckAccess(ctx, user, projectResource(project), ActionUpdate)
 	assert.True(t, decision.Allowed, "non-creator owner should be allowed to update project; reason=%q", decision.Reason)
-	assert.Equal(t, "project owner/admin", decision.Reason)
+	// CO1: The AK1 kernel evaluates role bindings; the project-owner role
+	// binding grants project.update, so the reason is "role binding grant".
+	assert.Equal(t, "role binding grant", decision.Reason)
 }
 
 func TestAuthz_ProjectOwnerBypass_NonCreatorAdminCanDeleteAgent(t *testing.T) {
@@ -98,8 +66,10 @@ func TestAuthz_ProjectOwnerBypass_NonCreatorAdminCanDeleteAgent(t *testing.T) {
 
 	user := NewAuthenticatedUser(bob.ID, bob.Email, bob.DisplayName, "member", "api")
 	decision := srv.authzService.CheckAccess(ctx, user, agentResource(a), ActionDelete)
-	assert.True(t, decision.Allowed, "project admin should be allowed to delete agents owned by other members; reason=%q", decision.Reason)
-	assert.Equal(t, "project owner/admin", decision.Reason)
+	// CO1: The project-admin role excludes all *.delete permissions, so
+	// project admins can no longer delete agents owned by other members.
+	assert.False(t, decision.Allowed, "project admin should NOT be allowed to delete agents (project-admin excludes *.delete); reason=%q", decision.Reason)
+	assert.Equal(t, `active bindings do not include permission "agent.delete"`, decision.Reason)
 }
 
 func TestAuthz_ProjectOwnerBypass_RegularMemberCannotUpdateProject(t *testing.T) {
@@ -111,6 +81,69 @@ func TestAuthz_ProjectOwnerBypass_RegularMemberCannotUpdateProject(t *testing.T)
 	user := NewAuthenticatedUser(carol.ID, carol.Email, carol.DisplayName, "member", "api")
 	decision := srv.authzService.CheckAccess(ctx, user, projectResource(project), ActionUpdate)
 	assert.False(t, decision.Allowed, "regular member should NOT be allowed to update project; reason=%q", decision.Reason)
+}
+
+func TestAuthz_ScopedAdminUATProjectUpdateRequiresIndependentGrant(t *testing.T) {
+	t.Run("admin role alone denied", func(t *testing.T) {
+		srv, _, _, _, project := setupDemoPolicyTest(t)
+		ctx := context.Background()
+
+		admin := NewAuthenticatedUser(tid("scoped-admin-no-grant"), "scoped-admin-no-grant@test.com", "Scoped Admin", store.UserRoleAdmin, "api")
+		scoped := NewScopedUserIdentity(admin, project.ID, []string{store.UATScopeProjectUpdate})
+
+		decision := srv.authzService.CheckAccess(ctx, scoped, projectResource(project), ActionUpdate)
+		assert.False(t, decision.Allowed, "scoped admin UAT must not inherit the role-only admin bypass; reason=%q", decision.Reason)
+		assert.NotEqual(t, "admin bypass", decision.Reason)
+	})
+
+	t.Run("explicit project policy grant allowed", func(t *testing.T) {
+		srv, s, _, _, project := setupDemoPolicyTest(t)
+		ctx := context.Background()
+
+		admin := &store.User{
+			ID:          tid("scoped-admin-policy-grant"),
+			Email:       "scoped-admin-policy-grant@test.com",
+			DisplayName: "Scoped Admin Policy Grant",
+			Role:        store.UserRoleAdmin,
+			Status:      "active",
+			Created:     time.Now(),
+		}
+		require.NoError(t, s.CreateUser(ctx, admin))
+		grantUserActionOnResource(t, s, admin.ID, "project", project.ID, ActionUpdate)
+
+		identity := NewAuthenticatedUser(admin.ID, admin.Email, admin.DisplayName, admin.Role, "api")
+		scoped := NewScopedUserIdentity(identity, project.ID, []string{store.UATScopeProjectUpdate})
+
+		decision := srv.authzService.CheckAccess(ctx, scoped, projectResource(project), ActionUpdate)
+		assert.True(t, decision.Allowed, "scoped admin UAT should use explicit policy grants after scope checks; reason=%q", decision.Reason)
+		assert.NotEqual(t, "admin bypass", decision.Reason)
+	})
+
+	t.Run("project admin membership allowed", func(t *testing.T) {
+		srv, s, _, _, project := setupDemoPolicyTest(t)
+		ctx := context.Background()
+
+		admin := &store.User{
+			ID:          tid("scoped-admin-project-admin"),
+			Email:       "scoped-admin-project-admin@test.com",
+			DisplayName: "Scoped Admin Project Admin",
+			Role:        store.UserRoleAdmin,
+			Status:      "active",
+			Created:     time.Now(),
+		}
+		require.NoError(t, s.CreateUser(ctx, admin))
+		ensureHubMembership(ctx, s, admin.ID)
+		addProjectMemberWithRole(t, s, project, admin.ID, store.GroupMemberRoleAdmin)
+
+		identity := NewAuthenticatedUser(admin.ID, admin.Email, admin.DisplayName, admin.Role, "api")
+		scoped := NewScopedUserIdentity(identity, project.ID, []string{store.UATScopeProjectUpdate})
+
+		decision := srv.authzService.CheckAccess(ctx, scoped, projectResource(project), ActionUpdate)
+		assert.True(t, decision.Allowed, "scoped admin UAT should use project admin membership after scope checks; reason=%q", decision.Reason)
+		// CO1: The AK1 kernel evaluates role bindings; the project-admin role
+		// binding grants project.update, so the reason is "role binding grant".
+		assert.Equal(t, "role binding grant", decision.Reason)
+	})
 }
 
 func TestAuthz_ProjectOwnerBypass_RegularMemberCannotDeleteOthersAgent(t *testing.T) {
@@ -138,9 +171,11 @@ func TestAuthz_ProjectOwnerBypass_CreatorOwnerStillWorks(t *testing.T) {
 
 	user := NewAuthenticatedUser(alice.ID, alice.Email, alice.DisplayName, "member", "api")
 	decision := srv.authzService.CheckAccess(ctx, user, projectResource(project), ActionUpdate)
-	assert.True(t, decision.Allowed, "project creator (direct OwnerID) should still be allowed; reason=%q", decision.Reason)
-	// The OwnerID bypass is checked before the project owner/admin bypass.
-	assert.Equal(t, "resource owner", decision.Reason)
+	assert.True(t, decision.Allowed, "project creator holding the project-owner binding should be allowed; reason=%q", decision.Reason)
+	// Project.OwnerID grants nothing on a project resource (ptone/scion#2586);
+	// alice's access comes only from the project-owner role binding created by
+	// seedProjectCreatorMembership, which includes project.update.
+	assert.Equal(t, "role binding grant", decision.Reason)
 }
 
 func TestAuthz_ProjectOwnerBypass_AppliesToProjectMembersGroup(t *testing.T) {
@@ -154,8 +189,10 @@ func TestAuthz_ProjectOwnerBypass_AppliesToProjectMembersGroup(t *testing.T) {
 
 	user := NewAuthenticatedUser(bob.ID, bob.Email, bob.DisplayName, "member", "api")
 	decision := srv.authzService.CheckAccess(ctx, user, groupResource(membersGroup), ActionAddMember)
-	assert.True(t, decision.Allowed, "non-creator project owner should be allowed to add members; reason=%q", decision.Reason)
-	assert.Equal(t, "project owner/admin", decision.Reason)
+	// CO1: The project-owner role does not include group.addMember, so this
+	// action is no longer granted via the project owner bypass.
+	assert.False(t, decision.Allowed, "project-owner role does not include group.addMember; reason=%q", decision.Reason)
+	assert.Equal(t, `active bindings do not include permission "group.addMember"`, decision.Reason)
 }
 
 func TestAuthz_ProjectOwnerBypass_IgnoresNonCanonicalExplicitProjectGroups(t *testing.T) {
@@ -211,7 +248,9 @@ func TestAuthz_ProjectOwnerBypass_CanonicalLookupIgnoresListLimit(t *testing.T) 
 	user := NewAuthenticatedUser(bob.ID, bob.Email, bob.DisplayName, "member", "api")
 	decision := srv.authzService.CheckAccess(ctx, user, projectResource(project), ActionUpdate)
 	assert.True(t, decision.Allowed, "canonical project members group must be found even with more than 10 explicit groups; reason=%q", decision.Reason)
-	assert.Equal(t, "project owner/admin", decision.Reason)
+	// CO1: The AK1 kernel evaluates role bindings; the project-owner role
+	// binding grants project.update, so the reason is "role binding grant".
+	assert.Equal(t, "role binding grant", decision.Reason)
 }
 
 func TestProjectMembersGroup_SlugSquatDoesNotGrantFutureProjectOwnership(t *testing.T) {
@@ -265,7 +304,7 @@ func TestProjectMembersGroup_SlugSquatDoesNotGrantFutureProjectOwnership(t *test
 		Updated:   time.Now(),
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
-	srv.createProjectMembersGroupAndPolicy(ctx, project)
+	srv.createProjectMembersGroup(ctx, project)
 
 	got, err := s.GetGroup(ctx, squatted.ID)
 	require.NoError(t, err)
@@ -309,12 +348,12 @@ func TestProjectMembersGroup_AllowsExistingSystemGroupForSameProject(t *testing.
 		GroupType: store.GroupTypeExplicit,
 		ProjectID: project.ID,
 		Annotations: map[string]string{
-			systemProjectMembersGroupAnnotation: "true",
+			store.AnnotationProjectMembersGroup: "true",
 		},
 	}
 	require.NoError(t, s.CreateGroup(ctx, membersGroup))
 
-	srv.createProjectMembersGroupAndPolicy(ctx, project)
+	srv.createProjectMembersGroup(ctx, project)
 
 	membership, err := s.GetGroupMembership(ctx, membersGroup.ID, store.GroupMemberTypeUser, creator.ID)
 	require.NoError(t, err)
@@ -333,10 +372,13 @@ func TestCapabilities_ProjectOwnerBypass_ProjectAllActions(t *testing.T) {
 
 	user := NewAuthenticatedUser(bob.ID, bob.Email, bob.DisplayName, "member", "api")
 	caps := srv.authzService.ComputeCapabilities(ctx, user, projectResource(project))
+	// Capabilities are the decision for each action.
 	for _, action := range ResourceActions["project"] {
-		assert.Contains(t, caps.Actions, string(action),
-			"non-creator project owner should have %q on project", action)
+		want := srv.authzService.CheckAccess(ctx, user, projectResource(project), action).Allowed
+		assert.Equal(t, want, capabilityAllows(caps, action),
+			"non-creator project owner capability %q must equal the decision", action)
 	}
+	assert.True(t, capabilityAllows(caps, ActionUpdate), "non-creator project owner can update the project")
 }
 
 func TestCapabilities_ProjectOwnerBypass_AgentAllActions(t *testing.T) {
@@ -355,8 +397,16 @@ func TestCapabilities_ProjectOwnerBypass_AgentAllActions(t *testing.T) {
 	user := NewAuthenticatedUser(bob.ID, bob.Email, bob.DisplayName, "member", "api")
 	caps := srv.authzService.ComputeCapabilities(ctx, user, agentResource(a))
 	for _, action := range ResourceActions["agent"] {
-		assert.Contains(t, caps.Actions, string(action),
-			"project owner should have %q on another member's agent", action)
+		// miller79/scion#88: attach/port_access to another member's agent
+		// would expose that member's user-scoped secrets.
+		if relationshipOnlyAgentActions[action] {
+			assert.NotContains(t, caps.Actions, string(action),
+				"project owner must NOT have %q on another member's agent", action)
+			continue
+		}
+		want := srv.authzService.CheckAccess(ctx, user, agentResource(a), action).Allowed
+		assert.Equal(t, want, capabilityAllows(caps, action),
+			"project owner capability %q on another member's agent must equal the decision", action)
 	}
 }
 
@@ -387,8 +437,16 @@ func TestCapabilities_ProjectOwnerBypass_BatchAllActions(t *testing.T) {
 	require.Len(t, capsList, 2)
 	for i, caps := range capsList {
 		for _, action := range ResourceActions["agent"] {
-			assert.Contains(t, caps.Actions, string(action),
-				"agent[%d]: project owner should have %q in batch result", i, action)
+			// miller79/scion#88: attach/port_access only on bob's own agent
+			// (index 1), never on alice's (index 0).
+			if relationshipOnlyAgentActions[action] && i == 0 {
+				assert.NotContains(t, caps.Actions, string(action),
+					"agent[%d]: project owner must NOT have %q on another member's agent", i, action)
+				continue
+			}
+			want := srv.authzService.CheckAccess(ctx, user, resources[i], action).Allowed
+			assert.Equal(t, want, capabilityAllows(caps, action),
+				"agent[%d]: project owner capability %q must equal the decision", i, action)
 		}
 	}
 }
@@ -500,9 +558,11 @@ func TestAuthz_GCPServiceAccount_ProjectScoped_OwnerBypassApplies(t *testing.T) 
 
 	user := NewAuthenticatedUser(alice.ID, alice.Email, alice.DisplayName, "member", "api")
 	decision := srv.authzService.CheckAccess(ctx, user, gcpServiceAccountResource(sa), ActionDelete)
-	assert.True(t, decision.Allowed,
-		"project owner should reach a project-scoped SA via the bypass; reason=%q", decision.Reason)
-	assert.Equal(t, "project owner/admin", decision.Reason)
+	// CO1: The project-owner role does not include gcp_service_account.delete,
+	// so the project owner bypass no longer grants delete on project-scoped SAs.
+	assert.False(t, decision.Allowed,
+		"project-owner role does not include gcp_service_account.delete; reason=%q", decision.Reason)
+	assert.Equal(t, `active bindings do not include permission "gcp_service_account.delete"`, decision.Reason)
 }
 
 // The regression this task exists to prevent. Goal 2 introduces hub-scoped SAs,
@@ -582,7 +642,65 @@ func TestCapabilities_GCPServiceAccount_HubScoped_NoProjectOwnerBypass(t *testin
 	assert.Equal(t, []string{"read", "assign"}, hubCaps.Actions,
 		"hub member should see read (hub-member-read-all) + assign (D5 baseline) on hub-scoped SA")
 
+	// The project-scoped control: each capability equals the decision.
 	projectCaps := srv.authzService.ComputeCapabilities(ctx, user, gcpServiceAccountResource(saProject))
-	assert.Equal(t, []string{"read", "delete", "verify", "assign"}, projectCaps.Actions,
-		"the project-scoped control should still get the full bypass")
+	for _, action := range ResourceActions["gcp_service_account"] {
+		want := srv.authzService.CheckAccess(ctx, user, gcpServiceAccountResource(saProject), action).Allowed
+		assert.Equal(t, want, capabilityAllows(projectCaps, action),
+			"project-scoped SA capability %q must equal the decision", action)
+	}
+}
+
+// relationshipOnlyAgentActions are agent actions the seeded project roles do
+// not carry; they come only from the owner or ancestor relationship to the
+// agent.
+var relationshipOnlyAgentActions = map[Action]bool{
+	ActionAttach: true,
+}
+
+// TestCapabilities_GCPServiceAccount_ProjectOwnerAdmin_AssignAgreesWithKernel
+// pins ptone/scion#2147: the project-owner/-admin capability short-circuit
+// (projectOwnerAdminCapabilities) shows "assign" for a project-scoped SA
+// regardless of who created it, and that agrees with CheckAccess because the
+// project-owner and project-admin RoleDefinitions grant
+// gcp_service_account.assign.
+func TestCapabilities_GCPServiceAccount_ProjectOwnerAdmin_AssignAgreesWithKernel(t *testing.T) {
+	srv, s, alice, bob, project := setupDemoPolicyTest(t)
+	ctx := context.Background()
+
+	admin := makeProjectMemberUser(t, s, project, tid("sa-caps-admin"), "Admin", store.GroupMemberRoleAdmin)
+
+	sa := &store.GCPServiceAccount{
+		ID:        tid("sa-project-scoped-owner-admin-agreement"),
+		Scope:     store.ScopeProject,
+		ScopeID:   project.ID,
+		Email:     "sa-owner-admin-agreement@example.iam.gserviceaccount.com",
+		ProjectID: "gcp-proj",
+		// Created by bob, a plain project member — neither alice (owner) nor
+		// admin owns this resource, so the resource-owner relationship grant
+		// does not apply and the only route to an allow is the role permission.
+		CreatedBy: bob.ID,
+	}
+	require.NoError(t, s.CreateGCPServiceAccount(ctx, sa))
+	resource := gcpServiceAccountResource(sa)
+
+	for _, tc := range []struct {
+		name string
+		user *store.User
+	}{
+		{"owner", alice},
+		{"admin", admin},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			identity := NewAuthenticatedUser(tc.user.ID, tc.user.Email, tc.user.DisplayName, "member", "api")
+
+			caps := srv.authzService.ComputeCapabilities(ctx, identity, resource)
+			assert.Contains(t, caps.Actions, "assign",
+				"%s short-circuit should list assign", tc.name)
+
+			decision := srv.authzService.CheckAccess(ctx, identity, resource, ActionAssign)
+			assert.True(t, decision.Allowed,
+				"%s CheckAccess(assign) should agree with the short-circuit's capability list", tc.name)
+		})
+	}
 }

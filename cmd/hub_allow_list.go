@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/clitime"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 	"github.com/spf13/cobra"
 )
@@ -116,17 +116,7 @@ func init() {
 }
 
 func runAllowListList(cmd *cobra.Command, args []string) error {
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve project path: %w", err)
-	}
-
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	client, err := getHubClient(settings)
+	_, client, err := loadHubClient()
 	if err != nil {
 		return err
 	}
@@ -154,7 +144,7 @@ func runAllowListList(cmd *cobra.Command, args []string) error {
 	for _, entry := range resp.Items {
 		fmt.Printf("%-40s %-30s %s\n",
 			entry.Email,
-			entry.Created.Format(time.RFC3339),
+			clitime.Format(entry.Created, clitime.Full),
 			entry.Note,
 		)
 	}
@@ -166,17 +156,7 @@ func runAllowListList(cmd *cobra.Command, args []string) error {
 func runAllowListAdd(cmd *cobra.Command, args []string) error {
 	email := args[0]
 
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve project path: %w", err)
-	}
-
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	client, err := getHubClient(settings)
+	_, client, err := loadHubClient()
 	if err != nil {
 		return err
 	}
@@ -202,17 +182,7 @@ func runAllowListAdd(cmd *cobra.Command, args []string) error {
 func runAllowListRemove(cmd *cobra.Command, args []string) error {
 	email := args[0]
 
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve project path: %w", err)
-	}
-
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	client, err := getHubClient(settings)
+	_, client, err := loadHubClient()
 	if err != nil {
 		return err
 	}
@@ -256,17 +226,7 @@ func runAllowListImport(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	resolvedPath, _, err := config.ResolveProjectPath(projectPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve project path: %w", err)
-	}
-
-	settings, err := config.LoadSettings(resolvedPath)
-	if err != nil {
-		return fmt.Errorf("failed to load settings: %w", err)
-	}
-
-	client, err := getHubClient(settings)
+	_, client, err := loadHubClient()
 	if err != nil {
 		return err
 	}
@@ -291,9 +251,21 @@ func runAllowListImport(cmd *cobra.Command, args []string) error {
 }
 
 func parseImportCSV(r io.Reader) ([]hubclient.AllowListAddRequest, error) {
+	return parseEmailRecords(r, false, true)
+}
+
+// parseEmailRecords reads one address per record with an optional second
+// note column, skipping empty records and an "email" header on the first
+// line. With comments, lines starting with '#' are skipped. With
+// requireAt, records without '@' are dropped; without it they are kept, so
+// the hub can report them (batch invite).
+func parseEmailRecords(r io.Reader, comments, requireAt bool) ([]hubclient.AllowListAddRequest, error) {
 	reader := csv.NewReader(bufio.NewReader(r))
 	reader.TrimLeadingSpace = true
 	reader.FieldsPerRecord = -1
+	if comments {
+		reader.Comment = '#'
+	}
 
 	var emails []hubclient.AllowListAddRequest
 	lineNum := 0
@@ -317,7 +289,7 @@ func parseImportCSV(r io.Reader) ([]hubclient.AllowListAddRequest, error) {
 			continue
 		}
 
-		if email == "" || !strings.Contains(email, "@") {
+		if email == "" || (requireAt && !strings.Contains(email, "@")) {
 			continue
 		}
 

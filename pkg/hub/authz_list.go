@@ -1,0 +1,459 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package hub
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
+)
+
+// errDelegatedListScope is ResolveListScopes's answer for an agent
+// delegated credential.
+var errDelegatedListScope = errors.New("ResolveListScopes: no list scope for a delegated credential")
+
+// ListScopeResult is the outcome of a single authoritative scope decision
+// for a list request. It communicates both the authorized scope set and any
+// project-level exclusions imposed by AccessConstraints.
+type ListScopeResult struct {
+	// Scopes is the authorized project scope set (All, None, or Explicit).
+	Scopes ScopeSet
+
+	// ExcludedProjectIDs contains project IDs that are excluded from an
+	// All scope by project-scoped AccessConstraints. When Scopes is All
+	// and project-scoped constraints block the list permission for specific
+	// projects, those project IDs appear here. The handler pushes them into
+	// the store filter's ExcludedProjectIDs field.
+	//
+	// This field is only meaningful when Scopes.IsAll() is true.
+	// When Scopes is Explicit or None, exclusions are already reflected
+	// in the Scopes set directly.
+	ExcludedProjectIDs []string
+}
+
+// ResolveListScopes resolves the set of projects the caller is authorized to
+// see for a given list permission (e.g. "project.list" or "agent.list").
+//
+// Wired into the project and agent list handlers, and (through
+// resolveListScopesWithCeiling) the skill list handler. Group and catalog
+// resources have different parentless-resource semantics and still use
+// per-resource authorization scans when the caller lacks wide list access.
+//
+// It bridges the store layer and the AK1 authorization kernel:
+//  1. Resolves the caller's principal closure (direct principal + effective groups).
+//  2. Loads applicable role bindings via ListRoleBindingsForPrincipals.
+//  3. Loads role definitions for those bindings.
+//  4. Calls ResolveAuthorizedScopes to compute the ScopeSet.
+//
+// The returned ScopeSet tells the handler how to filter:
+//   - ScopeSetAll: proceed with unfiltered query (admin view).
+//   - ScopeSetNone: return empty list.
+//   - Explicit set: push project IDs into the store query as a WHERE filter.
+//
+// RS2: Returns a typed result plus an error. Resolution dependency failures
+// are propagated as errors so the handler can fail closed with an appropriate
+// status code. ScopeSetNone with a nil error is a legitimate authorization
+// result meaning "no authority".
+func (a *AuthzService) ResolveListScopes(ctx context.Context, identity Identity, permissionID string) (ListScopeResult, error) {
+	return a.resolveListScopesWithCeiling(ctx, identity, permissionID, permissionID)
+}
+
+// resolveListScopesWithCeiling is ResolveListScopes for a list whose
+// project set comes from the grants of scopePermissionID while a user
+// access token must carry ceilingPermissionID, the list's own permission.
+// The skill list uses it: its project set is the caller's project.list
+// grants, and a token needs skill.list. Access constraints are applied to
+// scopePermissionID.
+func (a *AuthzService) resolveListScopesWithCeiling(ctx context.Context, identity Identity, scopePermissionID, ceilingPermissionID string) (ListScopeResult, error) {
+	none := ListScopeResult{Scopes: ScopeSetNone()}
+	if identity == nil {
+		return none, nil
+	}
+	// An agent delegated credential never gets a list scope from this
+	// function: the agent's own principals contribute nothing. A delegated
+	// list takes its scope only from the delegated list arm (delegatedListScope),
+	// which resolves the authorizing user's scope through
+	// resolveListScopesForPrincipal (.design/agent-delegation.md §11.8). An
+	// error, never a scope, so any other caller fails closed.
+	if isDelegatedAgentIdentity(identity) {
+		return none, errDelegatedListScope
+	}
+	return a.resolveListScopesForIdentity(ctx, identity, scopePermissionID, ceilingPermissionID)
+}
+
+// resolveListScopesForPrincipal resolves the list scope of principal, an
+// authorizing user held as an argument, for permissionID. It is
+// ResolveListScopes for a principal that is not the request's identity:
+// the delegated list arm passes the issuer it built from the stored issuer
+// row, which is never placed in the identity slot. Only a user principal
+// with an identity is accepted; anything else gets no scope and an error.
+// The issuer is a session principal, so no credential caveat reduces its
+// scope; its access constraints apply as for any user.
+func (a *AuthzService) resolveListScopesForPrincipal(ctx context.Context, principal PrincipalContext, permissionID string) (ListScopeResult, error) {
+	none := ListScopeResult{Scopes: ScopeSetNone()}
+	if isNilIdentity(principal.Identity) || principal.Kind != PrincipalKindUser {
+		return none, errors.New("resolveListScopesForPrincipal: not a user principal")
+	}
+	if isDelegatedAgentIdentity(principal.Identity) {
+		return none, errDelegatedListScope
+	}
+	return a.resolveListScopesForIdentity(ctx, principal.Identity, permissionID, permissionID)
+}
+
+// resolveListScopesForIdentity is the body of resolveListScopesWithCeiling
+// for a non-nil identity that is not an agent delegated credential.
+func (a *AuthzService) resolveListScopesForIdentity(ctx context.Context, identity Identity, scopePermissionID, ceilingPermissionID string) (ListScopeResult, error) {
+	none := ListScopeResult{Scopes: ScopeSetNone()}
+	permissionID := scopePermissionID
+
+	// Note: Suspension is enforced at the auth middleware layer, which rejects
+	// suspended principals before the handler runs. ResolveListScopes does not
+	// re-check suspension because no suspended identity reaches this code path.
+
+	// Step 1: Resolve principal closure (direct principal + transitive groups).
+	authzIn := a.inputsFor(ctx, identity)
+	principals, err := authzIn.Principals()
+	if err != nil {
+		a.logger.WarnContext(ctx, "ResolveListScopes: failed to resolve principals",
+			"error", err, "permission", permissionID)
+		return none, fmt.Errorf("ResolveListScopes: principal resolution: %w", err)
+	}
+
+	if len(principals) == 0 {
+		return none, nil
+	}
+
+	// Build the principal closure map for ResolveAuthorizedScopes.
+	// O2: Use typed composite keys (type:id) to prevent collisions.
+	principalClosure := make(map[string]struct{}, len(principals))
+	for _, p := range principals {
+		principalClosure[p.Type+":"+p.ID] = struct{}{}
+	}
+
+	// Step 2: Load applicable role bindings for all principals in the closure.
+	// We pass nil for scopeTypes and scopeIDs to get all bindings (both system
+	// and project scoped) so ResolveAuthorizedScopes can compute the full set.
+	bindings, err := authzIn.Bindings()
+	if err != nil {
+		a.logger.WarnContext(ctx, "ResolveListScopes: failed to load role bindings",
+			"error", err, "permission", permissionID)
+		return none, fmt.Errorf("ResolveListScopes: role binding load: %w", err)
+	}
+
+	if len(bindings) == 0 {
+		return none, nil
+	}
+
+	// Step 3: Collect unique role definition IDs and load them.
+	roleDefinitions, err := authzIn.RoleDefs()
+	if err != nil {
+		a.logger.WarnContext(ctx, "ResolveListScopes: failed to load role definitions",
+			"error", err, "permission", permissionID)
+		return none, fmt.Errorf("ResolveListScopes: role definition load: %w", err)
+	}
+
+	// Step 4: Convert store bindings to kernel CandidateBindings.
+	candidates := toCandidateBindings(bindings)
+
+	// Step 5: Call the pure kernel function.
+	scopes := ResolveAuthorizedScopes(principalClosure, permissionID, candidates, roleDefinitions, time.Now())
+
+	// Step 6: Apply credential caveats. A UAT-backed user's scope set is
+	// reduced by its token boundary and its permission ceiling, and a
+	// project-scoped agent's by its token project, since credential
+	// restrictions can only reduce authority.
+	scopes = applyCredentialCaveats(identity, ceilingPermissionID, scopes)
+
+	// Step 7: Apply AccessConstraints (C-2 fix).
+	// Load applicable constraints for the principal closure and check whether
+	// any active constraint excludes the list permission. Constraints can only
+	// reduce the authorized scope set, never expand it.
+	result, err := a.applyListScopeConstraints(ctx, principalClosure, identity, permissionID, scopes)
+	if err != nil {
+		return none, err
+	}
+
+	return result, nil
+}
+
+// applyCredentialCaveats intersects the resolved scope set with any credential-
+// level restrictions. This implements the design invariant that "credential
+// scopes, suspension, and delegation ceilings run after the union [of grants]
+// and can only reduce it."
+//
+// For a UAT-backed identity, on either boundary kind, the set is empty
+// unless the token's permission ceiling contains permissionID, the list's
+// own permission, and permissionID is eligible for the token's boundary
+// kind (the bearer gate's stage 3b rule). The token boundary then chooses
+// the reduction:
+//   - a valid project boundary intersects the set with that one project;
+//   - a valid hub boundary applies no project intersection (the grant-derived
+//     set is already the user's live authority);
+//   - an invalid boundary yields the empty set.
+func applyCredentialCaveats(identity Identity, permissionID string, scopes ScopeSet) ScopeSet {
+	switch id := identity.(type) {
+	case *ScopedUserIdentity:
+		if id == nil {
+			return ScopeSetNone()
+		}
+		if !uatListPermitted(id, permissionID) {
+			return ScopeSetNone()
+		}
+		boundary := id.Boundary()
+		switch boundary.Kind {
+		case BoundaryKindProject:
+			return scopes.Intersection(ScopeSetExplicit(boundary.ProjectID))
+		case BoundaryKindHub:
+			return scopes
+		default:
+			return ScopeSetNone()
+		}
+	case AgentIdentity:
+		// Agent with a project scope from its token.
+		if pid := id.ProjectID(); pid != "" {
+			return scopes.Intersection(ScopeSetExplicit(pid))
+		}
+	}
+	return scopes
+}
+
+// uatListPermitted reports whether a UAT-backed identity may run the list
+// whose permission is permissionID at all: its boundary is valid, its
+// ceiling contains permissionID, and permissionID is eligible for its
+// boundary kind. The rule is the same on a project and a hub boundary.
+func uatListPermitted(id *ScopedUserIdentity, permissionID string) bool {
+	if id == nil {
+		return false
+	}
+	boundary := id.Boundary()
+	return boundary.Valid() && id.Ceiling().Allows(permissionID) && permissionEligibleForBoundary(permissionID, boundary.Kind)
+}
+
+// applyListScopeConstraints loads active access constraints and applies them
+// to the resolved scope set. If any applicable constraint excludes the list
+// permission, the affected scope(s) are removed.
+//
+// C-2 fix: ResolveListScopes previously never loaded or applied
+// AccessConstraints, allowing a principal whose list permission was removed
+// by an operator boundary to retain full list visibility.
+//
+// RS2: Returns an error on constraint loading failure so the caller can
+// propagate fail-closed status to the handler.
+func (a *AuthzService) applyListScopeConstraints(
+	ctx context.Context,
+	closure map[string]struct{},
+	identity Identity,
+	permissionID string,
+	scopes ScopeSet,
+) (ListScopeResult, error) {
+	none := ListScopeResult{Scopes: ScopeSetNone()}
+
+	if scopes.IsNone() {
+		return none, nil
+	}
+
+	constraints, err := a.loadAllAccessConstraints(ctx)
+	if err != nil {
+		// C-2 + R-1: fail closed when constraint loading errors.
+		a.logger.WarnContext(ctx, "ResolveListScopes: failed to load access constraints (fail-closed)",
+			"error", err, "permission", permissionID)
+		return none, fmt.Errorf("ResolveListScopes: constraint load: %w", err)
+	}
+	if len(constraints) == 0 {
+		return ListScopeResult{Scopes: scopes}, nil
+	}
+
+	// Convert store constraints to hub AccessConstraint.
+	var hubConstraints []*AccessConstraint
+	for _, sc := range constraints {
+		hc := storeToHubAccessConstraint(sc)
+		if hc != nil {
+			hubConstraints = append(hubConstraints, hc)
+		}
+	}
+
+	// Normalize all closure keys so that dev/federated variants match
+	// the canonical "user"/"agent" types used in constraint subjects.
+	normalizedClosure := normalizeClosureTypes(closure)
+	now := time.Now()
+
+	// Check system-scoped constraints first: if any applicable system-scoped
+	// constraint excludes the list permission, return ScopeSetNone.
+	systemApplicable := FilterApplicableConstraints(
+		hubConstraints, normalizedClosure,
+		ScopeTypeSystem, "",
+	)
+	systemRestrictions := ConstraintsToRestrictions(systemApplicable, now)
+	for _, r := range systemRestrictions {
+		if r.Check == nil || !r.Check(permissionID) {
+			return none, nil
+		}
+	}
+
+	// For explicit project sets, check project-scoped constraints and remove
+	// projects where a constraint excludes the list permission.
+	projectIDs := scopes.ProjectIDs()
+	if len(projectIDs) > 0 {
+		var retained []string
+		for _, pid := range projectIDs {
+			projectApplicable := FilterApplicableConstraints(
+				hubConstraints, normalizedClosure,
+				ScopeTypeProject, pid,
+			)
+			projectRestrictions := ConstraintsToRestrictions(projectApplicable, now)
+			blocked := false
+			for _, r := range projectRestrictions {
+				if r.Check == nil || !r.Check(permissionID) {
+					blocked = true
+					break
+				}
+			}
+			if !blocked {
+				retained = append(retained, pid)
+			}
+		}
+		if len(retained) == 0 {
+			return none, nil
+		}
+		return ListScopeResult{Scopes: ScopeSetExplicit(retained...)}, nil
+	}
+
+	// RS2: For All scope, check project-scoped constraints that apply to
+	// the principal closure. Collect project IDs where any constraint blocks
+	// the list permission — these become exclusions in the store query.
+	// This prevents project-scoped constraints from being silently ignored
+	// when the fully reduced scope is All.
+	if scopes.IsAll() {
+		var excludedProjectIDs []string
+		for _, c := range hubConstraints {
+			if c == nil || c.Scope.Type != ScopeTypeProject || c.Scope.ID == "" {
+				continue
+			}
+			if !c.Subject.MatchesPrincipalClosure(normalizedClosure) {
+				continue
+			}
+			// Check if this project-scoped constraint blocks the permission.
+			cr := ConstraintsToRestrictions([]*AccessConstraint{c}, now)
+			for _, r := range cr {
+				if r.Check == nil || !r.Check(permissionID) {
+					excludedProjectIDs = append(excludedProjectIDs, c.Scope.ID)
+					break
+				}
+			}
+		}
+		return ListScopeResult{
+			Scopes:             scopes,
+			ExcludedProjectIDs: excludedProjectIDs,
+		}, nil
+	}
+
+	return ListScopeResult{Scopes: scopes}, nil
+}
+
+// collectRoleDefinitionIDs extracts unique role definition IDs from bindings.
+func collectRoleDefinitionIDs(bindings []*store.RoleBinding) []string {
+	seen := make(map[string]struct{}, len(bindings))
+	var ids []string
+	for _, b := range bindings {
+		if _, ok := seen[b.RoleDefinitionID]; !ok {
+			seen[b.RoleDefinitionID] = struct{}{}
+			ids = append(ids, b.RoleDefinitionID)
+		}
+	}
+	return ids
+}
+
+// loadRoleDefinitions fetches role definitions by ID in a single batch query
+// and converts them to the kernel's RolePermissions map.
+//
+// Missing role definitions are silently omitted — the corresponding bindings
+// will simply not contribute permissions. Transient store errors (DB timeout,
+// connection reset) are propagated to the caller, which fails closed by
+// returning ScopeSetNone.
+func (a *AuthzService) loadRoleDefinitions(ctx context.Context, roleDefIDs []string) (map[string]*RolePermissions, error) {
+	if len(roleDefIDs) == 0 {
+		return map[string]*RolePermissions{}, nil
+	}
+
+	defs, err := a.store.GetRoleDefinitionsByIDs(ctx, roleDefIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]*RolePermissions, len(defs))
+	for _, rd := range defs {
+		rp := NewRolePermissions(rd.ID, rd.Name, rd.ScopeType, rd.Permissions)
+		rp.ConfersMembership = rd.ConfersProjectMembership()
+		result[rd.ID] = rp
+	}
+	return result, nil
+}
+
+// toCandidateBindings converts store RoleBindings to the kernel's
+// CandidateBinding type.
+func toCandidateBindings(bindings []*store.RoleBinding) []CandidateBinding {
+	candidates := make([]CandidateBinding, len(bindings))
+	for i, b := range bindings {
+		candidates[i] = CandidateBinding{
+			BindingID:        b.ID,
+			RoleDefinitionID: b.RoleDefinitionID,
+			PrincipalType:    b.PrincipalType,
+			PrincipalID:      b.PrincipalID,
+			ScopeType:        b.ScopeType,
+			ScopeID:          b.ScopeID,
+		}
+		candidates[i].NotBefore, candidates[i].ExpiresAt = candidateActivationBounds(b)
+	}
+	return candidates
+}
+
+// setZeroBound stands in for a stored activation bound that is set but
+// holds the zero time. It is the earliest non-zero instant, so the kernel
+// sees a time condition rather than an unset bound.
+var setZeroBound = time.Time{}.Add(time.Nanosecond)
+
+// candidateActivationBounds converts a store RoleBinding's optional
+// activation bounds to the kernel's value form, where a zero time means
+// unset. A bound that is set but zero maps to setZeroBound, so the kernel
+// agrees with the store's membership reads: a set-but-zero ExpiresAt is
+// already expired, and any set bound fails closed on a zero evaluation
+// time. Every conversion from store.RoleBinding to CandidateBinding uses
+// this, so all activation checks in pkg/hub apply one rule.
+//
+// A nil binding gets bounds that no evaluation time satisfies (NotBefore
+// and ExpiresAt both setZeroBound: active would need now >= setZeroBound
+// and now < setZeroBound), so it is never active. Zero bounds would read
+// as unbounded, which is active.
+func candidateActivationBounds(b *store.RoleBinding) (notBefore, expiresAt time.Time) {
+	if b == nil {
+		return setZeroBound, setZeroBound
+	}
+	if b.NotBefore != nil {
+		notBefore = *b.NotBefore
+		if notBefore.IsZero() {
+			notBefore = setZeroBound
+		}
+	}
+	if b.ExpiresAt != nil {
+		expiresAt = *b.ExpiresAt
+		if expiresAt.IsZero() {
+			expiresAt = setZeroBound
+		}
+	}
+	return notBefore, expiresAt
+}

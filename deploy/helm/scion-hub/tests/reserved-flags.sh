@@ -32,10 +32,15 @@
 # an empty table and exited 0; this must not be able to do that.
 set -u
 
-EXPECTED_TOTAL=31          # 29 must-reject + 2 must-accept. Update deliberately.
+EXPECTED_TOTAL=59          # 38 must-reject + 6 must-accept + 15 test-identity / hub-class value rows. Update deliberately.
 CHART="${CHART:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 HELM="${HELM:-helm}"
-BASE=(--set image.repository=r --set hub.hubId=h)
+# auth.sessionSecret became REQUIRED in the session-secret phase, and it is here for the same
+# reason hub.baseUrl is: scion-hub.assertSessionSecret fails the render without it, so every
+# BASE render would return an error string instead of manifests and every check below would
+# accuse the chart of a fault it does not have. The chart will not default it - a generated
+# secret rotates on every helm upgrade, invalidating every session and the JWT signing key.
+BASE=(--set image.repository=r --set agents.imageRegistry=example.invalid/agents --set hub.hubId=h --set hub.baseUrl=https://h.example.invalid --set auth.sessionSecret=harness-not-a-real-secret --set auth.proxy.iap.audience=/projects/123456789012/locations/us-central1/services/probe-tests)   # hub.baseUrl became REQUIRED in Phase 1; see the arm below.
 
 # TOOL-PRESENCE ARM. A MISSING TOOLCHAIN MUST NOT BE REPORTED AS A BROKEN CHART.
 # Without this every helm invocation fails, every assertion fails, and the output
@@ -54,6 +59,30 @@ if [ -n "$_missing" ]; then
   echo "ASSERTIONS_EXECUTED=0"
   exit 2
 fi
+
+# BASE-VIABILITY ARM, AND IT IS THE SAME ARGUMENT AS THE TOOL-PRESENCE ARM ABOVE
+# ONE STEP IN. A missing toolchain makes every render fail; so does a BASE that
+# no longer satisfies the chart's required values, and the output is worse,
+# because it is not empty - it is every assertion confidently blaming the guard
+# it was aimed at. MEASURED: Phase 1 made hub.baseUrl required, and this suite
+# emitted 77 failures reading "refused, but NOT by the reserved-flag guard" and
+# "rejected with the WRONG message". Every one of those sentences was false. The
+# guards were fine; BASE was.
+#
+# A REQUIRED VALUE ADDED BY A LATER PHASE INVALIDATES EVERY BASE IN THIS SUITE AT
+# ONCE, AND NOTHING ABOUT IT IS SPECIFIC TO hub.baseUrl. Adding the flag fixes
+# today; this arm is what makes the NEXT one arrive as one honest line instead of
+# seventy-seven misleading ones. Exit 2, not 1: an unrenderable BASE means the run
+# is not evidence about the chart, in either direction.
+if ! _bv="$("$HELM" template t "$CHART" "${BASE[@]}" 2>&1)" || [ -z "$_bv" ]; then
+  echo "HARNESS ERROR: BASE alone does not render, so no assertion below tests what it says it tests."
+  echo "  This is almost always a newly-REQUIRED value that BASE does not set."
+  printf '%s\n' "$_bv" | sed 's/^/  | /' | head -5
+  echo "NOTHING WAS ANALYSED. This is not a passing run, and it is NOT a chart failure."
+  echo "ASSERTIONS_EXECUTED=0"
+  exit 2
+fi
+unset _bv
 
 executed=0
 failed=0
@@ -115,7 +144,7 @@ reject() {
   # produces. Normalise; never loosen.
   #
   # The colon: without it, want="-c" MATCHES a message reading "-config:".
-  # THREE such pairs are live, all three inside $neverPassed, all three measured:
+  # THREE such pairs are live, all three measured (grove is in $removedFlags, its partner g and the other four in $neverPassed):
   #
   #     sends -config   matcher -c   with colon: no match   without: MATCHES
   #     sends -grove    matcher -g   with colon: no match   without: MATCHES
@@ -130,7 +159,7 @@ reject() {
   # consistent with a matcher that never matches anything.
   #
   # All three pairs are already explicit cases - c, config, g, grove, p and
-  # profile each appear in the $neverPassed loop below and each asserts its own
+  # profile each appear in the $neverPassed or $removedFlags loop below and each asserts its own
   # name - so a misattribution in either direction fails one of them. No case
   # was added for them and EXPECTED_TOTAL is unchanged at 31.
   want="hub.args may not contain -${lower}:"
@@ -195,6 +224,60 @@ reject() {
   fi
 }
 
+reject_cluster() {
+  # $1 = the FULL argument, passed verbatim. $2 = the shorthand character the
+  # guard must name.
+  #
+  # A SEPARATE HELPER, NOT A CALLER OF reject(), AND THE COUNTER-FORM IS THE
+  # REASON. reject() asserts "hub.args may not contain -<name>:", which is the
+  # NAME axis. These arguments must be refused by the CLUSTER axis, and the two
+  # are different guards with different messages and different failure modes.
+  # Asserting the outcome alone would let the name guard take credit for a
+  # refusal the cluster guard produced, or the reverse - and the reverse is the
+  # live hazard, because -ctx would be refused by a name guard the day someone
+  # adds "ctx" to a list, and this suite would keep reporting the cluster walk
+  # as working after it had been deleted.
+  #
+  # So the control here is INVERTED relative to reject(): the cluster wording
+  # must be PRESENT and the name-axis wording must be ABSENT.
+  executed=$((executed + 1))
+  local out cluster_want char_want name_axis m_cluster=0 m_char=0 m_name=0
+  cluster_want="as a CLUSTER of one-character shorthands"
+  char_want="is the reserved shorthand -${2}"
+  name_axis="hub.args may not contain -"
+  if out="$("$HELM" template t "$CHART" "${BASE[@]}" --set-json "hub.args=[\"$1\"]" 2>&1)"; then
+    echo "FAIL  accepted but must reject: $1"; failed=$((failed + 1)); return
+  fi
+  case "$out" in *'%!'*)
+     echo "FAIL  $1: the refusal message could not render its own value (%!)"
+     failed=$((failed + 1)); return ;;
+  esac
+  case "$out" in *"$cluster_want"*) m_cluster=1 ;; esac
+  case "$out" in *"$char_want"*)    m_char=1 ;;    esac
+  case "$out" in *"$name_axis"*)    m_name=1 ;;    esac
+
+  if [ "$m_cluster" -eq 1 ] && [ "$m_char" -eq 1 ] && [ "$m_name" -eq 0 ]; then
+    echo "ok    rejected by the cluster walk, naming -${2}: $1"
+  elif [ "$m_cluster" -eq 0 ] && [ "$m_name" -eq 0 ]; then
+    echo "FAIL  $1: refused, but by NEITHER argv guard. Broken world, not a refusal:"
+    echo "        no helm, a schema rejection, a renamed helper, or a bad CHART path."
+    echo "        got: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+    failed=$((failed + 1))
+  elif [ "$m_name" -eq 1 ]; then
+    echo "FAIL  $1: refused by the NAME axis, not the cluster walk."
+    echo "        The cluster walk may have been deleted and this row would still"
+    echo "        be refused. That is the false green this control exists to catch."
+    echo "        got: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+    failed=$((failed + 1))
+  else
+    echo "FAIL  $1: cluster guard fired but did not name -${2}."
+    echo "        The message must say WHICH character matched; an operator who is"
+    echo "        told only that a cluster is bad cannot tell which letter to remove."
+    echo "        got: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+    failed=$((failed + 1))
+  fi
+}
+
 accept() {  # POSITIVE TWIN: a benign flag the chart must still allow.
   executed=$((executed + 1))
   if "$HELM" template t "$CHART" "${BASE[@]}" --set-json "hub.args=[$1]" >/dev/null 2>&1; then
@@ -208,20 +291,156 @@ accept() {  # POSITIVE TWIN: a benign flag the chart must still allow.
 for f in foreground hosted host web-port enable-hub enable-runtime-broker \
          enable-web auto-provide global; do reject "$f"; done
 # $neverPassed - config selection.
-for f in config c project g grove profile p; do reject "$f"; done
+for f in config c project g profile p; do reject "$f"; done
+# $removedFlags - the flag no longer exists at all.
+reject grove
 # $aliasOrIgnored - not the lever they appear to be.
 for f in production port; do reject "$f"; done
 # $ownedByConfig - delivered through another channel.
 for f in admin-emails base-url db storage-bucket storage-dir; do reject "$f"; done
 # $unsafeToPass - weaken auth or expose credentials.
 for f in session-secret dev-auth enable-test-login web-assets-dir; do reject "$f"; done
+# $unsafeToPass - --test-mode (ptone/scion#4240, gate G9). Only
+# hub.testIdentities.enabled renders it, and only at the member level.
+reject test-mode
+# $unsafeToPass - the three flags --test-mode replaced. The binary refuses them
+# at startup; the render refuses them first.
+for f in enable-test-identities enable-test-admin-identities enable-test-super-admin-identities; do reject "$f"; done
+# $refusedWhenHosted - the server refuses it in hosted mode.
+reject enable-debug-endpoints
 # Case-insensitivity of the reserved match (pflag itself is case-SENSITIVE).
 for f in CONFIG Global; do reject "$f"; done
+
+# SHORTHAND CLUSTERS. pflag walks a single-dash argument left to right and the
+# first value-taking shorthand swallows the remainder, so a reserved flag can be
+# reached by an argument whose first character is harmless. Measured against real
+# pflag at v1.0.10 (the go.mod pin) and v1.0.5; see the $neverPassedShorthand
+# comment in _helpers.tpl for the flag-table provenance by file and line.
+#
+# -yc/etc/evil IS THE ROW THAT KILLED THE FIRST FIX. The repair originally
+# ratified for this defect tokenised the FIRST character of the cluster, which
+# accepts this argument: -y is not reserved. pflag then sets yes=true AND
+# --config=/etc/evil. Keep this row above the others; it is the only one that
+# distinguishes a first-character check from a walk.
+reject_cluster '-yc/etc/evil' 'c'
+reject_cluster '-cy/etc/evil' 'c'
+reject_cluster '-project-id'  'p'
+reject_cluster '-ctx'         'c'
 
 # Positive twins. Without these the suite passes by refusing everything, which
 # is the shape that let --admin-token=hunter2 through in round 1.
 accept '"--log-level","debug"'
 accept '"--verbose"'
+
+# THE CLUSTER AXIS'S POSITIVE TWINS, AND THE FIRST ONE IS EXHAUSTIVE RATHER THAN
+# REPRESENTATIVE - THAT IS WHY IT IS WORTH A ROW.
+#
+# `server start` has EXACTLY FOUR reachable shorthands: -c (config), -g
+# (project), -p (profile), -y (yes). Obtained by walking the real cobra command
+# tree, not from --help, which prints the ROOT help after an "unknown command"
+# error in an agent container and will hand you the wrong command's flags.
+# Three of the four are reserved. SO THE SET OF SHORTHANDS THAT MUST STILL BE
+# ACCEPTED HAS EXACTLY ONE MEMBER, AND IT IS -y. This is not a sample: assert -y
+# and the accept side of this axis is complete as of the flag table cited in
+# _helpers.tpl. If a fifth shorthand is ever registered, this comment is wrong
+# and the row below is no longer exhaustive.
+accept '"-y"'
+accept '"-yy"'     # both characters boolean; the walk passes through and stops nowhere.
+accept '"--yc"'    # DOUBLE dash is a long flag named "yc". pflag does not cluster it,
+                   # and neither may we, or every long name containing a reserved
+                   # letter would be refused.
+accept '"-C/x"'    # CASE. pflag shorthands are case-sensitive and no -C is registered,
+                   # so this crash-loops at startup and the chart does NOT catch it.
+                   # Committed as an accept to record that boundary: refusing it would
+                   # print the reserved-config reason, which is false for -C. A guard
+                   # that fires for a true reason and prints a false one is worse than
+                   # no guard, because the operator acts on the reason.
+
+# HUB.TESTIDENTITIES.ENABLED AND HUB.HUBCLASS (ptone/scion#4240, --test-mode).
+# hub.testIdentities.enabled is the one way to set --test-mode; it renders
+# exactly --test-mode=member:<hub.hubId> and nothing else, so no chart value
+# reaches an admin level. It requires hub.hubClass: test (server.hub.class),
+# which the hub's member level needs too. Fifteen rows.
+ti_check() {  # ti_check <label> <0 if ok> [detail]
+  executed=$((executed + 1))
+  if [ "$2" -eq 0 ]; then echo "ok    $1"; else echo "FAIL  $1 ${3:-}"; failed=$((failed + 1)); fi
+}
+ti_default="$("$HELM" template t "$CHART" "${BASE[@]}" 2>&1)"; ti_rc=$?
+ti_off="$("$HELM" template t "$CHART" "${BASE[@]}" --set hub.testIdentities.enabled=false 2>&1)"; ti_off_rc=$?
+ti_class="$("$HELM" template t "$CHART" "${BASE[@]}" --set-string hub.hubClass=test 2>&1)"; ti_class_rc=$?
+ti_on="$("$HELM" template t "$CHART" "${BASE[@]}" --set-string hub.hubClass=test --set hub.testIdentities.enabled=true 2>&1)"; ti_on_rc=$?
+# 1. Unset: nothing anywhere in the render mentions the feature or a hub class.
+! printf '%s' "$ti_default" | grep -qiE 'test-identit|test_identit|testidentit|test-mode|class: test'
+ti_check "test identities unset: no trace in the render" $(( ti_rc != 0 || $? != 0 ))
+# 2. Explicit false: byte-identical to unset.
+ti_same_ok=0
+[ "$ti_off_rc" -eq 0 ] && [ "$ti_off" = "$ti_default" ] || ti_same_ok=1
+ti_check "test identities false: render identical to unset" "$ti_same_ok"
+# 3. True (with hub.hubClass: test): the ONLY difference from hub.hubClass: test
+#    alone is one added "- --test-mode=member:h" line (h is BASE's hub.hubId):
+#    no env var, configmap key, settings field or annotation.
+ti_diff="$(diff <(printf '%s\n' "$ti_class") <(printf '%s\n' "$ti_on") | grep -E '^[<>]')"
+ti_one_ok=0
+[ "$ti_on_rc" -eq 0 ] && [ "$ti_class_rc" -eq 0 ] && [ "$(printf '%s\n' "$ti_diff" | sed 's/^> *//')" = "- --test-mode=member:h" ] || ti_one_ok=1
+ti_check "test identities true: exactly one added arg, --test-mode=member:<hubId>" "$ti_one_ok" "diff: $(printf '%s' "$ti_diff" | tr '\n' ' ' | cut -c1-200)"
+# 4. True plus --test-mode in hub.args: still refused (the chart renders it).
+! "$HELM" template t "$CHART" "${BASE[@]}" --set-string hub.hubClass=test --set hub.testIdentities.enabled=true --set-json 'hub.args=["--test-mode=off"]' >/dev/null 2>&1
+ti_check "test identities true: hub.args --test-mode still refused" $?
+# 5. A non-boolean value is a schema error, never a truthy enable.
+! "$HELM" template t "$CHART" "${BASE[@]}" --set-string hub.hubClass=test --set-string hub.testIdentities.enabled=yes >/dev/null 2>&1
+ti_check "test identities: string value refused by the schema" $?
+# 6. GUARD, refusing direction: true without hub.hubClass: test fails the render
+#    and names hub.hubClass.
+ti_noclass="$("$HELM" template t "$CHART" "${BASE[@]}" --set hub.testIdentities.enabled=true 2>&1)"; ti_noclass_rc=$?
+[ "$ti_noclass_rc" -ne 0 ] && printf '%s' "$ti_noclass" | grep -qF 'requires hub.hubClass: test'
+ti_check "guard: test identities true without hub.hubClass refused, naming hub.hubClass" $?
+# 7. GUARD, admitting direction: hub.hubClass: test alone renders server.hub.class
+#    and no --test-mode argument.
+[ "$ti_class_rc" -eq 0 ] && printf '%s' "$ti_class" | grep -qE '^ +class: test$' && ! printf '%s' "$ti_class" | grep -qF -- '--test-mode'
+ti_check "guard: hub.hubClass test alone renders server.hub.class and no --test-mode" $?
+# 8. hub.hubClass admits only "" and "test" (exact, lower case).
+ti_case="$("$HELM" template t "$CHART" "${BASE[@]}" --set-string hub.hubClass=Test 2>&1)"; ti_case_rc=$?
+ti_prod="$("$HELM" template t "$CHART" "${BASE[@]}" --set-string hub.hubClass=production 2>&1)"; ti_prod_rc=$?
+[ "$ti_case_rc" -ne 0 ] && printf '%s' "$ti_case" | grep -qF 'hub.hubClass must be one of' \
+  && [ "$ti_prod_rc" -ne 0 ] && printf '%s' "$ti_prod" | grep -qF 'hub.hubClass must be one of'
+ti_check "hub.hubClass: values other than \"\" and test refused" $?
+# 9. config.extra cannot set server.hub.class: it is a second source for the class.
+"$HELM" template t "$CHART" "${BASE[@]}" --set-string config.extra.server.hub.class=test 2>&1 | grep -qF 'which is not the value of hub.hubClass'
+ti_check "config.extra server.hub.class refused" $?
+# 10. No chart value reaches an admin level: there is no level value under
+#     hub.testIdentities (the schema refuses unknown keys) ...
+"$HELM" template t "$CHART" "${BASE[@]}" --set-string hub.hubClass=test --set hub.testIdentities.enabled=true --set-string hub.testIdentities.level=admin 2>&1 | grep -qF 'Additional property level is not allowed'
+ti_check "admin levels: hub.testIdentities.level refused by the schema" $?
+# 11. ... and hub.args cannot carry --test-mode=admin or super-admin.
+"$HELM" template t "$CHART" "${BASE[@]}" --set-string hub.hubClass=test --set-json 'hub.args=["--test-mode=admin:h"]' 2>&1 | grep -qF 'hub.args may not contain -test-mode' \
+  && "$HELM" template t "$CHART" "${BASE[@]}" --set-string hub.hubClass=test --set-json 'hub.args=["--test-mode=super-admin:h"]' 2>&1 | grep -qF 'hub.args may not contain -test-mode'
+ti_check "admin levels: hub.args --test-mode=admin and super-admin refused" $?
+# 12. The rendered argument is only ever the member level.
+[ "$(printf '%s' "$ti_on" | grep -cE -- '--test-mode=')" -eq 1 ] && ! printf '%s' "$ti_on" | grep -qE -- '--test-mode=(admin|super-admin|off)'
+ti_check "admin levels: the only rendered --test-mode is member" $?
+# 13. config.existingSecret: the operator's own settings.yaml carries the class,
+#     so true renders the argument without hub.hubClass ...
+# BASE_ES drops BASE's agents.imageRegistry and auth.proxy.iap.audience, which
+# config.existingSecret refuses as inline settings values in their own right.
+BASE_ES=(--set image.repository=r --set hub.hubId=h --set hub.baseUrl=https://h.example.invalid --set auth.sessionSecret=harness-not-a-real-secret --set config.existingSecret=mine)
+ti_es="$("$HELM" template t "$CHART" "${BASE_ES[@]}" --set hub.testIdentities.enabled=true 2>&1)"; ti_es_rc=$?
+[ "$ti_es_rc" -eq 0 ] && printf '%s' "$ti_es" | grep -qF -- '- --test-mode=member:h'
+ti_check "existingSecret: test identities true renders --test-mode=member without hub.hubClass" $? "$(printf '%s' "$ti_es" | head -3 | tr '\n' ' ')"
+# 14. ... and hub.hubClass, which would go nowhere, is refused by name.
+ti_es_class="$("$HELM" template t "$CHART" "${BASE_ES[@]}" --set-string hub.hubClass=test 2>&1)"; ti_es_class_rc=$?
+[ "$ti_es_class_rc" -ne 0 ] && printf '%s' "$ti_es_class" | grep -qE 'inline settings values \([^)]*hub\.hubClass'
+ti_check "existingSecret: hub.hubClass refused by name" $?
+
+# 15. hub.extraEnv cannot set the class either (literal, valueFrom, lower case),
+#     with or without config.existingSecret.
+ti_env_ok=0
+for ev in '[{"name":"SCION_SERVER_HUB_CLASS","value":"test"}]' \
+          '[{"name":"SCION_SERVER_HUB_CLASS","valueFrom":{"configMapKeyRef":{"name":"x","key":"y"}}}]' \
+          '[{"name":"scion_server_hub_class","value":"test"}]'; do
+  "$HELM" template t "$CHART" "${BASE[@]}" --set-json "hub.extraEnv=$ev" 2>&1 | grep -qF 'hub.extraEnv may not set SCION_SERVER_HUB_CLASS' || ti_env_ok=1
+  "$HELM" template t "$CHART" "${BASE_ES[@]}" --set-json "hub.extraEnv=$ev" 2>&1 | grep -qF 'hub.extraEnv may not set SCION_SERVER_HUB_CLASS' || ti_env_ok=1
+done
+ti_check "hub.extraEnv SCION_SERVER_HUB_CLASS refused (3 forms, with and without existingSecret)" $ti_env_ok
 
 echo "---"
 echo "executed=${executed} expected=${EXPECTED_TOTAL} failed=${failed}"

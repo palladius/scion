@@ -29,8 +29,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const hubPSHPath = "/api/v1/pre-start-hooks"
-
 // createNonAdminUserForHubPSH creates an authenticated hub member (non-admin)
 // used to assert that mutating hub-hook endpoints are admin-only.
 func createNonAdminUserForHubPSH(t *testing.T, s store.Store) *store.User {
@@ -67,16 +65,38 @@ func createAdminUserForHubPSH(t *testing.T, s store.Store) *store.User {
 func uatTokenForUser(t *testing.T, srv *Server, s store.Store, user *store.User) string {
 	t.Helper()
 	project := createTestProjectForPSH(t, s)
+
+	// RS4: user needs a project-scoped role binding to mint UATs.
+	// Use ProjectRoleOwner so the binding covers the agent:manage scope.
+	rd, err := s.GetRoleDefinitionByName(t.Context(), store.ProjectRoleOwner, store.RoleScopeProject)
+	require.NoError(t, err, "project-owner role definition must exist")
+	_, err = s.CreateRoleBinding(t.Context(), &store.RoleBinding{
+		RoleDefinitionID: rd.ID,
+		PrincipalType:    store.RoleBindingPrincipalUser,
+		PrincipalID:      user.ID,
+		ScopeType:        store.RoleScopeProject,
+		ScopeID:          project.ID,
+		CreatedBy:        "test",
+	})
+	require.NoError(t, err)
+
+	// RS4: context must carry actor identity for audit record.
+	ctx := rs4MintContext(user.ID)
 	token, _, err := srv.uatService.CreateToken(
-		t.Context(), user.ID, "ci-token", project.ID, []string{store.UATScopeAgentManage}, nil,
+		ctx, user.ID, "ci-token", project.ID, []string{store.UATScopeAgentManage}, nil,
 	)
 	require.NoError(t, err)
 	return token
 }
 
-// doRequestWithToken performs an HTTP request using an arbitrary bearer token.
-func doRequestWithToken(t *testing.T, srv *Server, token, method, path string, body interface{}) *httptest.ResponseRecorder {
+// doHubPSHRequestAsIdentity invokes the hub pre-start-hook handlers with an
+// already authenticated identity. Federation tokens are verified by separate
+// middleware tests; this helper exercises the authorization boundary after
+// identity construction, including defensive handling of an unexpected admin
+// role on a federated identity.
+func doHubPSHRequestAsIdentity(t *testing.T, srv *Server, identity UserIdentity, method, path string, body interface{}) *httptest.ResponseRecorder {
 	t.Helper()
+
 	var bodyBytes []byte
 	if body != nil {
 		var err error
@@ -88,10 +108,14 @@ func doRequestWithToken(t *testing.T, srv *Server, token, method, path string, b
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	req = req.WithContext(contextWithIdentity(req.Context(), identity))
 
 	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
+	if path == hubPSHPath {
+		srv.handleHubPreStartHooks(rec, req)
+	} else {
+		srv.handleHubPreStartHookByID(rec, req)
+	}
 	return rec
 }
 
@@ -493,6 +517,56 @@ func TestHubPreStartHooks_Delete_ScopedAdminForbidden(t *testing.T) {
 
 	rec := doRequestWithToken(t, srv, token, http.MethodDelete, hubPSHPath+"/"+hook.ID, nil)
 	assert.Equal(t, http.StatusForbidden, rec.Code, "body: %s", rec.Body.String())
+}
+
+func TestHubPreStartHooks_FederatedAdminCannotUseHubAdminBypass(t *testing.T) {
+	srv, _ := testServer(t)
+	federatedAdmin := NewFederatedUserIdentity(
+		"https://issuer.example", "federated-admin", "federated-admin@example.com", "Federated Admin", store.UserRoleAdmin, nil,
+	)
+	hook := createHubHook(t, srv, "Baseline", "baseline", "#!/bin/sh\necho SECRET_TOKEN\n")
+
+	newName := "Hijacked"
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   interface{}
+	}{
+		{
+			name:   "create",
+			method: http.MethodPost,
+			path:   hubPSHPath,
+			body:   CreateProjectPreStartHookRequest{Name: "Backdoor", Script: "#!/bin/sh\ntrue\n"},
+		},
+		{
+			name:   "update",
+			method: http.MethodPut,
+			path:   hubPSHPath + "/" + hook.ID,
+			body:   UpdateProjectPreStartHookRequest{Name: &newName},
+		},
+		{
+			name:   "activate",
+			method: http.MethodPost,
+			path:   hubPSHPath + "/" + hook.ID + "/activate",
+		},
+		{
+			name:   "delete",
+			method: http.MethodDelete,
+			path:   hubPSHPath + "/" + hook.ID,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doHubPSHRequestAsIdentity(t, srv, federatedAdmin, tc.method, tc.path, tc.body)
+			assert.Equal(t, http.StatusForbidden, rec.Code, "body: %s", rec.Body.String())
+		})
+	}
+
+	for _, path := range []string{hubPSHPath, hubPSHPath + "/" + hook.ID} {
+		rec := doHubPSHRequestAsIdentity(t, srv, federatedAdmin, http.MethodGet, path, nil)
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		assert.NotContains(t, rec.Body.String(), "SECRET_TOKEN", "federated admins must not receive hub hook scripts")
+	}
 }
 
 // =============================================================================

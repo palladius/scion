@@ -48,8 +48,16 @@ const (
 	FieldChannel = "channel"
 	// FieldThreadID holds the string denoting the thread_id field in the database.
 	FieldThreadID = "thread_id"
-	// FieldVisibility holds the string denoting the visibility field in the database.
-	FieldVisibility = "visibility"
+	// FieldConversationID holds the string denoting the conversation_id field in the database.
+	FieldConversationID = "conversation_id"
+	// FieldSenderProjectID holds the string denoting the sender_project_id field in the database.
+	FieldSenderProjectID = "sender_project_id"
+	// FieldRecipientProjectID holds the string denoting the recipient_project_id field in the database.
+	FieldRecipientProjectID = "recipient_project_id"
+	// FieldAuthorizingUserID holds the string denoting the authorizing_user_id field in the database.
+	FieldAuthorizingUserID = "authorizing_user_id"
+	// FieldDelegationGrantID holds the string denoting the delegation_grant_id field in the database.
+	FieldDelegationGrantID = "delegation_grant_id"
 	// FieldCreated holds the string denoting the created field in the database.
 	FieldCreated = "created"
 	// Table holds the table name of the message in the database.
@@ -76,7 +84,11 @@ var Columns = []string{
 	FieldDispatchedAt,
 	FieldChannel,
 	FieldThreadID,
-	FieldVisibility,
+	FieldConversationID,
+	FieldSenderProjectID,
+	FieldRecipientProjectID,
+	FieldAuthorizingUserID,
+	FieldDelegationGrantID,
 	FieldCreated,
 }
 
@@ -95,8 +107,6 @@ var (
 	SenderValidator func(string) error
 	// RecipientValidator is a validator for the "recipient" field. It is called by the builders before save.
 	RecipientValidator func(string) error
-	// MsgValidator is a validator for the "msg" field. It is called by the builders before save.
-	MsgValidator func(string) error
 	// DefaultType holds the default value on creation for the "type" field.
 	DefaultType string
 	// DefaultUrgent holds the default value on creation for the "urgent" field.
@@ -111,8 +121,6 @@ var (
 	ChannelValidator func(string) error
 	// ThreadIDValidator is a validator for the "thread_id" field. It is called by the builders before save.
 	ThreadIDValidator func(string) error
-	// VisibilityValidator is a validator for the "visibility" field. It is called by the builders before save.
-	VisibilityValidator func(string) error
 	// DefaultCreated holds the default value on creation for the "created" field.
 	DefaultCreated func() time.Time
 	// DefaultID holds the default value on creation for the "id" field.
@@ -212,9 +220,29 @@ func ByThreadID(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldThreadID, opts...).ToFunc()
 }
 
-// ByVisibility orders the results by the visibility field.
-func ByVisibility(opts ...sql.OrderTermOption) OrderOption {
-	return sql.OrderByField(FieldVisibility, opts...).ToFunc()
+// ByConversationID orders the results by the conversation_id field.
+func ByConversationID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldConversationID, opts...).ToFunc()
+}
+
+// BySenderProjectID orders the results by the sender_project_id field.
+func BySenderProjectID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldSenderProjectID, opts...).ToFunc()
+}
+
+// ByRecipientProjectID orders the results by the recipient_project_id field.
+func ByRecipientProjectID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldRecipientProjectID, opts...).ToFunc()
+}
+
+// ByAuthorizingUserID orders the results by the authorizing_user_id field.
+func ByAuthorizingUserID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldAuthorizingUserID, opts...).ToFunc()
+}
+
+// ByDelegationGrantID orders the results by the delegation_grant_id field.
+func ByDelegationGrantID(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldDelegationGrantID, opts...).ToFunc()
 }
 
 // ByCreated orders the results by the created field.

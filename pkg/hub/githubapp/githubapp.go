@@ -169,7 +169,7 @@ func (c *Client) trackRateLimit(resp *http.Response) {
 		slog.Warn("GitHub API rate limit running low",
 			"remaining", rl.Remaining,
 			"limit", rl.Limit,
-			"reset", rl.Reset.Format(time.RFC3339))
+			"reset", rl.Reset.UTC().Format(time.RFC3339))
 	}
 }
 
@@ -329,6 +329,16 @@ func (c *Client) MintInstallationToken(ctx context.Context, installationID int64
 	}
 	if perms.Actions != "" {
 		permMap["actions"] = perms.Actions
+	}
+
+	// A request without permissions gets every permission the installation
+	// has. Callers always name the permissions they need; refuse rather
+	// than send an empty set.
+	if len(permMap) == 0 {
+		return nil, &TokenMintError{
+			ErrorCode: ErrCodeTokenMintFailed,
+			Message:   "refusing to request an installation token without explicit permissions",
+		}
 	}
 
 	reqBody := accessTokenRequest{

@@ -115,6 +115,26 @@ func TestResolvedSettings_HubDefaultPresenceSemantics(t *testing.T) {
 			want: ResolvedHubDefaultPresent,
 		},
 		{
+			name: "gcp identity mode present",
+			key:  projectSettingDefaultGCPIdentityMode,
+			doc:  `{"default_gcp_identity_mode": "passthrough"}`,
+			want: ResolvedHubDefaultPresent,
+		},
+		{
+			name: "gcp identity service account present",
+			key:  projectSettingDefaultGCPIdentitySAID,
+			doc:  `{"default_gcp_identity_service_account_id": "sa-1"}`,
+			want: ResolvedHubDefaultPresent,
+		},
+		{
+			// Same ambiguity as the other plain strings: "" is dropped by
+			// omitempty, so a missing mode cannot be reported as absent.
+			name: "gcp identity mode missing is unknown",
+			key:  projectSettingDefaultGCPIdentityMode,
+			doc:  `{}`,
+			want: ResolvedHubDefaultUnknown,
+		},
+		{
 			name: "explicit json null counts as missing",
 			key:  projectSettingDefaultMaxTurns,
 			doc:  `{"default_max_turns": null}`,
@@ -166,6 +186,18 @@ func TestResolvedSettings_HubValueExtraction(t *testing.T) {
 			wantValue: "10Gi",
 		},
 		{
+			name:      "gcp identity mode value extracted",
+			key:       projectSettingDefaultGCPIdentityMode,
+			doc:       `{"default_gcp_identity_mode": "assign"}`,
+			wantValue: "assign",
+		},
+		{
+			name:      "gcp identity service account value extracted",
+			key:       projectSettingDefaultGCPIdentitySAID,
+			doc:       `{"default_gcp_identity_service_account_id": "sa-1"}`,
+			wantValue: "sa-1",
+		},
+		{
 			name:      "missing key returns nil value",
 			key:       projectSettingDefaultMaxTurns,
 			doc:       `{}`,
@@ -212,17 +244,15 @@ func TestResolvedSettings_UnreadableSourceIsUnknownNotAbsent(t *testing.T) {
 	}
 }
 
-// TestResolvedSettings_NoHubCounterpartIsAbsent covers the opposite case:
-// AgentDefaultsSettings has eight fields, enumerated in full, so "there
-// is no hub default for activeProfile" is a measured structural fact and may be
-// reported as absent rather than unknown.
+// TestResolvedSettings_NoHubCounterpartIsAbsent covers the case where a
+// registered project setting genuinely has no hub-level counterpart: "there
+// is no hub default for activeProfile" is a measured structural fact and may
+// be reported as absent rather than unknown.
 func TestResolvedSettings_NoHubCounterpartIsAbsent(t *testing.T) {
 	resp := (&Server{}).resolvedProjectSettings(&store.Project{ID: "p-1"})
 
 	for _, key := range []string{
 		projectSettingActiveProfile,
-		projectSettingDefaultGCPIdentityMode,
-		projectSettingDefaultGCPIdentitySAID,
 	} {
 		assert.Equalf(t, ResolvedHubDefaultAbsent, resp.Settings[key].HubDefault,
 			"%q has no agent_defaults counterpart; that is a measured structural "+
@@ -292,6 +322,30 @@ func TestResolvedSettings_ProjectAnnotationReporting(t *testing.T) {
 	unset := resp.Settings[projectSettingDefaultHarnessConfig]
 	assert.False(t, unset.ProjectSet)
 	assert.Nil(t, unset.ProjectValue, "an unset annotation must be null, not \"\"")
+}
+
+// A stored thinking level outside 1-100 (a stale "0") is not a project
+// value: projectSet is false and projectValue null, as GET /settings omits
+// it, so the page shows the hub default. A valid level is reported as set
+// (ptone/scion#5692).
+func TestResolvedSettings_InvalidStoredThinkingLevelIsUnset(t *testing.T) {
+	for _, val := range []string{"0", "101", "-1", "high", ""} {
+		project := &store.Project{ID: "p-1", Annotations: map[string]string{projectSettingDefaultThinkingLevel: val}}
+		resp := (&Server{}).resolvedProjectSettings(project)
+		entry := resp.Settings[projectSettingDefaultThinkingLevel]
+		assert.False(t, entry.ProjectSet, "stored %q must read as unset", val)
+		assert.Nil(t, entry.ProjectValue, "stored %q must be null", val)
+		assert.Nil(t, resp.Project.DefaultThinkingLevel, "the project member agrees for %q", val)
+	}
+
+	project := &store.Project{ID: "p-1", Annotations: map[string]string{projectSettingDefaultThinkingLevel: "60"}}
+	resp := (&Server{}).resolvedProjectSettings(project)
+	entry := resp.Settings[projectSettingDefaultThinkingLevel]
+	assert.True(t, entry.ProjectSet)
+	require.NotNil(t, entry.ProjectValue)
+	assert.Equal(t, "60", *entry.ProjectValue)
+	require.NotNil(t, resp.Project.DefaultThinkingLevel)
+	assert.Equal(t, 60, *resp.Project.DefaultThinkingLevel)
 }
 
 // TestResolvedSettings_EndpointReturnsNoEffectiveValue asserts on the actual
@@ -431,21 +485,12 @@ func TestResolvedSettings_EndpointUnknownProject(t *testing.T) {
 }
 
 // TestResolvedSettings_NonHubMemberForbidden asserts that the Forbidden branch
-// of this endpoint is REACHABLE and correct: a caller who is not a hub member
-// gets 403.
+// of this endpoint is REACHABLE and correct: callers without project read
+// access get 403.
 //
-// Read the wording carefully, because the obvious version of this test cannot
-// be written on this platform. The seeded hub-member-read-all policy grants
-// ActionRead on ALL projects to EVERY hub member, so a caller who is merely not
-// a member OF THIS PROJECT is legitimately authorized and gets 200. A test
-// named "non-member is refused" would have had to assert 200 in order to pass,
-// which is very likely why no negative test existed here in the first place.
-// The meaningful denial is therefore a non-HUB-member, and that is what this
-// asserts.
-//
-// Both facts are pinned below, the surprising one deliberately, so that the
-// next person to read this does not "fix" the 200 into a 403 and break the
-// platform's actual access model.
+// After narrowing hub-member-read-all (proj-visibility), project reads are
+// gated by per-project membership policies. Non-project-members now correctly
+// get 403, regardless of hub membership.
 func TestResolvedSettings_NonHubMemberForbidden(t *testing.T) {
 	srv, s, _, hubMemberNonProjectMember, project := setupDemoPolicyTest(t)
 
@@ -464,31 +509,25 @@ func TestResolvedSettings_NonHubMemberForbidden(t *testing.T) {
 	resolvedPath := "/api/v1/projects/" + project.ID + "/settings/resolved"
 	settingsPath := "/api/v1/projects/" + project.ID + "/settings"
 
-	// The assertion the lead asked for: the Forbidden branch is reachable.
+	// Non-hub-member: refused.
 	rec := doRequestAsUser(t, srv, outsider, http.MethodGet, resolvedPath, nil)
 	assert.Equalf(t, http.StatusForbidden, rec.Code,
 		"a non-hub-member must be refused by the resolved endpoint; body: %s",
 		rec.Body.String())
 
 	// Control against the pre-existing endpoint this handler was modelled on.
-	// If GET /settings ever stops refusing this caller, the line above is
-	// asserting a local quirk rather than the platform's policy, and the two
-	// should be changed together rather than drifting apart.
 	rec = doRequestAsUser(t, srv, outsider, http.MethodGet, settingsPath, nil)
 	assert.Equalf(t, http.StatusForbidden, rec.Code,
 		"control: the pre-existing GET /settings must refuse the same caller, "+
 			"otherwise /settings/resolved is enforcing a policy of its own; body: %s",
 		rec.Body.String())
 
-	// The counter-intuitive half. This caller is NOT a member of the project,
-	// and is nonetheless authorized, because hub-member-read-all grants read on
-	// every project to every hub member. This is pinned as correct-as-designed.
-	// If it ever returns 403, the hub's read model has changed and this
-	// endpoint's authorization needs rereading — do not simply update the
-	// expectation.
+	// Hub member who is NOT a project member: also refused. After narrowing
+	// hub-member-read-all to exclude project resources, project reads require
+	// membership in the project's members group.
 	rec = doRequestAsUser(t, srv, hubMemberNonProjectMember, http.MethodGet, resolvedPath, nil)
-	assert.Equalf(t, http.StatusOK, rec.Code,
-		"a hub member who is not a project member is granted read by "+
-			"hub-member-read-all and must get 200, not 403; body: %s",
+	assert.Equalf(t, http.StatusForbidden, rec.Code,
+		"a hub member who is not a project member should get 403 after "+
+			"hub-member-read-all was narrowed; body: %s",
 		rec.Body.String())
 }

@@ -230,16 +230,72 @@ func (_c *MessageCreate) SetNillableThreadID(v *string) *MessageCreate {
 	return _c
 }
 
-// SetVisibility sets the "visibility" field.
-func (_c *MessageCreate) SetVisibility(v string) *MessageCreate {
-	_c.mutation.SetVisibility(v)
+// SetConversationID sets the "conversation_id" field.
+func (_c *MessageCreate) SetConversationID(v uuid.UUID) *MessageCreate {
+	_c.mutation.SetConversationID(v)
 	return _c
 }
 
-// SetNillableVisibility sets the "visibility" field if the given value is not nil.
-func (_c *MessageCreate) SetNillableVisibility(v *string) *MessageCreate {
+// SetNillableConversationID sets the "conversation_id" field if the given value is not nil.
+func (_c *MessageCreate) SetNillableConversationID(v *uuid.UUID) *MessageCreate {
 	if v != nil {
-		_c.SetVisibility(*v)
+		_c.SetConversationID(*v)
+	}
+	return _c
+}
+
+// SetSenderProjectID sets the "sender_project_id" field.
+func (_c *MessageCreate) SetSenderProjectID(v uuid.UUID) *MessageCreate {
+	_c.mutation.SetSenderProjectID(v)
+	return _c
+}
+
+// SetNillableSenderProjectID sets the "sender_project_id" field if the given value is not nil.
+func (_c *MessageCreate) SetNillableSenderProjectID(v *uuid.UUID) *MessageCreate {
+	if v != nil {
+		_c.SetSenderProjectID(*v)
+	}
+	return _c
+}
+
+// SetRecipientProjectID sets the "recipient_project_id" field.
+func (_c *MessageCreate) SetRecipientProjectID(v uuid.UUID) *MessageCreate {
+	_c.mutation.SetRecipientProjectID(v)
+	return _c
+}
+
+// SetNillableRecipientProjectID sets the "recipient_project_id" field if the given value is not nil.
+func (_c *MessageCreate) SetNillableRecipientProjectID(v *uuid.UUID) *MessageCreate {
+	if v != nil {
+		_c.SetRecipientProjectID(*v)
+	}
+	return _c
+}
+
+// SetAuthorizingUserID sets the "authorizing_user_id" field.
+func (_c *MessageCreate) SetAuthorizingUserID(v string) *MessageCreate {
+	_c.mutation.SetAuthorizingUserID(v)
+	return _c
+}
+
+// SetNillableAuthorizingUserID sets the "authorizing_user_id" field if the given value is not nil.
+func (_c *MessageCreate) SetNillableAuthorizingUserID(v *string) *MessageCreate {
+	if v != nil {
+		_c.SetAuthorizingUserID(*v)
+	}
+	return _c
+}
+
+// SetDelegationGrantID sets the "delegation_grant_id" field.
+func (_c *MessageCreate) SetDelegationGrantID(v string) *MessageCreate {
+	_c.mutation.SetDelegationGrantID(v)
+	return _c
+}
+
+// SetNillableDelegationGrantID sets the "delegation_grant_id" field if the given value is not nil.
+func (_c *MessageCreate) SetNillableDelegationGrantID(v *string) *MessageCreate {
+	if v != nil {
+		_c.SetDelegationGrantID(*v)
 	}
 	return _c
 }
@@ -361,11 +417,6 @@ func (_c *MessageCreate) check() error {
 	if _, ok := _c.mutation.Msg(); !ok {
 		return &ValidationError{Name: "msg", err: errors.New(`ent: missing required field "Message.msg"`)}
 	}
-	if v, ok := _c.mutation.Msg(); ok {
-		if err := message.MsgValidator(v); err != nil {
-			return &ValidationError{Name: "msg", err: fmt.Errorf(`ent: validator failed for field "Message.msg": %w`, err)}
-		}
-	}
 	if _, ok := _c.mutation.GetType(); !ok {
 		return &ValidationError{Name: "type", err: errors.New(`ent: missing required field "Message.type"`)}
 	}
@@ -389,11 +440,6 @@ func (_c *MessageCreate) check() error {
 	if v, ok := _c.mutation.ThreadID(); ok {
 		if err := message.ThreadIDValidator(v); err != nil {
 			return &ValidationError{Name: "thread_id", err: fmt.Errorf(`ent: validator failed for field "Message.thread_id": %w`, err)}
-		}
-	}
-	if v, ok := _c.mutation.Visibility(); ok {
-		if err := message.VisibilityValidator(v); err != nil {
-			return &ValidationError{Name: "visibility", err: fmt.Errorf(`ent: validator failed for field "Message.visibility": %w`, err)}
 		}
 	}
 	if _, ok := _c.mutation.Created(); !ok {
@@ -503,9 +549,25 @@ func (_c *MessageCreate) createSpec() (*Message, *sqlgraph.CreateSpec) {
 		_spec.SetField(message.FieldThreadID, field.TypeString, value)
 		_node.ThreadID = value
 	}
-	if value, ok := _c.mutation.Visibility(); ok {
-		_spec.SetField(message.FieldVisibility, field.TypeString, value)
-		_node.Visibility = value
+	if value, ok := _c.mutation.ConversationID(); ok {
+		_spec.SetField(message.FieldConversationID, field.TypeUUID, value)
+		_node.ConversationID = &value
+	}
+	if value, ok := _c.mutation.SenderProjectID(); ok {
+		_spec.SetField(message.FieldSenderProjectID, field.TypeUUID, value)
+		_node.SenderProjectID = &value
+	}
+	if value, ok := _c.mutation.RecipientProjectID(); ok {
+		_spec.SetField(message.FieldRecipientProjectID, field.TypeUUID, value)
+		_node.RecipientProjectID = &value
+	}
+	if value, ok := _c.mutation.AuthorizingUserID(); ok {
+		_spec.SetField(message.FieldAuthorizingUserID, field.TypeString, value)
+		_node.AuthorizingUserID = &value
+	}
+	if value, ok := _c.mutation.DelegationGrantID(); ok {
+		_spec.SetField(message.FieldDelegationGrantID, field.TypeString, value)
+		_node.DelegationGrantID = &value
 	}
 	if value, ok := _c.mutation.Created(); ok {
 		_spec.SetField(message.FieldCreated, field.TypeTime, value)
@@ -815,21 +877,21 @@ func (u *MessageUpsert) ClearThreadID() *MessageUpsert {
 	return u
 }
 
-// SetVisibility sets the "visibility" field.
-func (u *MessageUpsert) SetVisibility(v string) *MessageUpsert {
-	u.Set(message.FieldVisibility, v)
+// SetConversationID sets the "conversation_id" field.
+func (u *MessageUpsert) SetConversationID(v uuid.UUID) *MessageUpsert {
+	u.Set(message.FieldConversationID, v)
 	return u
 }
 
-// UpdateVisibility sets the "visibility" field to the value that was provided on create.
-func (u *MessageUpsert) UpdateVisibility() *MessageUpsert {
-	u.SetExcluded(message.FieldVisibility)
+// UpdateConversationID sets the "conversation_id" field to the value that was provided on create.
+func (u *MessageUpsert) UpdateConversationID() *MessageUpsert {
+	u.SetExcluded(message.FieldConversationID)
 	return u
 }
 
-// ClearVisibility clears the value of the "visibility" field.
-func (u *MessageUpsert) ClearVisibility() *MessageUpsert {
-	u.SetNull(message.FieldVisibility)
+// ClearConversationID clears the value of the "conversation_id" field.
+func (u *MessageUpsert) ClearConversationID() *MessageUpsert {
+	u.SetNull(message.FieldConversationID)
 	return u
 }
 
@@ -849,6 +911,18 @@ func (u *MessageUpsertOne) UpdateNewValues() *MessageUpsertOne {
 	u.create.conflict = append(u.create.conflict, sql.ResolveWith(func(s *sql.UpdateSet) {
 		if _, exists := u.create.mutation.ID(); exists {
 			s.SetIgnore(message.FieldID)
+		}
+		if _, exists := u.create.mutation.SenderProjectID(); exists {
+			s.SetIgnore(message.FieldSenderProjectID)
+		}
+		if _, exists := u.create.mutation.RecipientProjectID(); exists {
+			s.SetIgnore(message.FieldRecipientProjectID)
+		}
+		if _, exists := u.create.mutation.AuthorizingUserID(); exists {
+			s.SetIgnore(message.FieldAuthorizingUserID)
+		}
+		if _, exists := u.create.mutation.DelegationGrantID(); exists {
+			s.SetIgnore(message.FieldDelegationGrantID)
 		}
 		if _, exists := u.create.mutation.Created(); exists {
 			s.SetIgnore(message.FieldCreated)
@@ -1178,24 +1252,24 @@ func (u *MessageUpsertOne) ClearThreadID() *MessageUpsertOne {
 	})
 }
 
-// SetVisibility sets the "visibility" field.
-func (u *MessageUpsertOne) SetVisibility(v string) *MessageUpsertOne {
+// SetConversationID sets the "conversation_id" field.
+func (u *MessageUpsertOne) SetConversationID(v uuid.UUID) *MessageUpsertOne {
 	return u.Update(func(s *MessageUpsert) {
-		s.SetVisibility(v)
+		s.SetConversationID(v)
 	})
 }
 
-// UpdateVisibility sets the "visibility" field to the value that was provided on create.
-func (u *MessageUpsertOne) UpdateVisibility() *MessageUpsertOne {
+// UpdateConversationID sets the "conversation_id" field to the value that was provided on create.
+func (u *MessageUpsertOne) UpdateConversationID() *MessageUpsertOne {
 	return u.Update(func(s *MessageUpsert) {
-		s.UpdateVisibility()
+		s.UpdateConversationID()
 	})
 }
 
-// ClearVisibility clears the value of the "visibility" field.
-func (u *MessageUpsertOne) ClearVisibility() *MessageUpsertOne {
+// ClearConversationID clears the value of the "conversation_id" field.
+func (u *MessageUpsertOne) ClearConversationID() *MessageUpsertOne {
 	return u.Update(func(s *MessageUpsert) {
-		s.ClearVisibility()
+		s.ClearConversationID()
 	})
 }
 
@@ -1381,6 +1455,18 @@ func (u *MessageUpsertBulk) UpdateNewValues() *MessageUpsertBulk {
 		for _, b := range u.create.builders {
 			if _, exists := b.mutation.ID(); exists {
 				s.SetIgnore(message.FieldID)
+			}
+			if _, exists := b.mutation.SenderProjectID(); exists {
+				s.SetIgnore(message.FieldSenderProjectID)
+			}
+			if _, exists := b.mutation.RecipientProjectID(); exists {
+				s.SetIgnore(message.FieldRecipientProjectID)
+			}
+			if _, exists := b.mutation.AuthorizingUserID(); exists {
+				s.SetIgnore(message.FieldAuthorizingUserID)
+			}
+			if _, exists := b.mutation.DelegationGrantID(); exists {
+				s.SetIgnore(message.FieldDelegationGrantID)
 			}
 			if _, exists := b.mutation.Created(); exists {
 				s.SetIgnore(message.FieldCreated)
@@ -1711,24 +1797,24 @@ func (u *MessageUpsertBulk) ClearThreadID() *MessageUpsertBulk {
 	})
 }
 
-// SetVisibility sets the "visibility" field.
-func (u *MessageUpsertBulk) SetVisibility(v string) *MessageUpsertBulk {
+// SetConversationID sets the "conversation_id" field.
+func (u *MessageUpsertBulk) SetConversationID(v uuid.UUID) *MessageUpsertBulk {
 	return u.Update(func(s *MessageUpsert) {
-		s.SetVisibility(v)
+		s.SetConversationID(v)
 	})
 }
 
-// UpdateVisibility sets the "visibility" field to the value that was provided on create.
-func (u *MessageUpsertBulk) UpdateVisibility() *MessageUpsertBulk {
+// UpdateConversationID sets the "conversation_id" field to the value that was provided on create.
+func (u *MessageUpsertBulk) UpdateConversationID() *MessageUpsertBulk {
 	return u.Update(func(s *MessageUpsert) {
-		s.UpdateVisibility()
+		s.UpdateConversationID()
 	})
 }
 
-// ClearVisibility clears the value of the "visibility" field.
-func (u *MessageUpsertBulk) ClearVisibility() *MessageUpsertBulk {
+// ClearConversationID clears the value of the "conversation_id" field.
+func (u *MessageUpsertBulk) ClearConversationID() *MessageUpsertBulk {
 	return u.Update(func(s *MessageUpsert) {
-		s.ClearVisibility()
+		s.ClearConversationID()
 	})
 }
 

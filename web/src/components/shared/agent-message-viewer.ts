@@ -22,11 +22,17 @@
  * and provides a compose box for sending new messages with optional interrupt.
  */
 
-import { LitElement, html, css, nothing } from 'lit';
+import { LitElement, html, css, nothing, type TemplateResult } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
+import { repeat } from 'lit/directives/repeat.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
+import { peekUser, resolveUser, userDisplayName } from '../../client/user-directory.js';
+import { FrameBatcher, SortedLogBuffer } from '../../client/sorted-log-buffer.js';
+import { getDenialMessage } from '../../shared/message-mode.js';
 import type { Message } from '../../shared/types.js';
 import './json-browser.js';
+import { effectiveTimeZone, formatInstant, formatInstantWithZone } from '../../utils/time.js';
+import { DisplayZoneController } from '../../utils/display-zone-controller.js';
 
 interface MessageLogEntry {
   timestamp: string;
@@ -57,12 +63,74 @@ interface ParsedMessage {
   timestamp: string;
   insertId: string;
   raw: MessageLogEntry | null;
+  /** Sender's project ID for cross-project provenance. */
+  senderProjectId?: string | undefined;
+  /** Recipient's project ID for cross-project provenance. */
+  recipientProjectId?: string | undefined;
+  /** Whether this message crossed project boundaries. */
+  crossProject?: boolean | undefined;
+  /**
+   * The user who authorized a message sent with an agent delegated
+   * credential, and the grant (.design/agent-delegation.md §14.5). The
+   * sender stays the agent. Absent on every other message.
+   */
+  authorizingUserId?: string | undefined;
+  delegationGrantId?: string | undefined;
+}
+
+/**
+ * A parsed message plus what its row needs, computed once at ingest: the
+ * numeric timestamp (sort key) and the formatted strings. `zone` records the
+ * display zone the strings were formatted in; a zone change re-formats them
+ * once on the next render.
+ */
+interface MessageRow extends ParsedMessage {
+  ts: number;
+  zone: string;
+  date: string;
+  time: string;
+}
+
+function toMessageRow(msg: ParsedMessage, zone: string): MessageRow {
+  const row: MessageRow = {
+    ...msg,
+    ts: new Date(msg.timestamp).getTime(),
+    zone: '',
+    date: '',
+    time: '',
+  };
+  formatMessageRow(row, zone);
+  return row;
+}
+
+/** (Re-)formats a row's strings unless they are already in `zone`. */
+function formatMessageRow(row: MessageRow, zone: string): void {
+  if (row.zone === zone) return;
+  row.zone = zone;
+  // Date divider and row time in the effective display zone (24-hour);
+  // the divider names the zone.
+  row.date = formatInstantWithZone(row.timestamp, 'date');
+  row.time = formatInstant(row.timestamp, 'time-seconds');
 }
 
 const MAX_BUFFER = 500;
 
+/**
+ * Reports whether a message log entry is a message record. Lifecycle and
+ * bookkeeping entries (tagged log_kind=event, or carrying neither a sender
+ * nor a recipient) are not listed.
+ */
+function isMessageRecord(entry: MessageLogEntry, parsed: ParsedMessage): boolean {
+  const kind = entry.labels?.['log_kind'] ?? entry.jsonPayload?.['log_kind'];
+  if (kind === 'event') return false;
+  return parsed.sender !== '' || parsed.recipient !== '';
+}
+
 @customElement('scion-agent-message-viewer')
 export class ScionAgentMessageViewer extends LitElement {
+  /** Re-renders timestamps and date dividers when the display zone changes. */
+  readonly _zone = new DisplayZoneController(this);
+
   @property()
   agentId = '';
 
@@ -112,8 +180,20 @@ export class ScionAgentMessageViewer extends LitElement {
   @property()
   broadcastUrl = '';
 
-  @state() private messages: ParsedMessage[] = [];
-  @state() private entryMap = new Map<string, ParsedMessage>();
+  /**
+   * Current project ID, used to detect cross-project messages.
+   * When set, messages from/to a different project get a cross-project badge.
+   */
+  @property()
+  projectId = '';
+
+  /** Messages in ascending timestamp order (rendered newest first). */
+  private readonly buffer = new SortedLogBuffer<MessageRow>({
+    cap: MAX_BUFFER,
+    keyOf: (row) => row.insertId,
+  });
+  /** Streamed messages render at most once per animation frame. */
+  private readonly renderBatch = new FrameBatcher(() => this.requestUpdate());
   @state() private loading = false;
   @state() private error: string | null = null;
   @state() private streaming = false;
@@ -163,6 +243,16 @@ export class ScionAgentMessageViewer extends LitElement {
     }
     .compose-input sl-input::part(base) {
       font-size: 0.875rem;
+    }
+
+    /* This local override replaces the app-wide --sl-input-font-size-*
+       variable with a fixed value, which would otherwise defeat the
+       pointer:coarse 16px floor (see pkg/hub/web.go / web/index.html) on
+       touch — re-floor it here too, desktop unchanged. */
+    @media (pointer: coarse) {
+      .compose-input sl-input::part(base) {
+        font-size: max(16px, 0.875rem);
+      }
     }
     .compose-actions {
       display: flex;
@@ -326,7 +416,18 @@ export class ScionAgentMessageViewer extends LitElement {
       background: var(--scion-warning-50, #fffbeb);
       color: var(--scion-warning-700, #b45309);
     }
+    .badge-cross-project {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.1875rem;
+      background: var(--sl-color-success-100, #dcfce7);
+      color: var(--sl-color-success-700, #15803d);
+    }
 
+    .msg-authorized-by {
+      font-size: 0.6875rem;
+      color: var(--scion-text-muted, #64748b);
+    }
     .msg-body {
       font-size: 0.8125rem;
       color: var(--scion-text-secondary, #475569);
@@ -374,9 +475,20 @@ export class ScionAgentMessageViewer extends LitElement {
     }
   `;
 
+  override connectedCallback(): void {
+    super.connectedCallback();
+    // Lit does not re-render on reconnect; show lines whose frame was
+    // cancelled by disconnectedCallback.
+    if (this.buffer.size > 0) this.requestUpdate();
+  }
+
   override disconnectedCallback(): void {
     super.disconnectedCallback();
     this.stopStream();
+    // A frame left pending would keep this detached element (and its buffer)
+    // alive until a hidden tab becomes visible; connectedCallback renders
+    // anything it skipped.
+    this.renderBatch.cancel();
   }
 
   /** Called by the parent when the messages tab is first shown. */
@@ -421,10 +533,25 @@ export class ScionAgentMessageViewer extends LitElement {
             this.mergeHubMessages(items);
             return;
           }
+        } else if (hubRes.status >= 400 && hubRes.status < 500) {
+          // DEF-128a: A 4xx is the hub answering, not failing. Surface the
+          // error instead of falling through to the Cloud Logging fallback.
+          // Without this guard, a 409 (conversation not resolved) silently
+          // escalates the viewer to the unscoped Cloud Logging path.
+          const errData = (await hubRes.json().catch(() => ({}))) as {
+            error?: { message?: string };
+            message?: string;
+          };
+          throw new Error(
+            (errData.error as { message?: string })?.message ||
+              errData.message ||
+              `HTTP ${hubRes.status}`
+          );
         }
       }
 
       // Fallback: Cloud Logging proxy (for pre-migration records or when Hub is unavailable).
+      // Only reached on network errors or 5xx — never on 4xx (DEF-128a).
       // Skipped when Cloud Logging is unavailable — the /message-logs endpoint returns 501
       // in that case, which would turn an empty hub-store result into a user-facing error
       // instead of the intended "No messages found" empty state.
@@ -433,8 +560,9 @@ export class ScionAgentMessageViewer extends LitElement {
       if (!baseUrl) return;
 
       const params = new URLSearchParams({ tail: '200' });
-      if (this.messages.length > 0) {
-        params.set('since', this.messages[0].timestamp);
+      const newest = this.buffer.newest;
+      if (newest) {
+        params.set('since', newest.timestamp);
       }
       const res = await apiFetch(`${baseUrl}?${params.toString()}`);
       if (!res.ok) {
@@ -464,6 +592,12 @@ export class ScionAgentMessageViewer extends LitElement {
     const direction: 'sent' | 'received' =
       !this.agentId || msg.senderId === this.agentId ? 'sent' : 'received';
 
+    // Cross-project detection: if either project ID differs from the current project
+    const crossProject =
+      !!this.projectId &&
+      ((!!msg.senderProjectId && msg.senderProjectId !== this.projectId) ||
+        (!!msg.recipientProjectId && msg.recipientProjectId !== this.projectId));
+
     return {
       sender: msg.sender,
       recipient: msg.recipient,
@@ -475,29 +609,26 @@ export class ScionAgentMessageViewer extends LitElement {
       timestamp: msg.createdAt,
       insertId: `hub:${msg.id}`,
       raw: null,
+      senderProjectId: msg.senderProjectId,
+      recipientProjectId: msg.recipientProjectId,
+      crossProject,
+      authorizingUserId: msg.authorizingUserId || undefined,
+      delegationGrantId: msg.delegationGrantId || undefined,
     };
   }
 
+  /**
+   * Adds hub store messages to the sorted buffer (formatting each new one
+   * once) and schedules one render for the next animation frame.
+   */
   private mergeHubMessages(items: Message[]): void {
+    const zone = effectiveTimeZone();
+    let added = false;
     for (const item of items) {
-      const parsed = this.parseHubMessage(item);
-      if (!this.entryMap.has(parsed.insertId)) {
-        this.entryMap.set(parsed.insertId, parsed);
-      }
+      if (this.buffer.has(`hub:${item.id}`)) continue;
+      added = this.buffer.insert(toMessageRow(this.parseHubMessage(item), zone)) || added;
     }
-
-    const sorted = Array.from(this.entryMap.values()).sort(
-      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-    );
-
-    if (sorted.length > MAX_BUFFER) {
-      const evicted = sorted.splice(MAX_BUFFER);
-      for (const e of evicted) {
-        this.entryMap.delete(e.insertId);
-      }
-    }
-
-    this.messages = sorted;
+    if (added) this.renderBatch.schedule();
   }
 
   private parseEntry(entry: MessageLogEntry): ParsedMessage {
@@ -537,6 +668,14 @@ export class ScionAgentMessageViewer extends LitElement {
     // The actual message body is in payload['message_content'].
     const body = (payload['message_content'] as string) || '';
 
+    // Cross-project provenance from log labels
+    const senderProjectId = labels['sender_project_id'] || undefined;
+    const recipientProjectId = labels['recipient_project_id'] || undefined;
+    const crossProject =
+      !!this.projectId &&
+      ((!!senderProjectId && senderProjectId !== this.projectId) ||
+        (!!recipientProjectId && recipientProjectId !== this.projectId));
+
     return {
       sender,
       recipient,
@@ -548,28 +687,26 @@ export class ScionAgentMessageViewer extends LitElement {
       timestamp: entry.timestamp,
       insertId: entry.insertId,
       raw: entry,
+      senderProjectId,
+      recipientProjectId,
+      crossProject,
     };
   }
 
+  /**
+   * Adds Cloud Logging message records to the sorted buffer (formatting each
+   * new one once) and schedules one render for the next animation frame.
+   */
   private mergeEntries(newEntries: MessageLogEntry[]): void {
+    const zone = effectiveTimeZone();
+    let added = false;
     for (const entry of newEntries) {
-      if (!this.entryMap.has(entry.insertId)) {
-        this.entryMap.set(entry.insertId, this.parseEntry(entry));
-      }
+      if (this.buffer.has(entry.insertId)) continue;
+      const parsed = this.parseEntry(entry);
+      if (!isMessageRecord(entry, parsed)) continue;
+      added = this.buffer.insert(toMessageRow(parsed, zone)) || added;
     }
-
-    const sorted = Array.from(this.entryMap.values()).sort(
-      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-    );
-
-    if (sorted.length > MAX_BUFFER) {
-      const evicted = sorted.splice(MAX_BUFFER);
-      for (const e of evicted) {
-        this.entryMap.delete(e.insertId);
-      }
-    }
-
-    this.messages = sorted;
+    if (added) this.renderBatch.schedule();
   }
 
   // ---------------------------------------------------------------------------
@@ -588,7 +725,7 @@ export class ScionAgentMessageViewer extends LitElement {
     // UserMessageEvent payload (hub store record) per message.
     this.eventSource.addEventListener('message', (event: Event) => {
       try {
-        const msg = JSON.parse((event as MessageEvent).data) as Message;
+        const msg = JSON.parse((event as MessageEvent<string>).data) as Message;
         this.mergeHubMessages([msg]);
       } catch {
         // Skip unparseable entries
@@ -599,7 +736,7 @@ export class ScionAgentMessageViewer extends LitElement {
     // when explicitly opted in): emits "log" events with raw log entries.
     this.eventSource.addEventListener('log', (event: Event) => {
       try {
-        const entry = JSON.parse((event as MessageEvent).data) as MessageLogEntry;
+        const entry = JSON.parse((event as MessageEvent<string>).data) as MessageLogEntry;
         this.mergeEntries([entry]);
       } catch {
         // Skip unparseable entries
@@ -668,6 +805,18 @@ export class ScionAgentMessageViewer extends LitElement {
         body: JSON.stringify(body),
       });
       if (!res.ok) {
+        // Try to parse structured rejection error
+        try {
+          const errorBody = (await res.clone().json()) as {
+            error?: { code?: string; details?: { reason?: string } };
+          };
+          if (errorBody.error?.code === 'message_denied' && errorBody.error?.details?.reason) {
+            this.sendError = getDenialMessage(errorBody.error.details.reason, this.agentName);
+            return;
+          }
+        } catch {
+          /* fall through to generic */
+        }
         this.sendError = await extractApiError(res, 'Failed to send message');
         return;
       }
@@ -824,7 +973,7 @@ export class ScionAgentMessageViewer extends LitElement {
   }
 
   private renderContent() {
-    if (this.loading && this.messages.length === 0) {
+    if (this.loading && this.buffer.size === 0) {
       return html`
         <div class="state-msg">
           <sl-spinner></sl-spinner>
@@ -833,7 +982,7 @@ export class ScionAgentMessageViewer extends LitElement {
       `;
     }
 
-    if (this.error && this.messages.length === 0) {
+    if (this.error && this.buffer.size === 0) {
       return html`
         <div class="state-msg">
           <sl-icon name="exclamation-triangle"></sl-icon>
@@ -843,7 +992,7 @@ export class ScionAgentMessageViewer extends LitElement {
       `;
     }
 
-    if (this.messages.length === 0) {
+    if (this.buffer.size === 0) {
       return html`
         <div class="state-msg">
           <sl-icon name="chat-dots"></sl-icon>
@@ -856,37 +1005,39 @@ export class ScionAgentMessageViewer extends LitElement {
   }
 
   private renderMessages() {
-    const rows: unknown[] = [];
-    let lastDate = '';
+    // Newest first. Formatting happened at ingest; formatMessageRow only
+    // redoes it after a display zone change.
+    const zone = effectiveTimeZone();
+    const items = this.buffer.items;
+    const rows: { msg: MessageRow; divider: boolean }[] = [];
+    let lastDate: string | null = null;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const msg = items[i];
+      formatMessageRow(msg, zone);
+      rows.push({ msg, divider: msg.date !== lastDate });
+      lastDate = msg.date;
+    }
 
-    for (const msg of this.messages) {
-      const d = new Date(msg.timestamp);
-      const dateStr = d.toLocaleDateString('en', {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-      });
+    return repeat(
+      rows,
+      ({ msg }) => msg.insertId,
+      ({ msg, divider }) => this.renderMessage(msg, divider)
+    );
+  }
 
-      if (dateStr !== lastDate) {
-        lastDate = dateStr;
-        rows.push(html`<div class="date-divider">${dateStr}</div>`);
-      }
+  private renderMessage(msg: MessageRow, divider: boolean): TemplateResult {
+    const timeStr = msg.time;
+    const isExpanded = this.expandedIds.has(msg.insertId);
 
-      const timeStr = d.toLocaleTimeString('en', {
-        hour12: false,
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-      });
-      const isExpanded = this.expandedIds.has(msg.insertId);
+    const dirIcon = msg.direction === 'sent' ? 'box-arrow-up-right' : 'box-arrow-in-down-left';
 
-      const dirIcon = msg.direction === 'sent' ? 'box-arrow-up-right' : 'box-arrow-in-down-left';
+    // Always show sender on the left and recipient on the right.
+    const fromLabel = msg.sender || 'unknown';
+    const toLabel = msg.recipient || 'unknown';
 
-      // Always show sender on the left and recipient on the right.
-      const fromLabel = msg.sender || 'unknown';
-      const toLabel = msg.recipient || 'unknown';
-
-      rows.push(html`
+    // prettier-ignore
+    return html`
+        ${divider ? html`<div class="date-divider">${msg.date}</div>` : nothing}
         <div class="message-row" @click=${() => this.toggleExpand(msg.insertId)}>
           <div class="msg-direction ${msg.direction}">
             <sl-icon name=${dirIcon}></sl-icon>
@@ -897,6 +1048,11 @@ export class ScionAgentMessageViewer extends LitElement {
               <sl-icon name="arrow-right" class="msg-arrow" style="font-size:0.6875rem"></sl-icon>
               <span class="msg-target">${toLabel}</span>
               <div class="msg-badges">
+                ${msg.crossProject
+                  ? html`<span class="msg-badge badge-cross-project"
+                      ><sl-icon name="globe" style="font-size:0.625rem"></sl-icon> cross-project</span
+                    >`
+                  : nothing}
                 ${msg.msgType
                   ? html`<span class="msg-badge badge-type">${msg.msgType}</span>`
                   : nothing}
@@ -907,15 +1063,38 @@ export class ScionAgentMessageViewer extends LitElement {
               </div>
               <span class="msg-time">${timeStr}</span>
             </div>
+            ${this.renderAuthorizedBy(msg)}
             <div class="msg-body">${this.truncateBody(msg.body)}</div>
             ${isExpanded ? this.renderDetail(msg) : nothing}
           </div>
         </div>
-      `);
-    }
-
-    return rows;
+      `;
   }
+
+  /**
+   * The "authorized by <user> via delegation <grant>" line of a message sent
+   * with an agent delegated credential; nothing for any other message. The
+   * user is shown by display name, else email, else ID. An uncached user is
+   * looked up at most once per viewer (a failed lookup is not retried on
+   * later renders), and the list re-renders when a name arrives.
+   */
+  private renderAuthorizedBy(msg: ParsedMessage) {
+    const id = msg.authorizingUserId;
+    if (!id) return nothing;
+    const cached = peekUser(id);
+    if (!cached && !this.authorizerLookups.has(id)) {
+      this.authorizerLookups.add(id);
+      void resolveUser(id).then((user) => {
+        if (user) this.requestUpdate();
+      });
+    }
+    const name = cached ? userDisplayName(cached) : id;
+    const grant = msg.delegationGrantId ? ` via delegation ${msg.delegationGrantId}` : '';
+    return html`<div class="msg-authorized-by">authorized by ${name}${grant}</div>`;
+  }
+
+  /** Authorizing user IDs this viewer has already looked up. */
+  private readonly authorizerLookups = new Set<string>();
 
   private truncateBody(body: string): string {
     if (body.length > 300) {
@@ -934,6 +1113,15 @@ export class ScionAgentMessageViewer extends LitElement {
       broadcasted: msg.broadcasted,
       message: msg.body,
     };
+    if (msg.authorizingUserId) {
+      detail['authorizingUserId'] = msg.authorizingUserId;
+      if (msg.delegationGrantId) detail['delegationGrantId'] = msg.delegationGrantId;
+    }
+    if (msg.crossProject) {
+      detail['crossProject'] = true;
+      if (msg.senderProjectId) detail['senderProjectId'] = msg.senderProjectId;
+      if (msg.recipientProjectId) detail['recipientProjectId'] = msg.recipientProjectId;
+    }
     if (msg.raw) {
       if (msg.raw.labels && Object.keys(msg.raw.labels).length > 0) {
         detail['labels'] = msg.raw.labels;

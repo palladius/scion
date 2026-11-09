@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !no_sqlite
+
 package hub
 
 import (
@@ -78,28 +80,6 @@ func TestStartUpdateTracking_NilTracker(t *testing.T) {
 	srv := &Server{}
 	// Should not panic.
 	srv.startUpdateTracking("discord", "test-id", "1.0.0")
-}
-
-func TestHasPendingUpdate(t *testing.T) {
-	tracker := newPendingUpdateTracker()
-
-	if tracker.hasPendingUpdate("discord") {
-		t.Error("expected no pending update initially")
-	}
-
-	srv := &Server{updateTracker: tracker}
-	srv.startUpdateTracking("discord", "test-id", "1.0.0")
-
-	if !tracker.hasPendingUpdate("discord") {
-		t.Error("expected pending update after tracking started")
-	}
-
-	// Clean up.
-	tracker.mu.Lock()
-	e := tracker.pending["discord"]
-	e.cancel()
-	e.timer.Stop()
-	tracker.mu.Unlock()
 }
 
 func TestTriggerImmediatePoll_NoPending(t *testing.T) {

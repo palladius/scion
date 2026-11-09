@@ -64,8 +64,23 @@ func (f *fakeSecretBackend) GetMeta(context.Context, string, string, string) (*s
 	return nil, store.ErrNotFound
 }
 
+func (f *fakeSecretBackend) UpdateMeta(_ context.Context, _ *secret.UpdateMetaInput) (*secret.SecretMeta, error) {
+	return nil, nil
+}
+
 func (f *fakeSecretBackend) Resolve(context.Context, string, string, string, *secret.ResolveOpts) ([]secret.SecretWithValue, error) {
 	return nil, nil
+}
+
+// FetchValues is not exercised by secretmigration.MigratePluginSecrets; this
+// stub only satisfies secret.SecretBackend and reports every item not found,
+// the same as the other minimal fakes in this codebase.
+func (f *fakeSecretBackend) FetchValues(_ context.Context, metas []secret.SecretMeta) (map[string]secret.FetchResult, error) {
+	results := make(map[string]secret.FetchResult, len(metas))
+	for _, meta := range metas {
+		results[meta.ID] = secret.FetchResult{Err: store.ErrNotFound}
+	}
+	return results, nil
 }
 
 // captureLog collects everything written to the standard logger while fn runs.

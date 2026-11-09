@@ -22,34 +22,10 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"testing/fstest"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/storage"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
-	"github.com/GoogleCloudPlatform/scion/resources"
 )
-
-// testFS creates a minimal in-memory fs.FS with the given file contents.
-func testFS(files map[string]string) fs.FS {
-	m := fstest.MapFS{}
-	for path, content := range files {
-		m[path] = &fstest.MapFile{Data: []byte(content), Mode: 0644}
-	}
-	return m
-}
-
-// testBundledResource creates a BundledResource for testing.
-func testBundledResource(kind storage.ResourceKind, name string, files map[string]string) resources.BundledResource {
-	return resources.BundledResource{
-		Kind:      kind,
-		Name:      name,
-		Scope:     "global",
-		ScopeID:   "",
-		SourceURL: "builtin://scion/dev/" + string(kind) + "/" + name,
-		FS:        testFS(files),
-		Root:      ".",
-	}
-}
 
 func TestFSResourceSource_Files(t *testing.T) {
 	br := testBundledResource(storage.ResourceKindTemplate, "default", map[string]string{
@@ -335,7 +311,6 @@ func TestBootstrapSource_SkipNonBuiltinConflict(t *testing.T) {
 		StoragePath:   "templates/global/conflict",
 		StorageBucket: stor.Bucket(),
 		StorageURI:    "gs://test-bucket/templates/global/conflict",
-		Visibility:    store.VisibilityPrivate,
 	}
 	if err := s.CreateTemplate(ctx, existing); err != nil {
 		t.Fatalf("pre-create failed: %v", err)
@@ -393,7 +368,6 @@ func TestBootstrapSource_DuplicateCreateRace(t *testing.T) {
 		StoragePath:   "templates/global/raced",
 		StorageBucket: "test-bucket",
 		StorageURI:    "gs://test-bucket/templates/global/raced",
-		Visibility:    store.VisibilityPrivate,
 	}
 	if err := s.CreateTemplate(ctx, existing); err != nil {
 		t.Fatalf("pre-create failed: %v", err)
@@ -504,7 +478,6 @@ func TestBootstrapSource_OverwriteAlways(t *testing.T) {
 		StoragePath:   "templates/global/admin-override",
 		StorageBucket: stor.Bucket(),
 		StorageURI:    "gs://test-bucket/templates/global/admin-override",
-		Visibility:    store.VisibilityPrivate,
 	}
 	if err := s.CreateTemplate(ctx, existing); err != nil {
 		t.Fatalf("pre-create failed: %v", err)

@@ -15,20 +15,26 @@
 package hub
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/fstest"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/logging/loglevel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -39,99 +45,14 @@ type mockWebStore struct {
 	store.Store // embed interface to satisfy all method signatures (will panic if called)
 }
 
-// mockProxyAuthenticator is a test double for ProxyAuthenticator.
-type mockProxyAuthenticator struct {
-	user *ProxyUserInfo
-	err  error
-}
-
-func (m *mockProxyAuthenticator) Authenticate(_ *http.Request) (*ProxyUserInfo, error) {
-	return m.user, m.err
-}
-func (m *mockProxyAuthenticator) Name() string { return "mock" }
-
-// proxyAuthStore is a minimal store that supports the proxy auth user provisioning path.
-type proxyAuthStore struct {
-	store.Store // embed interface to satisfy all methods
-	users       map[string]*store.User
-}
-
-func newProxyAuthStore() *proxyAuthStore {
-	return &proxyAuthStore{users: make(map[string]*store.User)}
-}
-
-func (s *proxyAuthStore) GetUserByEmail(_ context.Context, email string) (*store.User, error) {
-	for _, u := range s.users {
-		if u.Email == email {
-			return u, nil
-		}
-	}
-	return nil, store.ErrNotFound
-}
-
-func (s *proxyAuthStore) CreateUser(_ context.Context, user *store.User) error {
-	s.users[user.ID] = user
-	return nil
-}
-
-func (s *proxyAuthStore) UpdateUser(_ context.Context, user *store.User) error {
-	s.users[user.ID] = user
-	return nil
-}
-
-func (s *proxyAuthStore) GetGroupBySlug(_ context.Context, _ string) (*store.Group, error) {
-	return nil, store.ErrNotFound // hub-members group not found is gracefully handled
-}
-
-func (s *proxyAuthStore) AddGroupMember(_ context.Context, _ *store.GroupMember) error {
-	return nil
-}
-
-func (s *proxyAuthStore) GetUser(_ context.Context, id string) (*store.User, error) {
-	if u, ok := s.users[id]; ok {
-		return u, nil
-	}
-	return nil, store.ErrNotFound
-}
-
-func newTestWebServer(t *testing.T, cfg WebServerConfig) *WebServer {
-	t.Helper()
-	ws := NewWebServer(cfg)
-	if ws.assets == nil && ws.assetsDisk == "" && cfg.AssetsDir == "" {
-		ws.assets = fstest.MapFS{
-			"assets/main.js": &fstest.MapFile{Data: []byte("// test stub")},
-		}
-	}
-	return ws
-}
-
-// newDevAuthWebServer creates a web server with dev-auth enabled for testing
-// authenticated routes without requiring OAuth.
-func newDevAuthWebServer(t *testing.T, overrides ...func(*WebServerConfig)) *WebServer {
-	t.Helper()
-	cfg := WebServerConfig{
-		DevAuthToken: "test-dev-token-12345",
-	}
-	for _, fn := range overrides {
-		fn(&cfg)
-	}
-	ws := NewWebServer(cfg)
-	if ws.assets == nil && ws.assetsDisk == "" {
-		ws.assets = fstest.MapFS{
-			"assets/main.js": &fstest.MapFile{Data: []byte("// test stub")},
-		}
-	}
-	return ws
-}
-
 func TestSPAShellHandler(t *testing.T) {
-	// Use dev-auth so the SPA handler is accessible
+	// Signed in with dev auth so the SPA handler is accessible
 	ws := newDevAuthWebServer(t)
 
 	req := httptest.NewRequest("GET", "/", nil)
 	rec := httptest.NewRecorder()
 
-	ws.Handler().ServeHTTP(rec, req)
+	devSignedIn(t, ws).ServeHTTP(rec, req)
 
 	resp := rec.Result()
 	body, err := io.ReadAll(resp.Body)
@@ -156,27 +77,45 @@ func TestSPAShellHandler(t *testing.T) {
 		"main.js":         "client entry point script",
 		"--scion-primary": "critical CSS variables",
 		"scion-theme":     "theme detection script",
-		shoelaceVersion:   "Shoelace CDN version",
 	}
 	for needle, desc := range checks {
 		if !strings.Contains(html, needle) {
 			t.Errorf("SPA shell missing %s (expected %q in HTML)", desc, needle)
 		}
 	}
+
+	// Shoelace is bundled with the client: the shell must not load the CDN
+	// autoloader or CDN theme stylesheets alongside it.
+	for _, needle := range []string{"cdn.jsdelivr.net", "shoelace-autoloader", "@shoelace-style"} {
+		if strings.Contains(html, needle) {
+			t.Errorf("SPA shell still references %q; Shoelace must load only from the bundle", needle)
+		}
+	}
 }
 
 func TestSPACatchAll(t *testing.T) {
-	// Use dev-auth so all routes are accessible
+	// Signed in with dev auth so all routes are accessible
 	ws := newDevAuthWebServer(t)
+	handler := devSignedIn(t, ws)
 
-	// Various SPA routes should all return the SPA shell
-	paths := []string{"/", "/projects", "/agents", "/projects/abc123", "/settings", "/not-a-real-page"}
+	// Various SPA routes should all return the SPA shell.
+	// Chat routes are included to verify that multi-segment client-side
+	// paths survive a browser refresh (SPA routing fallback).
+	paths := []string{
+		"/", "/projects", "/agents", "/projects/abc123", "/settings", "/not-a-real-page",
+		"/chat",
+		"/chat/my-project",
+		"/chat/chat-grove/649788a3-322a-45d5-9972-c7e66b2ada30",
+		"/chat/space/project-id",
+		"/chat/space/project-id/thread/topic-id",
+		"/chat/dm/dm-key",
+	}
 	for _, path := range paths {
 		t.Run(path, func(t *testing.T) {
 			req := httptest.NewRequest("GET", path, nil)
 			rec := httptest.NewRecorder()
 
-			ws.Handler().ServeHTTP(rec, req)
+			handler.ServeHTTP(rec, req)
 
 			resp := rec.Result()
 			if resp.StatusCode != http.StatusOK {
@@ -260,6 +199,173 @@ func TestStaticAssetHandler_HashedCaching(t *testing.T) {
 	}
 }
 
+// writeFingerprintFixture writes a client build with a Vite manifest into a
+// temp dir: real chunk names from a current build (hashes containing - and
+// _), the unhashed entry, a public file and a Shoelace icon.
+func writeFingerprintFixture(t *testing.T, manifest string) string {
+	t.Helper()
+	dir := t.TempDir()
+	files := map[string]string{
+		"assets/main.js":                           "// entry",
+		"assets/shoelace-B3-XBhED.js":              "// chunk",
+		"assets/project-detail-CeCkJL--.js":        "// chunk",
+		"assets/model-utils-UsxIS_8q.js":           "// chunk",
+		"assets/entry-AbCdEfGh.js":                 "// a hashed-looking entry",
+		"assets/font-Xy_z9-Ab.woff2":               "font",
+		"assets/shoelace-BZzytDYN.css":             "/* css */",
+		"assets/settings-AbCdEfGh.js":              "// not in the manifest",
+		"assets/chunk-abc12345.js":                 "// hex name",
+		"assets/shoelace-B3-XBhED.js.map":          "{}",
+		"favicon.ico":                              "icon",
+		"shoelace/assets/icons/cloud-download.svg": "<svg/>",
+	}
+	if manifest != "" {
+		files[".vite/manifest.json"] = manifest
+	}
+	for name, data := range files {
+		p := filepath.Join(dir, filepath.FromSlash(name))
+		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+		require.NoError(t, os.WriteFile(p, []byte(data), 0o644))
+	}
+	return dir
+}
+
+const fingerprintManifest = `{
+  "src/client/main.ts": {"file": "assets/main.js", "isEntry": true, "imports": ["_shoelace-B3-XBhED.js"]},
+  "_shoelace-B3-XBhED.js": {"file": "assets/shoelace-B3-XBhED.js", "css": ["assets/shoelace-BZzytDYN.css"]},
+  "src/components/pages/project-detail.ts": {"file": "assets/project-detail-CeCkJL--.js", "isDynamicEntry": true},
+  "_model-utils-UsxIS_8q.js": {"file": "assets/model-utils-UsxIS_8q.js", "assets": ["assets/font-Xy_z9-Ab.woff2"]},
+  "src/other-entry.ts": {"file": "assets/entry-AbCdEfGh.js", "isEntry": true},
+  "_bad-1": {"file": "../outside-AbCdEfGh.js"},
+  "_bad-2": {"file": "/assets/abs-AbCdEfGh.js"},
+  "_bad-3": {"file": "https://cdn.example.com/x-AbCdEfGh.js"},
+  "_bad-4": {"file": "assets/../assets/settings-AbCdEfGh.js"}
+}`
+
+func cacheControlOf(t *testing.T, ws *WebServer, p string) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, p, nil)
+	rec := httptest.NewRecorder()
+	ws.Handler().ServeHTTP(rec, req)
+	resp := rec.Result()
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode, p)
+	return resp.Header.Get("Cache-Control")
+}
+
+// TestStaticAssetFingerprintedCaching pins ptone/scion#3789: the files Vite
+// fingerprinted, read from its build manifest, get the immutable one-year
+// lifetime (ptone/scion#5348), from the disk and the embedded asset source
+// alike; the entry, source maps, public files and unlisted names stay
+// no-cache; hex names not in the manifest keep the one-day lifetime.
+func TestStaticAssetFingerprintedCaching(t *testing.T) {
+	const long = "public, max-age=31536000, immutable"
+	const day = "public, max-age=86400"
+	want := map[string]string{
+		"/assets/shoelace-B3-XBhED.js":              long,       // chunk
+		"/assets/project-detail-CeCkJL--.js":        long,       // dynamic entry chunk, hash ends in --
+		"/assets/model-utils-UsxIS_8q.js":           long,       // hash contains _
+		"/assets/shoelace-BZzytDYN.css":             long,       // css listed by a chunk
+		"/assets/chunk-abc12345.js":                 day,        // hex name, not in the manifest
+		"/assets/font-Xy_z9-Ab.woff2":               long,       // listed in a chunk's assets
+		"/assets/main.js":                           "no-cache", // the unhashed entry
+		"/assets/entry-AbCdEfGh.js":                 "no-cache", // an entry, even with a hash-like name
+		"/assets/settings-AbCdEfGh.js":              "no-cache", // looks hashed, not in the manifest
+		"/assets/shoelace-B3-XBhED.js.map":          "no-cache", // source map
+		"/favicon.ico":                              "no-cache", // public file
+		"/shoelace/assets/icons/cloud-download.svg": "no-cache",
+	}
+	dir := writeFingerprintFixture(t, fingerprintManifest)
+
+	t.Run("disk", func(t *testing.T) {
+		ws := newTestWebServer(t, WebServerConfig{AssetsDir: dir})
+		assert.Len(t, ws.fingerprintedAssets, 5, "the five clean, non-entry manifest paths, nothing else")
+		for p, cc := range want {
+			assert.Equal(t, cc, cacheControlOf(t, ws, p), p)
+		}
+	})
+
+	t.Run("embedded", func(t *testing.T) {
+		ws := newTestWebServer(t, WebServerConfig{})
+		ws.assets = os.DirFS(dir)
+		ws.assetsDisk = ""
+		ws.hasAssets = ws.detectWebAssets()
+		ws.fingerprintedAssets = fingerprintedAssetsOf(ws)
+		assert.Len(t, ws.fingerprintedAssets, 5)
+		for p, cc := range want {
+			assert.Equal(t, cc, cacheControlOf(t, ws, p), p)
+		}
+	})
+
+	t.Run("no manifest read without the entry", func(t *testing.T) {
+		bare := writeFingerprintFixture(t, fingerprintManifest)
+		require.NoError(t, os.Remove(filepath.Join(bare, "assets", "main.js")))
+		ws := newTestWebServer(t, WebServerConfig{AssetsDir: bare})
+		assert.False(t, ws.hasAssets)
+		assert.Nil(t, ws.fingerprintedAssets)
+		assert.Equal(t, "no-cache", cacheControlOf(t, ws, "/assets/shoelace-B3-XBhED.js"))
+	})
+
+	t.Run("manifest paths outside the build are ignored", func(t *testing.T) {
+		ws := newTestWebServer(t, WebServerConfig{AssetsDir: dir})
+		for _, p := range []string{"/../outside-AbCdEfGh.js", "/outside-AbCdEfGh.js", "//assets/abs-AbCdEfGh.js", "/assets/abs-AbCdEfGh.js", "/assets/settings-AbCdEfGh.js"} {
+			assert.False(t, ws.fingerprintedAssets[p], p)
+		}
+	})
+}
+
+// TestStaticAssetFingerprintedCaching_NoUsableManifest pins the fallback: with
+// no manifest, or one that does not parse, only hex names get the long
+// lifetime and Vite names stay no-cache.
+func TestStaticAssetFingerprintedCaching_NoUsableManifest(t *testing.T) {
+	cases := []struct {
+		name, manifest string
+		manifestIsDir  bool // a directory where the manifest file should be: unreadable
+		wantNil        bool // no set at all, so never a partial one
+	}{
+		{name: "missing", wantNil: true},
+		{name: "malformed", manifest: `{"src/client/main.ts": {"file": `, wantNil: true},
+		{name: "empty", manifest: `{}`},
+		{name: "null", manifest: `null`},
+		{name: "type mismatch", manifest: `{"a": {"file": 1}, "b": {"file": "assets/shoelace-B3-XBhED.js"}}`, wantNil: true},
+		{name: "unreadable", manifestIsDir: true, wantNil: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := writeFingerprintFixture(t, tc.manifest)
+			if tc.manifestIsDir {
+				require.NoError(t, os.MkdirAll(filepath.Join(dir, ".vite", "manifest.json"), 0o755))
+			}
+			ws := newTestWebServer(t, WebServerConfig{AssetsDir: dir})
+			assert.Empty(t, ws.fingerprintedAssets)
+			if tc.wantNil {
+				assert.Nil(t, ws.fingerprintedAssets, "no partial set")
+			}
+			assert.Equal(t, "public, max-age=86400", cacheControlOf(t, ws, "/assets/chunk-abc12345.js"))
+			assert.Equal(t, "no-cache", cacheControlOf(t, ws, "/assets/shoelace-B3-XBhED.js"))
+			assert.Equal(t, "no-cache", cacheControlOf(t, ws, "/assets/main.js"))
+		})
+	}
+}
+
+func TestFingerprintedRequestPath(t *testing.T) {
+	for p, want := range map[string]string{
+		"assets/shoelace-B3-XBhED.js":       "/assets/shoelace-B3-XBhED.js",
+		"assets/project-detail-CeCkJL--.js": "/assets/project-detail-CeCkJL--.js",
+		"assets/main.js":                    "", // no hash segment
+		"../assets/x-AbCdEfGh.js":           "",
+		"assets/../x-AbCdEfGh.js":           "",
+		"/assets/x-AbCdEfGh.js":             "",
+		"https://h/x-AbCdEfGh.js":           "",
+		`assets\x-AbCdEfGh.js`:              "",
+		"":                                  "",
+	} {
+		got, ok := fingerprintedRequestPath(p)
+		assert.Equal(t, want, got, p)
+		assert.Equal(t, want != "", ok, p)
+	}
+}
+
 func TestStaticAssetHandler_NoAssets(t *testing.T) {
 	ws := newTestWebServer(t, WebServerConfig{})
 	// Force the no-assets state regardless of whether web.AssetsEmbedded is true.
@@ -267,6 +373,7 @@ func TestStaticAssetHandler_NoAssets(t *testing.T) {
 	// if the embedded dist/client/ directory happens to lack the requested file.
 	ws.assets = nil
 	ws.assetsDisk = ""
+	ws.hasAssets = false
 
 	req := httptest.NewRequest("GET", "/assets/main.js", nil)
 	rec := httptest.NewRecorder()
@@ -283,8 +390,9 @@ func TestSPAHandler_NoAssets_ServesErrorPage(t *testing.T) {
 	ws := newDevAuthWebServer(t)
 	ws.assets = nil
 	ws.assetsDisk = ""
+	ws.hasAssets = false
 
-	handler := ws.Handler()
+	handler := devSignedIn(t, ws)
 
 	paths := []string{"/", "/projects", "/agents", "/settings"}
 	for _, path := range paths {
@@ -314,6 +422,7 @@ func TestSPAHandler_NoAssets_HealthzStillWorks(t *testing.T) {
 	ws := newTestWebServer(t, WebServerConfig{})
 	ws.assets = nil
 	ws.assetsDisk = ""
+	ws.hasAssets = false
 
 	req := httptest.NewRequest("GET", "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -332,6 +441,7 @@ func TestSPAHandler_NoAssets_APIStillWorks(t *testing.T) {
 	ws := newTestWebServer(t, WebServerConfig{})
 	ws.assets = nil
 	ws.assetsDisk = ""
+	ws.hasAssets = false
 
 	mockHub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -360,7 +470,7 @@ func TestSPAHandler_WithAssets_ServesNormalShell(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/", nil)
 	rec := httptest.NewRecorder()
-	ws.Handler().ServeHTTP(rec, req)
+	devSignedIn(t, ws).ServeHTTP(rec, req)
 
 	resp := rec.Result()
 	body, _ := io.ReadAll(resp.Body)
@@ -416,15 +526,160 @@ func TestRootLevelStaticFile_NonexistentFallsToSPA(t *testing.T) {
 	})
 
 	req := httptest.NewRequest("GET", "/nonexistent.png", nil)
-	req.Header.Set("Authorization", "Bearer test-dev-token-12345")
 	rec := httptest.NewRecorder()
 
-	ws.Handler().ServeHTTP(rec, req)
+	devSignedIn(t, ws).ServeHTTP(rec, req)
 
 	resp := rec.Result()
 	ct := resp.Header.Get("Content-Type")
 	if !strings.Contains(ct, "text/html") {
 		t.Errorf("non-existent root file should fall through to SPA shell (text/html), got Content-Type %q", ct)
+	}
+}
+
+// newRootStaticWebServer returns a web server whose assets dir holds every
+// rootStaticFiles entry plus robots.txt and index.html, two root-level
+// files that are not on the list.
+func newRootStaticWebServer(t *testing.T, devAuth bool) *WebServer {
+	t.Helper()
+	dir := t.TempDir()
+	for p := range rootStaticFiles {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, strings.TrimPrefix(p, "/")), []byte("data"), 0o644))
+	}
+	for _, name := range []string{"robots.txt", "index.html"} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("data"), 0o644))
+	}
+	if devAuth {
+		return newDevAuthWebServer(t, func(cfg *WebServerConfig) { cfg.AssetsDir = dir })
+	}
+	return newTestWebServer(t, WebServerConfig{AssetsDir: dir})
+}
+
+// rootPathsNeedingSession are root-level request targets (as sent on the
+// wire) that are not rootStaticFiles entries: a file on disk but not on the
+// list, dotted names with no file, and backslash forms.
+var rootPathsNeedingSession = []string{
+	"/robots.txt",
+	"/index.html",
+	"/anything.txt",
+	"/nonexistent.png",
+	"/%5Cevil.example",
+	"/%5C%5Cevil.example",
+	"/%5Cfavicon.ico",
+	"/favicon.ico%5C",
+}
+
+func TestRootLevelStaticFile_ListedFilesServedWithoutSession(t *testing.T) {
+	handler := newRootStaticWebServer(t, false).Handler()
+	for p := range rootStaticFiles {
+		for _, accept := range []string{"", "text/html"} {
+			req := httptest.NewRequest(http.MethodGet, p, nil)
+			req.Header.Set("Accept", accept)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			assert.Equal(t, http.StatusOK, rec.Code, "GET %s (Accept %q)", p, accept)
+			assert.Equal(t, "data", rec.Body.String(), "GET %s (Accept %q)", p, accept)
+		}
+	}
+}
+
+func TestRootLevelStaticFile_OtherRootPathsRequireSession(t *testing.T) {
+	handler := newRootStaticWebServer(t, false).Handler()
+	for _, target := range rootPathsNeedingSession {
+		t.Run(target, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, target, nil)
+			req.Header.Set("Accept", "text/html")
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			assert.Equal(t, http.StatusFound, rec.Code, "browser GET %s", target)
+			assert.NotEmpty(t, rec.Header().Get("Location"), "browser GET %s", target)
+			assert.NotContains(t, rec.Body.String(), "scion-app", "browser GET %s", target)
+
+			req = httptest.NewRequest(http.MethodGet, target, nil)
+			rec = httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			assert.Equal(t, http.StatusUnauthorized, rec.Code, "GET %s", target)
+			assert.NotEqual(t, "data", rec.Body.String(), "GET %s", target)
+		})
+	}
+}
+
+func TestRootLevelStaticFile_SignedInUnaffected(t *testing.T) {
+	ws := newRootStaticWebServer(t, true)
+	handler := devSignedIn(t, ws)
+	get := func(target string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.Header.Set("Accept", "text/html")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Listed files and unlisted files on disk are served as files.
+	for p := range rootStaticFiles {
+		rec := get(p)
+		assert.Equal(t, http.StatusOK, rec.Code, "GET %s", p)
+		assert.Equal(t, "data", rec.Body.String(), "GET %s", p)
+	}
+	rec := get("/robots.txt")
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "data", rec.Body.String())
+
+	// Other root-level paths get the app shell.
+	for _, target := range []string{"/anything.txt", "/nonexistent.png", "/%5Cevil.example"} {
+		rec := get(target)
+		assert.Equal(t, http.StatusOK, rec.Code, "GET %s", target)
+		assert.Contains(t, rec.Body.String(), "scion-app", "GET %s", target)
+	}
+}
+
+// TestRootLevelStaticFile_ListMatchesPublicDir checks that rootStaticFiles
+// equals the set of files in web/public/ and holds every appIconPaths entry.
+func TestRootLevelStaticFile_ListMatchesPublicDir(t *testing.T) {
+	entries, err := os.ReadDir("../../web/public")
+	require.NoError(t, err)
+	want := map[string]bool{}
+	for _, e := range entries {
+		// Dot names (such as .gitkeep) are never served (hasDotSegment).
+		if strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		require.False(t, e.IsDir(), "web/public/%s: rootStaticFiles lists root-level files only", e.Name())
+		want["/"+e.Name()] = true
+	}
+	assert.Equal(t, want, rootStaticFiles)
+	for p := range appIconPaths {
+		assert.True(t, rootStaticFiles[p], "%s in appIconPaths but not in rootStaticFiles", p)
+	}
+}
+
+func TestSPACatchAll_EmbeddedDirectoryDoesNotIntercept(t *testing.T) {
+	// Ensure that an embedded directory matching part of a client-side route
+	// does not cause tryServeStaticFile to intercept the request. The SPA
+	// handler must fall through to the SPA shell for directory-like paths.
+	ws := newDevAuthWebServer(t, func(cfg *WebServerConfig) {
+		// AssetsDir stays empty so ws.assets (in-memory FS) is used.
+	})
+	// Override the embedded asset FS with one that has a "chat" directory.
+	ws.assets = fstest.MapFS{
+		"assets/main.js":    &fstest.MapFile{Data: []byte("// stub")},
+		"chat/somefile.txt": &fstest.MapFile{Data: []byte("data")},
+	}
+	ws.hasAssets = ws.detectWebAssets()
+
+	// A request to /chat/my-project/thread-id should get the SPA shell,
+	// NOT a static file or 404 from the file server.
+	req := httptest.NewRequest("GET", "/chat/my-project/thread-id", nil)
+	rec := httptest.NewRecorder()
+	devSignedIn(t, ws).ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "scion-app") {
+		t.Errorf("expected SPA shell HTML, got: %s", string(body)[:min(200, len(body))])
 	}
 }
 
@@ -460,7 +715,6 @@ func TestSecurityHeaders(t *testing.T) {
 		cspChecks := []string{
 			"default-src 'self'",
 			"script-src 'self'",
-			"cdn.jsdelivr.net",
 			"fonts.googleapis.com",
 			"fonts.gstatic.com",
 		}
@@ -469,6 +723,39 @@ func TestSecurityHeaders(t *testing.T) {
 				t.Errorf("CSP missing %q", check)
 			}
 		}
+		// Nothing is loaded from jsDelivr or Web Awesome, so the CSP must not
+		// allow either.
+		for _, host := range []string{"cdn.jsdelivr.net", "cdn.webawesome.com"} {
+			if strings.Contains(csp, host) {
+				t.Errorf("CSP still allows %s: %q", host, csp)
+			}
+		}
+
+		// The host sources, per directive, are exactly these. Every source
+		// counts as a host except quoted keywords ('self', 'unsafe-inline'),
+		// bare schemes ending in a colon (data:, blob:, ws:, wss:, and the
+		// https: source in img-src that allows any HTTPS image) and the two
+		// local development origins below, matched exactly.
+		wantHosts := map[string][]string{
+			"style-src":   {"https://fonts.googleapis.com"},
+			"font-src":    {"https://fonts.gstatic.com"},
+			"connect-src": {"https://storage.googleapis.com"},
+		}
+		localDev := map[string]bool{"http://localhost:*": true, "http://127.0.0.1:*": true}
+		gotHosts := map[string][]string{}
+		for _, directive := range strings.Split(csp, ";") {
+			fields := strings.Fields(directive)
+			if len(fields) == 0 {
+				continue
+			}
+			for _, src := range fields[1:] {
+				if strings.HasPrefix(src, "'") || strings.HasSuffix(src, ":") || localDev[src] {
+					continue
+				}
+				gotHosts[fields[0]] = append(gotHosts[fields[0]], src)
+			}
+		}
+		assert.Equal(t, wantHosts, gotHosts, "host sources per directive")
 	}
 
 	// Verify Permissions-Policy is set
@@ -603,7 +890,7 @@ func TestWebHealthz_DegradedHub(t *testing.T) {
 			Version:      "0.1.0",
 			ScionVersion: "abc1234",
 			Uptime:       "1m0s",
-			Checks:       map[string]string{"database": "unhealthy"},
+			Checks:       map[string]string{"database": "healthy", "colocated_broker": "unhealthy: registration failed"},
 		}
 	})
 
@@ -620,11 +907,59 @@ func TestWebHealthz_DegradedHub(t *testing.T) {
 
 	// Top-level status should be degraded because hub is degraded
 	assert.Equal(t, "degraded", result["status"])
+	// gce-start-hub.sh and single-node-vm/deploy.sh read the top-level
+	// status by body prefix, so "status" must be the first field.
+	assert.True(t, strings.HasPrefix(string(body), `{"status":"degraded"`),
+		"composite /healthz must start with the top-level status; got %s", body)
 
 	// Hub sub-object should show degraded
 	hubObj, ok := result["hub"].(map[string]interface{})
 	require.True(t, ok)
 	assert.Equal(t, "degraded", hubObj["status"])
+}
+
+// TestWebHealthz_UnhealthyHub: the composite /healthz uses the same severity
+// semantics as GetHealthInfo, so an unhealthy hub (critical check failed)
+// makes the composite unhealthy rather than merely degraded.
+func TestWebHealthz_UnhealthyHub(t *testing.T) {
+	ws := newTestWebServer(t, WebServerConfig{})
+	ws.SetHubHealthProvider(func(ctx context.Context) interface{} {
+		return &HealthResponse{Status: "unhealthy", Checks: map[string]string{"database": "unhealthy"}}
+	})
+	// A degraded broker must not lower the composite back to degraded.
+	ws.SetBrokerHealthProvider(func(ctx context.Context) interface{} {
+		return &HealthResponse{Status: "degraded"}
+	})
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	rec := httptest.NewRecorder()
+	ws.Handler().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var result map[string]interface{}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &result))
+	assert.Equal(t, "unhealthy", result["status"])
+}
+
+// TestWebHealthz_DegradedBroker: a healthy hub with a degraded broker gives a
+// degraded composite.
+func TestWebHealthz_DegradedBroker(t *testing.T) {
+	ws := newTestWebServer(t, WebServerConfig{})
+	ws.SetHubHealthProvider(func(ctx context.Context) interface{} {
+		return &HealthResponse{Status: "healthy", Checks: map[string]string{"database": "healthy"}}
+	})
+	ws.SetBrokerHealthProvider(func(ctx context.Context) interface{} {
+		return &HealthResponse{Status: "degraded"}
+	})
+
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	rec := httptest.NewRecorder()
+	ws.Handler().ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var result map[string]interface{}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &result))
+	assert.Equal(t, "degraded", result["status"])
 }
 
 func TestIsHashedAsset(t *testing.T) {
@@ -756,7 +1091,7 @@ func TestMountHubAPI_RoutesToHub(t *testing.T) {
 	})
 	ws.MountHubAPI(mockHandler, func(ctx context.Context) error { return nil })
 
-	handler := ws.Handler()
+	handler := devSignedIn(t, ws)
 
 	// /api/v1/projects should reach the Hub handler
 	req := httptest.NewRequest("GET", "/api/v1/projects", nil)
@@ -797,9 +1132,9 @@ func TestSessionToBearerMiddleware(t *testing.T) {
 	})
 	ws.MountHubAPI(mockHandler, func(ctx context.Context) error { return nil })
 
-	handler := ws.Handler()
+	// Signed in through a dev sign-in link (a session with a JWT).
+	handler := devSignedIn(t, ws)
 
-	// First request: auto-login via dev-auth (establishes session with JWT)
 	req1 := httptest.NewRequest("GET", "/api/v1/projects", nil)
 	rec1 := httptest.NewRecorder()
 	handler.ServeHTTP(rec1, req1)
@@ -891,8 +1226,8 @@ func TestSessionToBearerMiddleware_TokenRegeneration(t *testing.T) {
 	assert.Equal(t, "overflow-user@enterprise.example.com", claims.Email)
 }
 
-func TestDevAuthMiddleware_GeneratesHubTokens(t *testing.T) {
-	// When userTokenSvc is available, dev-auth should generate Hub JWTs in the session.
+func TestDevSignIn_GeneratesHubTokens(t *testing.T) {
+	// When userTokenSvc is available, a dev sign-in should put Hub JWTs in the session.
 	tokenSvc, err := NewUserTokenService(UserTokenConfig{})
 	require.NoError(t, err)
 
@@ -900,12 +1235,7 @@ func TestDevAuthMiddleware_GeneratesHubTokens(t *testing.T) {
 	ws.SetUserTokenService(tokenSvc)
 
 	handler := ws.Handler()
-
-	// Trigger dev auto-login
-	req := httptest.NewRequest("GET", "/auth/me", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	assert.Equal(t, http.StatusOK, rec.Result().StatusCode)
+	cookies := devSignIn(t, ws)
 
 	// Verify the session cookie contains Hub tokens by making a second request
 	// to an /api/v1/ route and checking the Authorization header is injected.
@@ -917,14 +1247,14 @@ func TestDevAuthMiddleware_GeneratesHubTokens(t *testing.T) {
 	ws.MountHubAPI(mockHub, func(ctx context.Context) error { return nil })
 
 	req2 := httptest.NewRequest("GET", "/api/v1/test", nil)
-	for _, c := range rec.Result().Cookies() {
+	for _, c := range cookies {
 		req2.AddCookie(c)
 	}
 	rec2 := httptest.NewRecorder()
 	handler.ServeHTTP(rec2, req2)
 
 	assert.True(t, strings.HasPrefix(capturedAuth, "Bearer "),
-		"dev-auth should generate Hub JWT, got Authorization: %q", capturedAuth)
+		"a dev sign-in should generate Hub JWT, got Authorization: %q", capturedAuth)
 }
 
 func TestSessionToBearerMiddleware_SigningKeyRotation(t *testing.T) {
@@ -949,14 +1279,16 @@ func TestSessionToBearerMiddleware_SigningKeyRotation(t *testing.T) {
 	handler := ws.Handler()
 
 	// Step 1: Establish a session with tokens signed by the old key.
+	sessionCookies := devSignIn(t, ws)
 	req1 := httptest.NewRequest("GET", "/api/v1/projects", nil)
+	for _, c := range sessionCookies {
+		req1.AddCookie(c)
+	}
 	rec1 := httptest.NewRecorder()
 	handler.ServeHTTP(rec1, req1)
 	require.Equal(t, http.StatusOK, rec1.Result().StatusCode)
 	require.True(t, strings.HasPrefix(capturedAuthHeader, "Bearer "),
 		"initial request should have a valid Bearer token")
-
-	sessionCookies := rec1.Result().Cookies()
 
 	// Step 2: Rotate the signing key.
 	newSvc, err := NewUserTokenService(UserTokenConfig{
@@ -1206,6 +1538,38 @@ func TestIsProxyRoute(t *testing.T) {
 		{"/api/v1/agents/abc/ports/8080", false},
 		{"/api/v1/agents/abc/status", false},
 		{"/healthz", false},
+		// isProxyRoute also decides which credential-less requests get the
+		// port proxy's plain-text 401 (ptone/scion#5566), so the set it
+		// matches is pinned here.
+		// Other port routes of an agent.
+		{"/api/v1/agents/abc/ports", false},
+		{"/api/v1/agents/abc/ports/", false},
+		{"/api/v1/agents/abc/ports/tunnel", false},
+		{"/api/v1/agents/abc/ports/8080/", false},
+		{"/api/v1/agents/abc/ports/8080/proxyx", false},
+		{"/api/v1/agents/abc/ports/8080/xproxy", false},
+		{"/api/v1/agents/abc/ports/8080/Proxy", false},
+		{"/api/v1/agents/abc/ports/8080/proxy.html", false},
+		// The router sends this to the proxy route too, whose handler
+		// refuses the non-numeric port.
+		{"/api/v1/agents/abc/ports/tunnel/proxy", true},
+		// Agent routes that are not port routes.
+		{"/api/v1/agents/abc", false},
+		{"/api/v1/agents/abc/pty", false},
+		{"/api/v1/agents/abc/workspace/ports/8080/proxy", false},
+		{"/api/v1/agents/abc/proxy", false},
+		{"/api/v1/agents/abc/logs", false},
+		// Look-alike prefixes.
+		{"/api/v1/agentsx/abc/ports/8080/proxy", false},
+		{"/api/v1/agent/abc/ports/8080/proxy", false},
+		{"/api/v2/agents/abc/ports/8080/proxy", false},
+		{"/api/v1/agents/abc/portsx/8080/proxy", false},
+		{"/api/v1/agents/abc/Ports/8080/proxy", false},
+		{"/x/api/v1/agents/abc/ports/8080/proxy", false},
+		{"api/v1/agents/abc/ports/8080/proxy", false},
+		{"/api/v1/projects/p/agents/abc/ports/8080/proxy", false},
+		{"/api/v1/artifacts/view/abc/ports/8080/proxy", false},
+		{"", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
@@ -1214,37 +1578,16 @@ func TestIsProxyRoute(t *testing.T) {
 	}
 }
 
-func TestDevAuth_AutoLogin(t *testing.T) {
-	ws := newDevAuthWebServer(t)
-
-	// Request to a protected route should succeed with dev-auth
-	req := httptest.NewRequest("GET", "/", nil)
-	rec := httptest.NewRecorder()
-
-	ws.Handler().ServeHTTP(rec, req)
-
-	resp := rec.Result()
-	assert.Equal(t, http.StatusOK, resp.StatusCode,
-		"dev-auth should auto-login and serve the page")
-
-	// A session cookie should be set
-	cookies := resp.Cookies()
-	var sessionCookie *http.Cookie
-	for _, c := range cookies {
-		if c.Name == webSessionName {
-			sessionCookie = c
-			break
-		}
-	}
-	assert.NotNil(t, sessionCookie, "session cookie should be set")
-}
-
 func TestDevAuth_SessionPersists(t *testing.T) {
 	ws := newDevAuthWebServer(t)
 	handler := ws.Handler()
+	cookies := devSignIn(t, ws)
 
-	// First request: get the session cookie
+	// First request with the session cookie from the sign-in link
 	req1 := httptest.NewRequest("GET", "/auth/me", nil)
+	for _, c := range cookies {
+		req1.AddCookie(c)
+	}
 	rec1 := httptest.NewRecorder()
 	handler.ServeHTTP(rec1, req1)
 
@@ -1259,9 +1602,9 @@ func TestDevAuth_SessionPersists(t *testing.T) {
 	assert.Equal(t, "dev@localhost", user1.Email)
 	assert.Equal(t, "Development User", user1.Name)
 
-	// Second request with the session cookie should also work
+	// Second request with the same session cookie should also work
 	req2 := httptest.NewRequest("GET", "/auth/me", nil)
-	for _, c := range resp1.Cookies() {
+	for _, c := range cookies {
 		req2.AddCookie(c)
 	}
 	rec2 := httptest.NewRecorder()
@@ -1277,7 +1620,7 @@ func TestDevAuth_SessionPersists(t *testing.T) {
 }
 
 func TestDevAuth_Disabled(t *testing.T) {
-	// Without dev token, no auto-login should occur
+	// Without dev token, protected routes redirect to login
 	ws := newTestWebServer(t, WebServerConfig{})
 
 	req := httptest.NewRequest("GET", "/", nil)
@@ -1310,9 +1653,8 @@ func TestAuthMe_Unauthenticated(t *testing.T) {
 
 func TestAuthMe_Authenticated(t *testing.T) {
 	ws := newDevAuthWebServer(t)
-	handler := ws.Handler()
+	handler := devSignedIn(t, ws)
 
-	// First request auto-logs in
 	req := httptest.NewRequest("GET", "/auth/me", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -1332,16 +1674,12 @@ func TestLogout_ClearsSession(t *testing.T) {
 	ws := newDevAuthWebServer(t)
 	handler := ws.Handler()
 
-	// First: auto-login to get a session
-	req1 := httptest.NewRequest("GET", "/auth/me", nil)
-	rec1 := httptest.NewRecorder()
-	handler.ServeHTTP(rec1, req1)
-	resp1 := rec1.Result()
-	assert.Equal(t, http.StatusOK, resp1.StatusCode)
+	// First: sign in to get a session
+	cookies := devSignIn(t, ws)
 
 	// POST /auth/logout with session cookies
 	req2 := httptest.NewRequest("POST", "/auth/logout", nil)
-	for _, c := range resp1.Cookies() {
+	for _, c := range cookies {
 		req2.AddCookie(c)
 	}
 	rec2 := httptest.NewRecorder()
@@ -1511,10 +1849,10 @@ func TestOAuthCallback_NoOAuthService(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 }
 
-func TestAuthDebug_DebugMode(t *testing.T) {
+func TestAuthDebugRoute_ServedWithExplicitFlag(t *testing.T) {
 	ws := newTestWebServer(t, WebServerConfig{
-		Debug:   true,
-		BaseURL: "http://localhost:8080",
+		EnableDebugEndpoints: true,
+		BaseURL:              "http://localhost:8080",
 	})
 
 	req := httptest.NewRequest("GET", "/auth/debug", nil)
@@ -1538,18 +1876,56 @@ func TestAuthDebug_DebugMode(t *testing.T) {
 	assert.Equal(t, false, config["devAuthEnabled"])
 }
 
-func TestAuthDebug_NotAvailableInProduction(t *testing.T) {
-	ws := newTestWebServer(t, WebServerConfig{
-		Debug: false,
-	})
+// TestAuthDebugRoute_RequiresExplicitFlag checks that the diagnostic route is
+// not served by default, even when the default log level is debug.
+func TestAuthDebugRoute_RequiresExplicitFlag(t *testing.T) {
+	t.Cleanup(func() { loglevel.Reset(false) })
+	loglevel.Apply(loglevel.Spec{Default: slog.LevelDebug}, loglevel.SourceFlag)
+
+	ws := newTestWebServer(t, WebServerConfig{})
 
 	req := httptest.NewRequest("GET", "/auth/debug", nil)
 	rec := httptest.NewRecorder()
 
 	ws.Handler().ServeHTTP(rec, req)
 
-	resp := rec.Result()
-	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	assert.Equal(t, http.StatusNotFound, rec.Result().StatusCode)
+}
+
+// TestWebRequestLogging_FollowsComponentLevel checks that successful requests
+// are logged only when the web component is at debug level, while error
+// responses are always logged.
+func TestWebRequestLogging_FollowsComponentLevel(t *testing.T) {
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	notFound := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+
+	for _, tc := range []struct {
+		name    string
+		spec    loglevel.Spec
+		handler http.Handler
+		wantLog bool
+	}{
+		{"info default, success", loglevel.Spec{Default: slog.LevelInfo}, ok, false},
+		{"info default, error", loglevel.Spec{Default: slog.LevelInfo}, notFound, true},
+		{"web component debug, success", loglevel.Spec{Default: slog.LevelInfo, Components: map[string]slog.Level{webLogSubsystem: slog.LevelDebug}}, ok, true},
+		{"hub component debug, success", loglevel.Spec{Default: slog.LevelInfo, Components: map[string]slog.Level{"hub": slog.LevelDebug}}, ok, true},
+		{"debug default, web component info, success", loglevel.Spec{Default: slog.LevelDebug, Components: map[string]slog.Level{webLogSubsystem: slog.LevelInfo}}, ok, false},
+		{"debug default, success", loglevel.Spec{Default: slog.LevelDebug}, ok, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(func() { loglevel.Reset(false) })
+			loglevel.Apply(tc.spec, loglevel.SourceFlag)
+
+			var buf bytes.Buffer
+			ws := newTestWebServer(t, WebServerConfig{})
+			ws.log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+			rec := httptest.NewRecorder()
+			ws.loggingMiddleware(tc.handler).ServeHTTP(rec, httptest.NewRequest("GET", "/some/path", nil))
+
+			assert.Equal(t, tc.wantLog, strings.Contains(buf.String(), "Web request"), "log output: %q", buf.String())
+		})
+	}
 }
 
 func TestIsPublicRoute(t *testing.T) {
@@ -1567,8 +1943,27 @@ func TestIsPublicRoute(t *testing.T) {
 		{"/auth/debug", true},
 		{"/login", true},
 		{"/favicon.ico", true},
+		{"/favicon.svg", true},
+		{"/apple-touch-icon.png", true},
+		{"/icon-192.png", true},
+		{"/icon-512.png", true},
+		{"/icon-maskable-512.png", true},
+		{"/manifest.webmanifest", true},
 		{"/scion-notification-icon.png", true},
-		{"/robots.txt", true},
+		// Root-level paths not in rootStaticFiles take the session check,
+		// whether or not they look like a file name.
+		{"/robots.txt", false},
+		{"/anything.txt", false},
+		{"/index.html", false},
+		{"/favicon.ico/", false},
+		{"/FAVICON.ICO", false},
+		{"/favicon.ico.", false},
+		// A backslash never forms a static path.
+		{"/\\evil.example", false},
+		{"/\\\\evil.example", false},
+		{"/\\favicon.ico", false},
+		{"/favicon.ico\\", false},
+		{"/%5Cevil.example", false},
 		{"/api/v1/projects", true},
 		{"/api/v1/agents", true},
 		{"/api/v1/auth/login", true},
@@ -1825,31 +2220,6 @@ func TestSessionStore_CookieOverflowRetry(t *testing.T) {
 		"Hub access token should not be present after overflow retry")
 }
 
-// mockOAuthTransport intercepts HTTP requests to Google OAuth endpoints and
-// returns canned responses. This lets us drive handleOAuthCallback through
-// the full handler path without hitting real Google servers.
-type mockOAuthTransport struct {
-	tokenJSON    string // response body for the token endpoint
-	userinfoJSON string // response body for the userinfo endpoint
-}
-
-func (t *mockOAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	var body string
-	switch {
-	case strings.Contains(req.URL.String(), "oauth2.googleapis.com/token"):
-		body = t.tokenJSON
-	case strings.Contains(req.URL.String(), "googleapis.com/oauth2"):
-		body = t.userinfoJSON
-	default:
-		return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader("not found"))}, nil
-	}
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Body:       io.NopCloser(strings.NewReader(body)),
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-	}, nil
-}
-
 func TestHandleOAuthCallback_CookieOverflowRetry(t *testing.T) {
 	// Handler-level integration test: exercises the actual handleOAuthCallback
 	// code path (including the retry-without-tokens logic) with a CookieStore
@@ -2017,7 +2387,7 @@ func TestSSEHandler_RequiresSubParam(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/events", nil)
 	rec := httptest.NewRecorder()
-	ws.Handler().ServeHTTP(rec, req)
+	devSignedIn(t, ws).ServeHTTP(rec, req)
 
 	resp := rec.Result()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -2034,7 +2404,7 @@ func TestSSEHandler_InvalidSubject(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/events?sub=foo..bar", nil)
 	rec := httptest.NewRecorder()
-	ws.Handler().ServeHTTP(rec, req)
+	devSignedIn(t, ws).ServeHTTP(rec, req)
 
 	resp := rec.Result()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -2049,7 +2419,7 @@ func TestSSEHandler_NoPublisher(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/events?sub=project.test.>", nil)
 	rec := httptest.NewRecorder()
-	ws.Handler().ServeHTTP(rec, req)
+	devSignedIn(t, ws).ServeHTTP(rec, req)
 
 	resp := rec.Result()
 	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
@@ -2062,11 +2432,12 @@ func TestSSEHandler_Headers(t *testing.T) {
 	ws := newDevAuthWebServer(t)
 	pub := NewChannelEventPublisher()
 	ws.SetEventPublisher(pub)
-	ws.SetAuthzService(NewAuthzService(&mockAuthzStore{}, nil))
+	// CO1: dev-auth user needs super-admin role binding for project subjects.
+	ws.SetAuthzService(NewAuthzService(mockSuperAdminStore(DevUserID), nil))
 	t.Cleanup(pub.Close)
 
 	// Use a test server so we get a real connection that supports streaming
-	ts := httptest.NewServer(ws.Handler())
+	ts := httptest.NewServer(devSignedIn(t, ws))
 	defer ts.Close()
 
 	// Make a request that will establish the SSE connection
@@ -2084,10 +2455,11 @@ func TestSSEHandler_EventDelivery(t *testing.T) {
 	ws := newDevAuthWebServer(t)
 	pub := NewChannelEventPublisher()
 	ws.SetEventPublisher(pub)
-	ws.SetAuthzService(NewAuthzService(&mockAuthzStore{}, nil))
+	// CO1: dev-auth user needs super-admin role binding for project subjects.
+	ws.SetAuthzService(NewAuthzService(mockSuperAdminStore(DevUserID), nil))
 	t.Cleanup(pub.Close)
 
-	ts := httptest.NewServer(ws.Handler())
+	ts := httptest.NewServer(devSignedIn(t, ws))
 	defer ts.Close()
 
 	// Start SSE connection in background
@@ -2205,10 +2577,11 @@ func TestSSEHandler_ReconnectOnMaxAge(t *testing.T) {
 	})
 	pub := NewChannelEventPublisher()
 	ws.SetEventPublisher(pub)
-	ws.SetAuthzService(NewAuthzService(&mockAuthzStore{}, nil))
+	// CO1: dev-auth user needs super-admin role binding for project subjects.
+	ws.SetAuthzService(NewAuthzService(mockSuperAdminStore(DevUserID), nil))
 	t.Cleanup(pub.Close)
 
-	ts := httptest.NewServer(ws.Handler())
+	ts := httptest.NewServer(devSignedIn(t, ws))
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/events?sub=project.test.>")
@@ -2250,6 +2623,56 @@ func TestSSEHandler_ReconnectOnMaxAge(t *testing.T) {
 	}
 }
 
+func TestSSEHandler_HeartbeatIsNamedEvent(t *testing.T) {
+	// A short heartbeat interval through the config seam; the connection
+	// age stays long so only heartbeats arrive.
+	ws := newDevAuthWebServer(t, func(cfg *WebServerConfig) {
+		cfg.SSEHeartbeatInterval = 50 * time.Millisecond
+		cfg.SSEMaxConnectionAge = time.Minute
+	})
+	pub := NewChannelEventPublisher()
+	ws.SetEventPublisher(pub)
+	ws.SetAuthzService(NewAuthzService(mockSuperAdminStore(DevUserID), nil))
+	t.Cleanup(pub.Close)
+
+	ts := httptest.NewServer(devSignedIn(t, ws))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/events?sub=project.test.>", nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Read one SSE frame (lines up to a blank line). The stream carries
+	// nothing but heartbeats here, so the first frame is a heartbeat.
+	scanner := bufio.NewScanner(resp.Body)
+	var frame []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if len(frame) > 0 {
+				break
+			}
+			continue
+		}
+		frame = append(frame, line)
+	}
+	require.NoError(t, scanner.Err())
+
+	// Exactly a named event with a millisecond timestamp: no id line (so
+	// Last-Event-ID is unaffected) and not an SSE comment.
+	require.Len(t, frame, 2, "heartbeat frame: %q", frame)
+	assert.Equal(t, "event: heartbeat", frame[0])
+	require.True(t, strings.HasPrefix(frame[1], "data: "), "heartbeat frame: %q", frame)
+	ms, err := strconv.ParseInt(strings.TrimPrefix(frame[1], "data: "), 10, 64)
+	require.NoError(t, err, "heartbeat data must be a millisecond timestamp")
+	assert.InDelta(t, time.Now().UnixMilli(), ms, float64(time.Minute.Milliseconds()))
+}
+
 func TestLoginPageRendersLoginComponent(t *testing.T) {
 	// /login is a public route so no dev-auth needed
 	ws := newTestWebServer(t, WebServerConfig{})
@@ -2273,7 +2696,7 @@ func TestNonLoginPageRendersAppComponent(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/", nil)
 	rec := httptest.NewRecorder()
-	ws.Handler().ServeHTTP(rec, req)
+	devSignedIn(t, ws).ServeHTTP(rec, req)
 
 	resp := rec.Result()
 	body, err := io.ReadAll(resp.Body)
@@ -2465,11 +2888,14 @@ func TestResolveAPIPath(t *testing.T) {
 		urlPath  string
 		expected string
 	}{
-		{"/agents", "/api/v1/agents"},
-		{"/agents/", "/api/v1/agents"},
-		{"/projects", "/api/v1/projects"},
-		{"/projects/", "/api/v1/projects"},
+		{"/agents", ""}, // list pages load their own lists
+		{"/agents/", ""},
+		{"/projects", ""},
+		{"/projects/", ""},
 		{"/agents/abc123", "/api/v1/agents/abc123"},
+		{"/skills", "/api/v1/skills"},
+		{"/skills/", "/api/v1/skills"},
+		{"/skills/s1", "/api/v1/skills/s1"},
 		{"/projects/my-project", "/api/v1/projects/my-project"},
 		{"/", ""},
 		{"/login", ""},
@@ -2490,37 +2916,30 @@ func TestResolveAPIPath(t *testing.T) {
 func TestSPAShellHandler_ContainsInitialData(t *testing.T) {
 	ws := newDevAuthWebServer(t)
 
-	// Set up user token service so dev-auth generates Hub JWTs
+	// Set up user token service so a dev sign-in puts Hub JWTs in the session
 	tokenSvc, err := NewUserTokenService(UserTokenConfig{})
 	require.NoError(t, err)
 	ws.SetUserTokenService(tokenSvc)
 
-	// Mount a mock Hub handler that returns agent data with _capabilities
+	// Mount a mock Hub handler that returns one agent with _capabilities
 	mockHub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"agents": []map[string]interface{}{
-				{
-					"id":     tid("agent-1"),
-					"name":   "test-agent",
-					"status": "running",
-					"_capabilities": map[string]interface{}{
-						"actions": []string{"start", "stop", "delete"},
-					},
-				},
-			},
+			"id":     tid("agent-1"),
+			"name":   "test-agent",
+			"status": "running",
 			"_capabilities": map[string]interface{}{
-				"actions": []string{"create", "list"},
+				"actions": []string{"start", "stop", "delete"},
 			},
 		})
 	})
 	ws.MountHubAPI(mockHub, func(ctx context.Context) error { return nil })
 
-	handler := ws.Handler()
+	handler := devSignedIn(t, ws)
 
-	// Request the agents page
-	req := httptest.NewRequest("GET", "/agents", nil)
+	// Request an agent detail page (its page consumes the prefetch)
+	req := httptest.NewRequest("GET", "/agents/"+tid("agent-1"), nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -2546,14 +2965,67 @@ func TestSPAShellHandler_ContainsInitialData(t *testing.T) {
 	var pageData map[string]interface{}
 	require.NoError(t, json.Unmarshal([]byte(jsonData), &pageData), "initial data should be valid JSON")
 
-	assert.Equal(t, "/agents", pageData["path"])
+	assert.Equal(t, "/agents/"+tid("agent-1"), pageData["path"])
 	assert.NotNil(t, pageData["data"], "data field should be present")
 	assert.NotNil(t, pageData["user"], "user field should be present")
 }
 
+// The /agents and /projects list pages load their own lists, so their shells
+// carry no prefetched data and the hub API is not called for page data while
+// rendering them. The signed-in shell's experiment map (GET
+// /api/v1/experiments, ptone/scion#2489) is the one call it does make; that
+// embed is covered by web_shell_experiments_test.go.
+func TestSPAShellHandler_ListPagesHaveNoPrefetch(t *testing.T) {
+	ws := newDevAuthWebServer(t)
+
+	tokenSvc, err := NewUserTokenService(UserTokenConfig{})
+	require.NoError(t, err)
+	ws.SetUserTokenService(tokenSvc)
+
+	var hubCalls []string
+	mockHub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/experiments" {
+			hubCalls = append(hubCalls, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"agents": []interface{}{}, "projects": []interface{}{}})
+	})
+	ws.MountHubAPI(mockHub, func(ctx context.Context) error { return nil })
+	handler := devSignedIn(t, ws)
+
+	for _, path := range []string{"/agents", "/agents/", "/projects", "/projects/"} {
+		t.Run(path, func(t *testing.T) {
+			hubCalls = nil
+			req := httptest.NewRequest("GET", path, nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			resp := rec.Result()
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			html := string(body)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+
+			const dataMarker = `type="application/json">`
+			markerAt := strings.Index(html, dataMarker)
+			require.GreaterOrEqual(t, markerAt, 0, "should find the __SCION_DATA__ script tag")
+			dataStart := markerAt + len(dataMarker)
+			dataEnd := strings.Index(html[dataStart:], `</script>`)
+			require.Greater(t, dataEnd, 0, "should find the end of the __SCION_DATA__ script tag")
+			var pageData map[string]interface{}
+			require.NoError(t, json.Unmarshal([]byte(html[dataStart:dataStart+dataEnd]), &pageData))
+
+			assert.NotNil(t, pageData["user"], "user field should still be present")
+			assert.Nil(t, pageData["data"], "list page shell must carry no prefetched data")
+			assert.Empty(t, hubCalls, "rendering the shell must not call the hub API for page data")
+		})
+	}
+}
+
 func TestSPAShellHandler_UserInInitialData(t *testing.T) {
 	ws := newDevAuthWebServer(t)
-	handler := ws.Handler()
+	handler := devSignedIn(t, ws)
 
 	// Request the home page (no API prefetch for /)
 	req := httptest.NewRequest("GET", "/", nil)
@@ -2591,10 +3063,10 @@ func TestSPAShellHandler_UserInInitialData(t *testing.T) {
 func TestSPAShellHandler_NoHubMounted(t *testing.T) {
 	ws := newDevAuthWebServer(t)
 	// Do NOT mount a Hub handler
-	handler := ws.Handler()
+	handler := devSignedIn(t, ws)
 
-	// Request the agents page — should still render with user info
-	req := httptest.NewRequest("GET", "/agents", nil)
+	// Request an agent detail page (a prefetched route) — should still render with user info
+	req := httptest.NewRequest("GET", "/agents/"+tid("agent-1"), nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -2624,7 +3096,7 @@ func TestSPAShellHandler_NoHubMounted(t *testing.T) {
 func TestSPAShellHandler_HubAPIError(t *testing.T) {
 	ws := newDevAuthWebServer(t)
 
-	// Set up user token service so dev-auth generates Hub JWTs
+	// Set up user token service so a dev sign-in puts Hub JWTs in the session
 	tokenSvc, err := NewUserTokenService(UserTokenConfig{})
 	require.NoError(t, err)
 	ws.SetUserTokenService(tokenSvc)
@@ -2636,10 +3108,10 @@ func TestSPAShellHandler_HubAPIError(t *testing.T) {
 	})
 	ws.MountHubAPI(mockHub, func(ctx context.Context) error { return nil })
 
-	handler := ws.Handler()
+	handler := devSignedIn(t, ws)
 
-	// Request agents page
-	req := httptest.NewRequest("GET", "/agents", nil)
+	// Request an agent detail page (a prefetched route)
+	req := httptest.NewRequest("GET", "/agents/"+tid("agent-1"), nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -2841,10 +3313,10 @@ func TestProxyAuthMiddleware_ExistingSession_SkipsVerification(t *testing.T) {
 	_ = callCount
 }
 
-func TestProxyAuthMiddleware_KeepsAdminWhenNotInList(t *testing.T) {
-	// AdminEmails is additive-only: an existing admin user whose email is not
-	// in AdminEmails (e.g. promoted through the admin UI) keeps the admin role
-	// on the next proxy-authenticated request.
+func TestProxyAuthMiddleware_DemotesAdminWhenNotInList(t *testing.T) {
+	// D11: AdminEmails is now the sole authority for the admin role. An existing
+	// admin user whose email is NOT in AdminEmails is demoted to "member" on
+	// the next proxy-authenticated request.
 	mockAuth := &mockProxyAuthenticator{
 		user: &ProxyUserInfo{
 			Subject: "99",
@@ -2867,10 +3339,16 @@ func TestProxyAuthMiddleware_KeepsAdminWhenNotInList(t *testing.T) {
 	ws := newTestWebServer(t, WebServerConfig{
 		AuthMode:           "proxy",
 		ProxyAuthenticator: mockAuth,
-		// AdminEmails does NOT include ui-admin@example.com
-		AdminEmails: []string{"other-admin@example.com"},
+	})
+	// AdminEmails does NOT include ui-admin@example.com
+	ws.SetAccessSettingsProvider(&staticAccessSettings{
+		adminEmails: []string{"other-admin@example.com"},
 	})
 	ws.SetStore(st)
+	// Simulate reconciler confirming demotion is safe.
+	var safe atomic.Bool
+	safe.Store(true)
+	ws.SetDemotionSafe(&safe)
 
 	req := httptest.NewRequest("GET", "/projects", nil)
 	req.Header.Set("Accept", "text/html")
@@ -2878,11 +3356,11 @@ func TestProxyAuthMiddleware_KeepsAdminWhenNotInList(t *testing.T) {
 
 	ws.Handler().ServeHTTP(rec, req)
 
-	// Verify user kept the admin role
+	// D11: verify user was demoted because email is not in AdminEmails.
 	updated, err := st.GetUserByEmail(context.Background(), "ui-admin@example.com")
 	assert.NoError(t, err)
-	assert.Equal(t, "admin", updated.Role,
-		"admin_emails must not demote an admin granted through the UI")
+	assert.Equal(t, "member", updated.Role,
+		"D11: admin not in admin_emails must be demoted to member")
 }
 
 func TestProxyAuthMiddleware_PromotesToAdminWhenAddedToList(t *testing.T) {
@@ -2910,7 +3388,9 @@ func TestProxyAuthMiddleware_PromotesToAdminWhenAddedToList(t *testing.T) {
 	ws := newTestWebServer(t, WebServerConfig{
 		AuthMode:           "proxy",
 		ProxyAuthenticator: mockAuth,
-		AdminEmails:        []string{"new-admin@example.com"},
+	})
+	ws.SetAccessSettingsProvider(&staticAccessSettings{
+		adminEmails: []string{"new-admin@example.com"},
 	})
 	ws.SetStore(st)
 
@@ -2940,12 +3420,13 @@ func TestProxyAuthMiddleware_ExistingSession_ReEvaluatesRoleOnPromotion(t *testi
 	}
 
 	st := newProxyAuthStore()
+	// Initially NOT an admin
+	accessCfg := &staticAccessSettings{adminEmails: []string{}}
 	ws := newTestWebServer(t, WebServerConfig{
 		AuthMode:           "proxy",
 		ProxyAuthenticator: mockAuth,
-		// Initially NOT an admin
-		AdminEmails: []string{},
 	})
+	ws.SetAccessSettingsProvider(accessCfg)
 	ws.SetStore(st)
 
 	handler := ws.Handler()
@@ -2966,7 +3447,7 @@ func TestProxyAuthMiddleware_ExistingSession_ReEvaluatesRoleOnPromotion(t *testi
 	assert.Equal(t, "member", created.Role)
 
 	// Now add user to admin list (simulates config change)
-	ws.config.AdminEmails = []string{"user@example.com"}
+	accessCfg.adminEmails = []string{"user@example.com"}
 
 	// Second request: re-uses the session cookie
 	req2 := httptest.NewRequest("GET", "/projects", nil)
@@ -3008,12 +3489,13 @@ func TestProxyAuthMiddleware_ExistingSession_ReEvaluatesRoleOnUIDemotion(t *test
 	}
 
 	st := newProxyAuthStore()
+	// Initially IS an admin
+	accessCfg := &staticAccessSettings{adminEmails: []string{"admin@example.com"}}
 	ws := newTestWebServer(t, WebServerConfig{
 		AuthMode:           "proxy",
 		ProxyAuthenticator: mockAuth,
-		// Initially IS an admin
-		AdminEmails: []string{"admin@example.com"},
 	})
+	ws.SetAccessSettingsProvider(accessCfg)
 	ws.SetStore(st)
 
 	handler := ws.Handler()
@@ -3034,7 +3516,7 @@ func TestProxyAuthMiddleware_ExistingSession_ReEvaluatesRoleOnUIDemotion(t *test
 	assert.Equal(t, "admin", created.Role)
 
 	// Remove from the config list AND demote through the UI (explicit action).
-	ws.config.AdminEmails = []string{}
+	accessCfg.adminEmails = []string{}
 	created.Role = "member"
 	require.NoError(t, st.UpdateUser(context.Background(), created))
 
@@ -3076,11 +3558,12 @@ func TestProxyAuthMiddleware_ExistingSession_KeepsRoleWhenRemovedFromList(t *tes
 	}
 
 	st := newProxyAuthStore()
+	accessCfg := &staticAccessSettings{adminEmails: []string{"admin@example.com"}}
 	ws := newTestWebServer(t, WebServerConfig{
 		AuthMode:           "proxy",
 		ProxyAuthenticator: mockAuth,
-		AdminEmails:        []string{"admin@example.com"},
 	})
+	ws.SetAccessSettingsProvider(accessCfg)
 	ws.SetStore(st)
 
 	handler := ws.Handler()
@@ -3099,7 +3582,7 @@ func TestProxyAuthMiddleware_ExistingSession_KeepsRoleWhenRemovedFromList(t *tes
 	require.Equal(t, "admin", created.Role)
 
 	// Config change only — no UI demotion.
-	ws.config.AdminEmails = []string{}
+	accessCfg.adminEmails = []string{}
 
 	req2 := httptest.NewRequest("GET", "/projects", nil)
 	req2.Header.Set("Accept", "text/html")
@@ -3135,8 +3618,8 @@ func TestProxyAuthMiddleware_ExistingSession_PicksUpUIPromotion(t *testing.T) {
 	ws := newTestWebServer(t, WebServerConfig{
 		AuthMode:           "proxy",
 		ProxyAuthenticator: mockAuth,
-		AdminEmails:        []string{},
 	})
+	ws.SetAccessSettingsProvider(&staticAccessSettings{adminEmails: []string{}})
 	ws.SetStore(st)
 
 	handler := ws.Handler()
@@ -3193,8 +3676,8 @@ func TestProxyAuthMiddleware_ExistingSession_SuspendedUserRejected(t *testing.T)
 	ws := newTestWebServer(t, WebServerConfig{
 		AuthMode:           "proxy",
 		ProxyAuthenticator: mockAuth,
-		AdminEmails:        []string{},
 	})
+	ws.SetAccessSettingsProvider(&staticAccessSettings{adminEmails: []string{}})
 	ws.SetStore(st)
 
 	handler := ws.Handler()
@@ -3246,8 +3729,8 @@ func TestProxyAuthMiddleware_ExistingSession_DeletedUserRejected(t *testing.T) {
 	ws := newTestWebServer(t, WebServerConfig{
 		AuthMode:           "proxy",
 		ProxyAuthenticator: mockAuth,
-		AdminEmails:        []string{}, // not an admin by config
 	})
+	ws.SetAccessSettingsProvider(&staticAccessSettings{adminEmails: []string{}}) // not an admin by config
 	ws.SetStore(st)
 
 	handler := ws.Handler()
@@ -3285,6 +3768,8 @@ func TestProxyAuthMiddleware_ExistingSession_DeletedUserRejected(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrNotFound)
 
 	// Replaying the still-valid admin session cookie must now be rejected.
+	// The server clears the stale session and redirects to login rather
+	// than returning a raw 403, so the user can re-authenticate.
 	req3 := httptest.NewRequest("GET", "/projects", nil)
 	req3.Header.Set("Accept", "text/html")
 	for _, c := range adminCookies {
@@ -3293,7 +3778,8 @@ func TestProxyAuthMiddleware_ExistingSession_DeletedUserRejected(t *testing.T) {
 	rec3 := httptest.NewRecorder()
 	handler.ServeHTTP(rec3, req3)
 
-	assert.Equal(t, http.StatusForbidden, rec3.Code, "deleted user should be rejected with 403")
+	assert.Equal(t, http.StatusFound, rec3.Code, "deleted user should be redirected to login")
+	assert.Equal(t, "/login", rec3.Header().Get("Location"))
 }
 
 func TestProxyAuthMiddleware_ExistingSession_NoUpdateWhenRoleUnchanged(t *testing.T) {
@@ -3311,8 +3797,8 @@ func TestProxyAuthMiddleware_ExistingSession_NoUpdateWhenRoleUnchanged(t *testin
 	ws := newTestWebServer(t, WebServerConfig{
 		AuthMode:           "proxy",
 		ProxyAuthenticator: mockAuth,
-		AdminEmails:        []string{},
 	})
+	ws.SetAccessSettingsProvider(&staticAccessSettings{adminEmails: []string{}})
 	ws.SetStore(st)
 
 	handler := ws.Handler()
@@ -3346,4 +3832,833 @@ func TestProxyAuthMiddleware_ExistingSession_NoUpdateWhenRoleUnchanged(t *testin
 		}
 	}
 	assert.False(t, sessionReSet, "session cookie should NOT be re-set when role is unchanged")
+}
+
+// ---------------------------------------------------------------------------
+// Super-admin RoleBinding management in WebServer login paths
+// ---------------------------------------------------------------------------
+
+func TestProxyAuthMiddleware_NewAdminUser_GetsSuperAdminBinding(t *testing.T) {
+	// When a new user is provisioned as admin via proxy auth, a system-scoped
+	// super-admin RoleBinding must be created (cold-start fix).
+	mockAuth := &mockProxyAuthenticator{
+		user: &ProxyUserInfo{
+			Subject:     "sa-1",
+			Email:       "admin@example.com",
+			DisplayName: "Admin User",
+			Domain:      "example.com",
+		},
+	}
+
+	st := newProxyAuthStoreWithRoles()
+
+	ws := newTestWebServer(t, WebServerConfig{
+		AuthMode:           "proxy",
+		ProxyAuthenticator: mockAuth,
+	})
+	ws.SetAccessSettingsProvider(&staticAccessSettings{
+		adminEmails: []string{"admin@example.com"},
+	})
+	ws.SetStore(st)
+
+	req := httptest.NewRequest("GET", "/projects", nil)
+	req.Header.Set("Accept", "text/html")
+	rec := httptest.NewRecorder()
+
+	ws.Handler().ServeHTTP(rec, req)
+
+	// Verify user was created as admin
+	user, err := st.GetUserByEmail(context.Background(), "admin@example.com")
+	require.NoError(t, err)
+	assert.Equal(t, "admin", user.Role)
+
+	// Verify super-admin binding was created
+	assert.True(t, st.hasSuperAdminBinding(user.ID),
+		"new admin user provisioned via proxy auth must get a super-admin RoleBinding")
+}
+
+func TestProxyAuthMiddleware_NewMemberUser_NoSuperAdminBinding(t *testing.T) {
+	// A non-admin user provisioned via proxy auth must NOT get a super-admin binding.
+	mockAuth := &mockProxyAuthenticator{
+		user: &ProxyUserInfo{
+			Subject: "sa-2",
+			Email:   "member@example.com",
+			Domain:  "example.com",
+		},
+	}
+
+	st := newProxyAuthStoreWithRoles()
+
+	ws := newTestWebServer(t, WebServerConfig{
+		AuthMode:           "proxy",
+		ProxyAuthenticator: mockAuth,
+	})
+	ws.SetAccessSettingsProvider(&staticAccessSettings{
+		adminEmails: []string{"other-admin@example.com"},
+	})
+	ws.SetStore(st)
+
+	req := httptest.NewRequest("GET", "/projects", nil)
+	req.Header.Set("Accept", "text/html")
+	rec := httptest.NewRecorder()
+
+	ws.Handler().ServeHTTP(rec, req)
+
+	user, err := st.GetUserByEmail(context.Background(), "member@example.com")
+	require.NoError(t, err)
+	assert.NotEqual(t, "admin", user.Role)
+	assert.False(t, st.hasSuperAdminBinding(user.ID),
+		"non-admin user must NOT get a super-admin RoleBinding")
+}
+
+func TestProxyAuthMiddleware_Promotion_CreatesSuperAdminBinding(t *testing.T) {
+	// An existing member promoted to admin on proxy login must get a super-admin binding.
+	mockAuth := &mockProxyAuthenticator{
+		user: &ProxyUserInfo{
+			Subject: "sa-3",
+			Email:   "promoted@example.com",
+			Domain:  "example.com",
+		},
+	}
+
+	st := newProxyAuthStoreWithRoles()
+	_ = st.CreateUser(context.Background(), &store.User{
+		ID:      "u-promote",
+		Email:   "promoted@example.com",
+		Role:    "member",
+		Status:  "active",
+		Created: time.Now(),
+	})
+
+	ws := newTestWebServer(t, WebServerConfig{
+		AuthMode:           "proxy",
+		ProxyAuthenticator: mockAuth,
+	})
+	ws.SetAccessSettingsProvider(&staticAccessSettings{
+		adminEmails: []string{"promoted@example.com"},
+	})
+	ws.SetStore(st)
+
+	req := httptest.NewRequest("GET", "/projects", nil)
+	req.Header.Set("Accept", "text/html")
+	rec := httptest.NewRecorder()
+
+	ws.Handler().ServeHTTP(rec, req)
+
+	user, err := st.GetUserByEmail(context.Background(), "promoted@example.com")
+	require.NoError(t, err)
+	assert.Equal(t, "admin", user.Role)
+	assert.True(t, st.hasSuperAdminBinding(user.ID),
+		"member promoted to admin via proxy auth must get a super-admin RoleBinding")
+}
+
+func TestProxyAuthMiddleware_Demotion_DeletesSuperAdminBinding(t *testing.T) {
+	// An existing admin demoted on proxy login must have the super-admin binding removed.
+	mockAuth := &mockProxyAuthenticator{
+		user: &ProxyUserInfo{
+			Subject: "sa-4",
+			Email:   "demoted@example.com",
+			Domain:  "example.com",
+		},
+	}
+
+	st := newProxyAuthStoreWithRoles()
+	_ = st.CreateUser(context.Background(), &store.User{
+		ID:      "u-demote",
+		Email:   "demoted@example.com",
+		Role:    "admin",
+		Status:  "active",
+		Created: time.Now(),
+	})
+	// Pre-create the super-admin binding
+	_, _ = st.CreateRoleBinding(context.Background(), &store.RoleBinding{
+		RoleDefinitionID: "rd-super-admin",
+		PrincipalType:    store.RoleBindingPrincipalUser,
+		PrincipalID:      "u-demote",
+		ScopeType:        store.RoleScopeSystem,
+		ScopeID:          "",
+		CreatedBy:        store.SystemReconcileCreatedBy,
+	})
+	require.True(t, st.hasSuperAdminBinding("u-demote"), "precondition: binding must exist")
+
+	ws := newTestWebServer(t, WebServerConfig{
+		AuthMode:           "proxy",
+		ProxyAuthenticator: mockAuth,
+	})
+	// AdminEmails does NOT include demoted@example.com
+	ws.SetAccessSettingsProvider(&staticAccessSettings{
+		adminEmails: []string{"other@example.com"},
+	})
+	ws.SetStore(st)
+	var safe atomic.Bool
+	safe.Store(true)
+	ws.SetDemotionSafe(&safe)
+
+	req := httptest.NewRequest("GET", "/projects", nil)
+	req.Header.Set("Accept", "text/html")
+	rec := httptest.NewRecorder()
+
+	ws.Handler().ServeHTTP(rec, req)
+
+	user, err := st.GetUserByEmail(context.Background(), "demoted@example.com")
+	require.NoError(t, err)
+	assert.Equal(t, "member", user.Role)
+	assert.False(t, st.hasSuperAdminBinding("u-demote"),
+		"admin demoted via proxy auth must have super-admin RoleBinding removed")
+}
+
+// TestOAuthCallback_PlatformAuthSA_Denied is a consistency check: a service
+// account cannot complete interactive Google OAuth in practice, but the
+// callback carries the same isReservedPlatformIdentity guard as every other
+// find-or-create path (see that predicate's invariant comment), so this
+// covers it in case that ever changes.
+func TestOAuthCallback_PlatformAuthSA_Denied(t *testing.T) {
+	const secret = "test-session-secret-for-platform-auth-sa-oauth-1234"
+	const sa = "transport-sa@example.iam.gserviceaccount.com"
+
+	ws := newTestWebServer(t, WebServerConfig{
+		SessionSecret:  secret,
+		BaseURL:        "http://localhost:8080",
+		PlatformAuthSA: sa,
+	})
+
+	ws.oauthService = NewOAuthService(OAuthConfig{
+		Web: OAuthClientConfig{
+			Google: OAuthProviderConfig{
+				ClientID:     "test-client-id",
+				ClientSecret: "test-client-secret",
+			},
+		},
+	}, nil)
+	ws.oauthService.httpClient = &http.Client{
+		Transport: &mockOAuthTransport{
+			tokenJSON:    `{"access_token":"mock-token","token_type":"Bearer","expires_in":3600}`,
+			userinfoJSON: `{"id":"sa-subject","email":"` + sa + `","verified_email":true,"name":"Transport SA"}`,
+		},
+	}
+
+	st := newProxyAuthStore()
+	ws.store = st
+	ws.SetAccessSettingsProvider(&staticAccessSettings{adminEmails: []string{}})
+
+	reqSetup := httptest.NewRequest(http.MethodGet, "/auth/login/google", nil)
+	recSetup := httptest.NewRecorder()
+	sess, err := ws.sessionStore.Get(reqSetup, webSessionName)
+	require.NoError(t, err)
+	oauthState := "test-state-platform-auth-sa"
+	sess.Values[sessKeyOAuthState] = oauthState
+	require.NoError(t, sess.Save(reqSetup, recSetup))
+	cookies := recSetup.Result().Cookies()
+	require.NotEmpty(t, cookies)
+
+	callbackURL := "/auth/callback/google?code=test-code&state=" + oauthState
+	reqCallback := httptest.NewRequest(http.MethodGet, callbackURL, nil)
+	for _, c := range cookies {
+		reqCallback.AddCookie(c)
+	}
+	recCallback := httptest.NewRecorder()
+
+	ws.Handler().ServeHTTP(recCallback, reqCallback)
+
+	resp := recCallback.Result()
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+	assert.Contains(t, resp.Header.Get("Location"), "/login?error=",
+		"OAuth callback must redirect to login with an error for the configured service account")
+
+	_, lookupErr := st.GetUserByEmail(context.Background(), sa)
+	assert.ErrorIs(t, lookupErr, store.ErrNotFound,
+		"no user row should be created for the configured service account")
+}
+
+func TestOAuthCallback_NewAdminUser_GetsSuperAdminBinding(t *testing.T) {
+	// When a new user is provisioned as admin via OAuth callback, a
+	// super-admin RoleBinding must be created.
+	const secret = "test-session-secret-for-binding-test-1234567890"
+	adminEmail := "oauth-admin@example.com"
+
+	ws := newTestWebServer(t, WebServerConfig{
+		SessionSecret: secret,
+		BaseURL:       "http://localhost:8080",
+	})
+
+	ws.oauthService = NewOAuthService(OAuthConfig{
+		Web: OAuthClientConfig{
+			Google: OAuthProviderConfig{
+				ClientID:     "test-client-id",
+				ClientSecret: "test-client-secret",
+			},
+		},
+	}, nil)
+	ws.oauthService.httpClient = &http.Client{
+		Transport: &mockOAuthTransport{
+			tokenJSON:    `{"access_token":"mock-token","token_type":"Bearer","expires_in":3600}`,
+			userinfoJSON: `{"id":"new-admin-id","email":"` + adminEmail + `","verified_email":true,"name":"OAuth Admin"}`,
+		},
+	}
+
+	st := newProxyAuthStoreWithRoles()
+	ws.store = st
+	ws.SetAccessSettingsProvider(&staticAccessSettings{
+		adminEmails: []string{adminEmail},
+	})
+
+	// Pre-seed session with valid OAuth state
+	reqSetup := httptest.NewRequest(http.MethodGet, "/auth/login/google", nil)
+	recSetup := httptest.NewRecorder()
+	sess, err := ws.sessionStore.Get(reqSetup, webSessionName)
+	require.NoError(t, err)
+	oauthState := "test-state-binding"
+	sess.Values[sessKeyOAuthState] = oauthState
+	require.NoError(t, sess.Save(reqSetup, recSetup))
+	cookies := recSetup.Result().Cookies()
+	require.NotEmpty(t, cookies)
+
+	// Make the OAuth callback request
+	callbackURL := "/auth/callback/google?code=test-code&state=" + oauthState
+	reqCallback := httptest.NewRequest(http.MethodGet, callbackURL, nil)
+	for _, c := range cookies {
+		reqCallback.AddCookie(c)
+	}
+	recCallback := httptest.NewRecorder()
+
+	ws.Handler().ServeHTTP(recCallback, reqCallback)
+
+	resp := recCallback.Result()
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+	assert.Equal(t, "/", resp.Header.Get("Location"),
+		"OAuth callback must redirect to '/' on success")
+
+	// Verify user was created as admin with a super-admin binding
+	user, err := st.GetUserByEmail(context.Background(), adminEmail)
+	require.NoError(t, err)
+	assert.Equal(t, "admin", user.Role)
+	assert.True(t, st.hasSuperAdminBinding(user.ID),
+		"new admin user provisioned via OAuth must get a super-admin RoleBinding")
+}
+
+func TestOAuthCallback_ExistingUser_Promotion_CreatesSuperAdminBinding(t *testing.T) {
+	// An existing member promoted to admin during OAuth login must get a binding.
+	const secret = "test-session-secret-for-promotion-test-123456789"
+	memberEmail := "promoted-via-oauth@example.com"
+
+	ws := newTestWebServer(t, WebServerConfig{
+		SessionSecret: secret,
+		BaseURL:       "http://localhost:8080",
+	})
+
+	ws.oauthService = NewOAuthService(OAuthConfig{
+		Web: OAuthClientConfig{
+			Google: OAuthProviderConfig{
+				ClientID:     "test-client-id",
+				ClientSecret: "test-client-secret",
+			},
+		},
+	}, nil)
+	ws.oauthService.httpClient = &http.Client{
+		Transport: &mockOAuthTransport{
+			tokenJSON:    `{"access_token":"mock-token","token_type":"Bearer","expires_in":3600}`,
+			userinfoJSON: `{"id":"promo-id","email":"` + memberEmail + `","verified_email":true,"name":"Promoted User"}`,
+		},
+	}
+
+	st := newProxyAuthStoreWithRoles()
+	_ = st.CreateUser(context.Background(), &store.User{
+		ID:      "u-oauth-promote",
+		Email:   memberEmail,
+		Role:    "member",
+		Status:  "active",
+		Created: time.Now(),
+	})
+	ws.store = st
+	ws.SetAccessSettingsProvider(&staticAccessSettings{
+		adminEmails: []string{memberEmail},
+	})
+
+	// Pre-seed session
+	reqSetup := httptest.NewRequest(http.MethodGet, "/auth/login/google", nil)
+	recSetup := httptest.NewRecorder()
+	sess, err := ws.sessionStore.Get(reqSetup, webSessionName)
+	require.NoError(t, err)
+	oauthState := "test-state-promote"
+	sess.Values[sessKeyOAuthState] = oauthState
+	require.NoError(t, sess.Save(reqSetup, recSetup))
+	cookies := recSetup.Result().Cookies()
+	require.NotEmpty(t, cookies)
+
+	callbackURL := "/auth/callback/google?code=test-code&state=" + oauthState
+	reqCallback := httptest.NewRequest(http.MethodGet, callbackURL, nil)
+	for _, c := range cookies {
+		reqCallback.AddCookie(c)
+	}
+	recCallback := httptest.NewRecorder()
+
+	ws.Handler().ServeHTTP(recCallback, reqCallback)
+
+	resp := recCallback.Result()
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+
+	user, err := st.GetUserByEmail(context.Background(), memberEmail)
+	require.NoError(t, err)
+	assert.Equal(t, "admin", user.Role)
+	assert.True(t, st.hasSuperAdminBinding(user.ID),
+		"member promoted to admin via OAuth must get a super-admin RoleBinding")
+}
+
+func TestOAuthCallback_InvitedUser_PromotedToAdmin_GetsSuperAdminBinding(t *testing.T) {
+	// An invited user who transitions to active with admin role must get a binding.
+	const secret = "test-session-secret-for-invited-test-1234567890"
+	invitedEmail := "invited-admin@example.com"
+
+	ws := newTestWebServer(t, WebServerConfig{
+		SessionSecret: secret,
+		BaseURL:       "http://localhost:8080",
+	})
+
+	ws.oauthService = NewOAuthService(OAuthConfig{
+		Web: OAuthClientConfig{
+			Google: OAuthProviderConfig{
+				ClientID:     "test-client-id",
+				ClientSecret: "test-client-secret",
+			},
+		},
+	}, nil)
+	ws.oauthService.httpClient = &http.Client{
+		Transport: &mockOAuthTransport{
+			tokenJSON:    `{"access_token":"mock-token","token_type":"Bearer","expires_in":3600}`,
+			userinfoJSON: `{"id":"invited-id","email":"` + invitedEmail + `","verified_email":true,"name":"Invited Admin"}`,
+		},
+	}
+
+	st := newProxyAuthStoreWithRoles()
+	// Pre-create user as invited member (not admin yet)
+	_ = st.CreateUser(context.Background(), &store.User{
+		ID:      "u-invited",
+		Email:   invitedEmail,
+		Role:    "member",
+		Status:  store.UserStatusInvited,
+		Created: time.Now(),
+	})
+	ws.store = st
+	ws.SetAccessSettingsProvider(&staticAccessSettings{
+		adminEmails: []string{invitedEmail},
+	})
+
+	// Pre-seed session
+	reqSetup := httptest.NewRequest(http.MethodGet, "/auth/login/google", nil)
+	recSetup := httptest.NewRecorder()
+	sess, err := ws.sessionStore.Get(reqSetup, webSessionName)
+	require.NoError(t, err)
+	oauthState := "test-state-invited"
+	sess.Values[sessKeyOAuthState] = oauthState
+	require.NoError(t, sess.Save(reqSetup, recSetup))
+	cookies := recSetup.Result().Cookies()
+	require.NotEmpty(t, cookies)
+
+	callbackURL := "/auth/callback/google?code=test-code&state=" + oauthState
+	reqCallback := httptest.NewRequest(http.MethodGet, callbackURL, nil)
+	for _, c := range cookies {
+		reqCallback.AddCookie(c)
+	}
+	recCallback := httptest.NewRecorder()
+
+	ws.Handler().ServeHTTP(recCallback, reqCallback)
+
+	resp := recCallback.Result()
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+
+	user, err := st.GetUserByEmail(context.Background(), invitedEmail)
+	require.NoError(t, err)
+	assert.Equal(t, "admin", user.Role)
+	assert.Equal(t, store.UserStatusActive, user.Status,
+		"invited user must transition to active")
+	assert.True(t, st.hasSuperAdminBinding(user.ID),
+		"invited user promoted to admin on first login must get a super-admin RoleBinding")
+}
+
+func TestOAuthCallback_InvitedAdmin_AlreadyAdmin_GetsSuperAdminBinding(t *testing.T) {
+	// An invited user who ALREADY has role "admin" (set at invite time) must
+	// still get a super-admin RoleBinding on first login, even though the role
+	// doesn't change during the invited→active transition.
+	const secret = "test-session-secret-for-invited-admin-test-123456"
+	invitedEmail := "invited-already-admin@example.com"
+
+	ws := newTestWebServer(t, WebServerConfig{
+		SessionSecret: secret,
+		BaseURL:       "http://localhost:8080",
+	})
+
+	ws.oauthService = NewOAuthService(OAuthConfig{
+		Web: OAuthClientConfig{
+			Google: OAuthProviderConfig{
+				ClientID:     "test-client-id",
+				ClientSecret: "test-client-secret",
+			},
+		},
+	}, nil)
+	ws.oauthService.httpClient = &http.Client{
+		Transport: &mockOAuthTransport{
+			tokenJSON:    `{"access_token":"mock-token","token_type":"Bearer","expires_in":3600}`,
+			userinfoJSON: `{"id":"invited-admin-id","email":"` + invitedEmail + `","verified_email":true,"name":"Already Admin"}`,
+		},
+	}
+
+	st := newProxyAuthStoreWithRoles()
+	// Pre-create user as invited with admin role already assigned
+	_ = st.CreateUser(context.Background(), &store.User{
+		ID:      "u-invited-admin",
+		Email:   invitedEmail,
+		Role:    "admin",
+		Status:  store.UserStatusInvited,
+		Created: time.Now(),
+	})
+	ws.store = st
+	ws.SetAccessSettingsProvider(&staticAccessSettings{
+		adminEmails: []string{invitedEmail},
+	})
+
+	// Pre-seed session with OAuth state
+	reqSetup := httptest.NewRequest(http.MethodGet, "/auth/login/google", nil)
+	recSetup := httptest.NewRecorder()
+	sess, err := ws.sessionStore.Get(reqSetup, webSessionName)
+	require.NoError(t, err)
+	oauthState := "test-state-invited-admin"
+	sess.Values[sessKeyOAuthState] = oauthState
+	require.NoError(t, sess.Save(reqSetup, recSetup))
+	cookies := recSetup.Result().Cookies()
+	require.NotEmpty(t, cookies)
+
+	callbackURL := "/auth/callback/google?code=test-code&state=" + oauthState
+	reqCallback := httptest.NewRequest(http.MethodGet, callbackURL, nil)
+	for _, c := range cookies {
+		reqCallback.AddCookie(c)
+	}
+	recCallback := httptest.NewRecorder()
+
+	ws.Handler().ServeHTTP(recCallback, reqCallback)
+
+	resp := recCallback.Result()
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+
+	user, err := st.GetUserByEmail(context.Background(), invitedEmail)
+	require.NoError(t, err)
+	assert.Equal(t, "admin", user.Role)
+	assert.Equal(t, store.UserStatusActive, user.Status,
+		"invited user must transition to active")
+	assert.True(t, st.hasSuperAdminBinding(user.ID),
+		"invited user who already has admin role must get super-admin RoleBinding on first login")
+}
+
+func TestProxyAuthMiddleware_InvitedUser_TransitionsToActive(t *testing.T) {
+	// An invited user logging in via proxy auth must transition from
+	// "invited" to "active" status.
+	mockAuth := &mockProxyAuthenticator{
+		user: &ProxyUserInfo{
+			Subject:     "sa-invited-1",
+			Email:       "invited-proxy@example.com",
+			DisplayName: "Invited Proxy User",
+			Domain:      "example.com",
+		},
+	}
+
+	st := newProxyAuthStoreWithRoles()
+	_ = st.CreateUser(context.Background(), &store.User{
+		ID:      "u-invited-proxy",
+		Email:   "invited-proxy@example.com",
+		Role:    "member",
+		Status:  store.UserStatusInvited,
+		Created: time.Now(),
+	})
+
+	ws := newTestWebServer(t, WebServerConfig{
+		AuthMode:           "proxy",
+		ProxyAuthenticator: mockAuth,
+	})
+	ws.SetAccessSettingsProvider(&staticAccessSettings{
+		adminEmails: []string{"other@example.com"},
+	})
+	ws.SetStore(st)
+
+	req := httptest.NewRequest("GET", "/projects", nil)
+	req.Header.Set("Accept", "text/html")
+	rec := httptest.NewRecorder()
+
+	ws.Handler().ServeHTTP(rec, req)
+
+	user, err := st.GetUserByEmail(context.Background(), "invited-proxy@example.com")
+	require.NoError(t, err)
+	assert.Equal(t, store.UserStatusActive, user.Status,
+		"invited user must transition to active via proxy auth")
+	assert.Equal(t, "Invited Proxy User", user.DisplayName,
+		"display name should be populated from proxy identity on activation")
+}
+
+func TestProxyAuthMiddleware_InvitedAdmin_AlreadyAdmin_GetsSuperAdminBinding(t *testing.T) {
+	// An invited user who already has role "admin" must get a super-admin
+	// RoleBinding when transitioning from invited to active via proxy auth,
+	// even though the role doesn't change.
+	mockAuth := &mockProxyAuthenticator{
+		user: &ProxyUserInfo{
+			Subject:     "sa-invited-admin",
+			Email:       "invited-admin-proxy@example.com",
+			DisplayName: "Invited Admin",
+			Domain:      "example.com",
+		},
+	}
+
+	st := newProxyAuthStoreWithRoles()
+	_ = st.CreateUser(context.Background(), &store.User{
+		ID:      "u-invited-admin-proxy",
+		Email:   "invited-admin-proxy@example.com",
+		Role:    "admin",
+		Status:  store.UserStatusInvited,
+		Created: time.Now(),
+	})
+
+	ws := newTestWebServer(t, WebServerConfig{
+		AuthMode:           "proxy",
+		ProxyAuthenticator: mockAuth,
+	})
+	ws.SetAccessSettingsProvider(&staticAccessSettings{
+		adminEmails: []string{"invited-admin-proxy@example.com"},
+	})
+	ws.SetStore(st)
+
+	req := httptest.NewRequest("GET", "/projects", nil)
+	req.Header.Set("Accept", "text/html")
+	rec := httptest.NewRecorder()
+
+	ws.Handler().ServeHTTP(rec, req)
+
+	user, err := st.GetUserByEmail(context.Background(), "invited-admin-proxy@example.com")
+	require.NoError(t, err)
+	assert.Equal(t, "admin", user.Role)
+	assert.Equal(t, store.UserStatusActive, user.Status,
+		"invited user must transition to active via proxy auth")
+	assert.True(t, st.hasSuperAdminBinding(user.ID),
+		"invited user who already has admin role must get super-admin RoleBinding via proxy auth")
+}
+
+// Live operational settings propagation — regression tests for issue #1270
+// ---------------------------------------------------------------------------
+
+func TestWebServer_AccessSettings_LivePropagation(t *testing.T) {
+	// Verify that WebServer reads operational settings through the
+	// AccessSettingsProvider rather than holding its own snapshot.
+	// When the provider's values change (e.g. via ApplySnapshot on the
+	// Server), WebServer immediately sees the new values.
+
+	srv := &Server{
+		maintenance: NewMaintenanceState(false, ""),
+	}
+	srv.config.AdminEmails = []string{"initial-admin@example.com"}
+	srv.config.AuthorizedDomains = []string{"example.com"}
+	srv.config.UserAccessMode = "open"
+
+	ws := NewWebServer(WebServerConfig{})
+	ws.SetAccessSettingsProvider(srv)
+
+	// Verify initial values
+	assert.Equal(t, []string{"initial-admin@example.com"}, ws.adminEmails())
+	assert.Equal(t, []string{"example.com"}, ws.authorizedDomains())
+	assert.Equal(t, "open", ws.userAccessMode())
+
+	// Simulate runtime update via ApplySnapshot
+	ApplySnapshot(srv, Layer1Snapshot{
+		AdminEmails:    []string{"new-admin@example.com", "other@example.com"},
+		UserAccessMode: "domain_restricted",
+	})
+
+	// WebServer must see the UPDATED values immediately — no restart needed
+	assert.Equal(t, []string{"new-admin@example.com", "other@example.com"}, ws.adminEmails(),
+		"AdminEmails must reflect live update after ApplySnapshot")
+	assert.Equal(t, "domain_restricted", ws.userAccessMode(),
+		"UserAccessMode must reflect live update after ApplySnapshot")
+}
+
+func TestWebServer_AccessSettings_NilProviderSafe(t *testing.T) {
+	// When no AccessSettingsProvider is configured (e.g. web-only mode
+	// without a Hub), the accessors return zero values rather than panicking.
+	ws := NewWebServer(WebServerConfig{})
+
+	assert.Nil(t, ws.adminEmails(), "nil provider should return nil AdminEmails")
+	assert.Nil(t, ws.authorizedDomains(), "nil provider should return nil AuthorizedDomains")
+	assert.Equal(t, "", ws.userAccessMode(), "nil provider should return empty UserAccessMode")
+}
+
+func TestServer_ImplementsAccessSettingsProvider(t *testing.T) {
+	// Verify the Server type satisfies the AccessSettingsProvider interface
+	// at compile time and with correct locking behavior.
+	srv := &Server{
+		maintenance: NewMaintenanceState(false, ""),
+	}
+	srv.config.AdminEmails = []string{"a@b.com"}
+	srv.config.AuthorizedDomains = []string{"b.com"}
+	srv.config.UserAccessMode = "invite_only"
+
+	var provider AccessSettingsProvider = srv // compile-time check
+
+	// Accessors return defensive copies — mutating the result must not
+	// affect the server state.
+	emails := provider.AdminEmails()
+	emails[0] = "MUTATED"
+	assert.Equal(t, "a@b.com", provider.AdminEmails()[0],
+		"AdminEmails must return a defensive copy")
+
+	domains := provider.AuthorizedDomains()
+	domains[0] = "MUTATED"
+	assert.Equal(t, "b.com", provider.AuthorizedDomains()[0],
+		"AuthorizedDomains must return a defensive copy")
+
+	assert.Equal(t, "invite_only", provider.UserAccessMode())
+}
+
+// ---------------------------------------------------------------------------
+// isLoopbackHost
+// ---------------------------------------------------------------------------
+
+func TestIsLoopbackHost(t *testing.T) {
+	tests := []struct {
+		host string
+		want bool
+	}{
+		// Safe: loopback addresses
+		{"127.0.0.1", true},
+		{"::1", true},
+		{"localhost", true},
+
+		// Unsafe: all-interfaces addresses
+		{"0.0.0.0", false},
+		{"::", false},
+
+		// Unsafe: non-loopback IPs
+		{"192.168.1.1", false},
+		{"10.0.0.1", false},
+		{"172.16.0.1", false},
+
+		// Unsafe: empty string (not a valid loopback)
+		{"", false},
+
+		// Unsafe: unresolvable hostname (not "localhost")
+		{"example.com", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			got := IsLoopbackHost(tt.host)
+			assert.Equal(t, tt.want, got, "IsLoopbackHost(%q)", tt.host)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// NewWebServer dev-auth + non-loopback guard
+// ---------------------------------------------------------------------------
+
+func TestNewWebServer_DevAuth_NonLoopback_Rejected(t *testing.T) {
+	// NewWebServer calls log.Fatalf when dev auth is combined with a
+	// non-loopback host. We cannot easily intercept log.Fatalf in a unit
+	// test without replacing the default logger, so instead we validate
+	// that the guard logic (IsLoopbackHost) correctly identifies non-loopback
+	// addresses, and that constructing a WebServer with dev auth + loopback
+	// succeeds without panicking.
+
+	// Positive case: dev auth with loopback should succeed.
+	ws := NewWebServer(WebServerConfig{
+		Host:         "127.0.0.1",
+		DevAuthToken: "test-token",
+	})
+	assert.NotNil(t, ws)
+	assert.Equal(t, "127.0.0.1", ws.config.Host)
+
+	// Also verify localhost works.
+	ws2 := NewWebServer(WebServerConfig{
+		Host:         "localhost",
+		DevAuthToken: "test-token",
+	})
+	assert.NotNil(t, ws2)
+
+	// IPv6 loopback.
+	ws3 := NewWebServer(WebServerConfig{
+		Host:         "::1",
+		DevAuthToken: "test-token",
+	})
+	assert.NotNil(t, ws3)
+
+	// No dev auth token: any host should be fine.
+	ws4 := NewWebServer(WebServerConfig{
+		Host: "0.0.0.0",
+	})
+	assert.NotNil(t, ws4)
+}
+
+// TestSPAShellCacheControl pins ptone/scion#3732: every HTML document that
+// renders the __SCION_DATA__ object (the session user and the API data
+// prefetched as that user) is served with Cache-Control no-store, while
+// static assets keep their own headers.
+func TestSPAShellCacheControl(t *testing.T) {
+	tmpDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, "assets"), 0o755))
+	for name, data := range map[string]string{
+		"assets/app-entry.js":      "// entry",
+		"assets/chunk-abc12345.js": "// chunk",
+		"favicon.ico":              "icon",
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(tmpDir, filepath.FromSlash(name)), []byte(data), 0o644))
+	}
+
+	ws := newDevAuthWebServer(t, func(cfg *WebServerConfig) { cfg.AssetsDir = tmpDir })
+	tokenSvc, err := NewUserTokenService(UserTokenConfig{})
+	require.NoError(t, err)
+	ws.SetUserTokenService(tokenSvc)
+	agentID := tid("cache-agent")
+	ws.MountHubAPI(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"id": agentID, "name": "cache-agent"})
+	}), func(ctx context.Context) error { return nil })
+	handler := devSignedIn(t, ws)
+
+	get := func(path string) (*http.Response, string) {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Accept", "text/html")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		resp := rec.Result()
+		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(resp.Body)
+		return resp, string(body)
+	}
+
+	cases := []struct {
+		name, path, cacheControl, bodyContains string
+	}{
+		{"shell, signed-in user", "/", "no-store", DevUserID},
+		{"shell with prefetched agent data", "/agents/" + agentID, "no-store", `"cache-agent"`},
+		{"shell, projects list", "/projects", "no-store", DevUserID},
+		{"login shell", "/login", "no-store", "__SCION_DATA__"},
+		{"invite shell", "/invite", "no-store", "__SCION_DATA__"},
+		{"hashed asset", "/assets/chunk-abc12345.js", "public, max-age=86400", "// chunk"},
+		{"non-hashed asset", "/assets/app-entry.js", "no-cache", "// entry"},
+		{"root static file", "/favicon.ico", "no-cache", "icon"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, body := get(tc.path)
+			require.Equal(t, http.StatusOK, resp.StatusCode, body)
+			assert.Equal(t, tc.cacheControl, resp.Header.Get("Cache-Control"))
+			assert.Contains(t, body, tc.bodyContains)
+		})
+	}
+
+	// The no-assets page carries no per-user data and keeps no-cache.
+	bare := newDevAuthWebServer(t)
+	bare.assets = nil
+	bare.assetsDisk = ""
+	bare.hasAssets = false
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	devSignedIn(t, bare).ServeHTTP(rec, req)
+	bareResp := rec.Result()
+	defer func() { _ = bareResp.Body.Close() }()
+	assert.Equal(t, "no-cache", bareResp.Header.Get("Cache-Control"))
+	assert.NotContains(t, rec.Body.String(), "__SCION_DATA__")
 }

@@ -21,7 +21,6 @@ import (
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/extras/scion-chat-app/internal/state"
-	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 	"github.com/GoogleCloudPlatform/scion/pkg/hubclient"
 )
 
@@ -44,8 +43,16 @@ func newTestMapper(t *testing.T, users []hubclient.User) *Mapper {
 	}
 	t.Cleanup(func() { store.Close() })
 
+	// Use a real TokenMinter with a dummy 32-byte key so the fixture is valid
+	// for every code path through Mapper, including ClientFor which calls
+	// MintToken. A nil minter would compile but panic on the impersonation path.
+	minter, err := NewTokenMinter(make([]byte, 32))
+	if err != nil {
+		t.Fatalf("failed to create test minter: %v", err)
+	}
+
 	client := &fakeHubClient{users: users}
-	return NewMapper(store, client, "http://hub.test", slog.Default())
+	return NewMapper(store, client, "http://hub.test", minter, slog.Default())
 }
 
 func TestAutoRegister_EmailMatch(t *testing.T) {
@@ -185,6 +192,6 @@ type fakeUserService struct {
 	users []hubclient.User
 }
 
-func (f *fakeUserService) List(ctx context.Context, opts *apiclient.PageOptions) (*hubclient.ListUsersResponse, error) {
+func (f *fakeUserService) List(ctx context.Context, opts *hubclient.ListUsersOptions) (*hubclient.ListUsersResponse, error) {
 	return &hubclient.ListUsersResponse{Users: f.users}, nil
 }

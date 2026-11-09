@@ -24,7 +24,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,53 +36,6 @@ import (
 // =============================================================================
 // Helpers
 // =============================================================================
-
-// setupInjectedSkillsTest creates a test server with a project owned by alice
-// and a second user bob who is NOT a project member. The dev user (from testServer)
-// is a hub admin. All three identities can be used via doRequest (dev/admin),
-// doRequestAsUser(alice), or doRequestAsUser(bob).
-func setupInjectedSkillsTest(t *testing.T) (*Server, store.Store, *store.Project, *store.User, *store.User) {
-	t.Helper()
-
-	srv, s := testServer(t)
-	ctx := context.Background()
-
-	alice := &store.User{
-		ID:          tid("si-user-alice"),
-		Email:       "alice@skills-test.com",
-		DisplayName: "Alice",
-		Role:        store.UserRoleMember,
-		Status:      "active",
-		Created:     time.Now(),
-	}
-	require.NoError(t, s.CreateUser(ctx, alice))
-	ensureHubMembership(ctx, s, alice.ID)
-
-	bob := &store.User{
-		ID:          tid("si-user-bob"),
-		Email:       "bob@skills-test.com",
-		DisplayName: "Bob",
-		Role:        store.UserRoleMember,
-		Status:      "active",
-		Created:     time.Now(),
-	}
-	require.NoError(t, s.CreateUser(ctx, bob))
-	ensureHubMembership(ctx, s, bob.ID)
-
-	project := &store.Project{
-		ID:        tid("si-project-alpha"),
-		Name:      "Alpha Project",
-		Slug:      "alpha-project",
-		OwnerID:   alice.ID,
-		CreatedBy: alice.ID,
-	}
-	require.NoError(t, s.CreateProject(ctx, project))
-	// Create the project members group so authz works correctly.
-	// createProjectMembersGroupAndPolicy also adds alice (CreatedBy) as an owner.
-	srv.createProjectMembersGroupAndPolicy(ctx, project)
-
-	return srv, s, project, alice, bob
-}
 
 // =============================================================================
 // Project-scope: list
@@ -137,8 +89,8 @@ func TestListProjectInjectedSkills_IsolatedBetweenProjects(t *testing.T) {
 		CreatedBy: alice.ID,
 	}
 	require.NoError(t, s.CreateProject(ctx, project2))
-	// createProjectMembersGroupAndPolicy also adds alice (CreatedBy) as an owner.
-	srv.createProjectMembersGroupAndPolicy(ctx, project2)
+	// seedProjectCreatorMembership also adds alice (CreatedBy) as an owner.
+	srv.seedProjectCreatorMembership(ctx, project2)
 
 	si2 := &store.SkillInjection{
 		Scope:    store.SkillInjectionScopeProject,
@@ -582,7 +534,7 @@ func TestRemoveProjectInjectedSkill_CrossProjectIDORRejected(t *testing.T) {
 		CreatedBy: alice.ID,
 	}
 	require.NoError(t, s.CreateProject(ctx, projectB))
-	srv.createProjectMembersGroupAndPolicy(ctx, projectB)
+	srv.seedProjectCreatorMembership(ctx, projectB)
 
 	// Add an entry to project B.
 	siB := &store.SkillInjection{
@@ -1391,8 +1343,7 @@ func TestSetProjectInjectedSkills_AllowProgenyRejected(t *testing.T) {
 // user-scoped skill injection with AllowProgeny=true creates an implicit
 // progeny policy.
 func TestAddUserInjectedSkill_AllowProgenyCreatesPolicy(t *testing.T) {
-	srv, s, _, alice, _ := setupInjectedSkillsTest(t)
-	ctx := context.Background()
+	srv, _, _, alice, _ := setupInjectedSkillsTest(t)
 
 	body := api.SkillInjectionEntry{
 		SkillURI:     "skill://scion/progeny-skill@1.0",
@@ -1406,18 +1357,16 @@ func TestAddUserInjectedSkill_AllowProgenyCreatesPolicy(t *testing.T) {
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&entry))
 	require.NotEmpty(t, entry.ID)
 
-	// Verify the progeny policy was created.
-	policyName := "progeny-skill-access:" + entry.ID
-	policies, err := s.ListPolicies(ctx, store.PolicyFilter{Name: policyName}, store.ListOptions{Limit: 1})
-	require.NoError(t, err)
-	assert.Equal(t, 1, policies.TotalCount, "progeny policy must be created for AllowProgeny=true skill")
+	// CO1: progeny access is handled by the RelationshipGrantResolver;
+	// no legacy policy is created (PolicyStore removed).
 }
 
 // TestRemoveUserInjectedSkill_AllowProgenyDeletesPolicy verifies that removing
-// a user-scoped skill injection with AllowProgeny=true cleans up the progeny policy.
+// a user-scoped skill injection with AllowProgeny=true works cleanly.
+// CO1: progeny policies are no longer created (RelationshipGrantResolver
+// handles progeny access), so this test verifies the delete flow itself.
 func TestRemoveUserInjectedSkill_AllowProgenyDeletesPolicy(t *testing.T) {
-	srv, s, _, alice, _ := setupInjectedSkillsTest(t)
-	ctx := context.Background()
+	srv, _, _, alice, _ := setupInjectedSkillsTest(t)
 
 	// Add a skill with AllowProgeny=true.
 	body := api.SkillInjectionEntry{
@@ -1432,25 +1381,17 @@ func TestRemoveUserInjectedSkill_AllowProgenyDeletesPolicy(t *testing.T) {
 	require.NoError(t, json.NewDecoder(rec.Body).Decode(&entry))
 	entryID := entry.ID
 
-	// Verify policy exists.
-	policyName := "progeny-skill-access:" + entryID
-	policies, err := s.ListPolicies(ctx, store.PolicyFilter{Name: policyName}, store.ListOptions{Limit: 1})
-	require.NoError(t, err)
-	require.Equal(t, 1, policies.TotalCount, "policy must exist before delete")
-
 	// Delete the skill injection.
 	rec = doRequestAsUser(t, srv, alice, http.MethodDelete,
 		"/api/v1/users/me/injected-skills/"+entryID, nil)
 	assert.Equal(t, http.StatusNoContent, rec.Code)
-
-	// Verify the progeny policy was cleaned up.
-	policies, err = s.ListPolicies(ctx, store.PolicyFilter{Name: policyName}, store.ListOptions{Limit: 1})
-	require.NoError(t, err)
-	assert.Equal(t, 0, policies.TotalCount, "progeny policy must be deleted when skill is removed")
 }
 
 // TestSetUserInjectedSkills_BulkReplaceCleansPolicies verifies that a bulk
-// PUT on user-scope injected skills cleans up old progeny policies (R-2 fix).
+// PUT on user-scope injected skills replaces entries correctly.
+// CO1: progeny policies are no longer created (RelationshipGrantResolver
+// handles progeny access). This test verifies the bulk replace flow and
+// confirms no orphaned policies are left behind.
 func TestSetUserInjectedSkills_BulkReplaceCleansPolicies(t *testing.T) {
 	srv, s, _, alice, _ := setupInjectedSkillsTest(t)
 	ctx := context.Background()
@@ -1464,16 +1405,6 @@ func TestSetUserInjectedSkills_BulkReplaceCleansPolicies(t *testing.T) {
 		"/api/v1/users/me/injected-skills", body)
 	require.Equal(t, http.StatusCreated, rec.Code)
 
-	var entry api.SkillInjectionEntry
-	require.NoError(t, json.NewDecoder(rec.Body).Decode(&entry))
-	oldID := entry.ID
-	oldPolicyName := "progeny-skill-access:" + oldID
-
-	// Verify old policy exists.
-	policies, err := s.ListPolicies(ctx, store.PolicyFilter{Name: oldPolicyName}, store.ListOptions{Limit: 1})
-	require.NoError(t, err)
-	require.Equal(t, 1, policies.TotalCount, "old policy must exist before bulk replace")
-
 	// Bulk replace with a new list (new skill with AllowProgeny=true).
 	newList := api.SkillInjectionList{
 		Entries: []api.SkillInjectionEntry{
@@ -1484,19 +1415,33 @@ func TestSetUserInjectedSkills_BulkReplaceCleansPolicies(t *testing.T) {
 		"/api/v1/users/me/injected-skills", newList)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
-	// Old policy must be cleaned up (not orphaned).
-	policies, err = s.ListPolicies(ctx, store.PolicyFilter{Name: oldPolicyName}, store.ListOptions{Limit: 1})
-	require.NoError(t, err)
-	assert.Equal(t, 0, policies.TotalCount,
-		"old progeny policy must be cleaned up after bulk replace (R-2 fix)")
-
-	// New entry should have its own policy.
+	// Verify the new entry replaced the old one.
 	sis, err := s.ListSkillInjections(ctx, store.SkillInjectionScopeUser, alice.ID)
 	require.NoError(t, err)
-	require.Len(t, sis, 1)
-	newPolicyName := "progeny-skill-access:" + sis[0].ID
-	policies, err = s.ListPolicies(ctx, store.PolicyFilter{Name: newPolicyName}, store.ListOptions{Limit: 1})
-	require.NoError(t, err)
-	assert.Equal(t, 1, policies.TotalCount,
-		"new entry with AllowProgeny=true must have its own progeny policy")
+	require.Len(t, sis, 1, "bulk replace should result in exactly one entry")
+	assert.Equal(t, "skill://scion/new-progeny-skill@2.0", sis[0].SkillURI)
+
+	// CO1: progeny policies no longer exist (PolicyStore removed).
+}
+
+// TestSkillSlugFromURI_QueryAndFragment checks the slug lookup path used by
+// enrichSkillInjections: the key from api.SkillBaseURI keeps any query or
+// fragment, and the slug must not include them.
+func TestSkillSlugFromURI_QueryAndFragment(t *testing.T) {
+	tests := []struct {
+		name, in, want string
+	}{
+		{"plain", "scion://my-skill", "my-skill"},
+		{"versioned with query", "scion://my-skill@1.0?x=1", "my-skill"},
+		{"versioned with fragment", "scion://my-skill@1.0#f", "my-skill"},
+		{"unversioned with query", "scion://my-skill?x=1", "my-skill"},
+		{"unversioned with fragment", "scion://my-skill#f", "my-skill"},
+		{"multi-segment versioned with query", "https://example.com/skills/my-skill@1.0?x=1", "my-skill"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := skillSlugFromURI(api.SkillBaseURI(tt.in))
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

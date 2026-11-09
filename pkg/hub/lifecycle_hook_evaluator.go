@@ -26,12 +26,14 @@ import (
 )
 
 // v1Triggers is the set of authoritative phase transitions that fire lifecycle
-// hooks in v1. Only these phases are considered as triggers.
+// hooks in v1. Only these phases are considered as triggers. A halt is not
+// fired from the bus: fireHalted fires it in-process, once (ptone/scion#4853).
 var v1Triggers = map[state.Phase]string{
 	state.PhaseRunning:   store.LifecycleHookTriggerRunning,
 	state.PhaseSuspended: store.LifecycleHookTriggerSuspended,
 	state.PhaseStopped:   store.LifecycleHookTriggerStopped,
 	state.PhaseError:     store.LifecycleHookTriggerError,
+	state.PhaseHalted:    store.LifecycleHookTriggerHalted,
 }
 
 // LifecycleHookExecutor is the interface that M5 will implement for executing
@@ -161,21 +163,6 @@ func (d *memoryDeduper) seed(s store.Store, log *slog.Logger) {
 		d.previousPhase[a.ID] = a.Phase
 	}
 	log.Info("Seeded lifecycle hook evaluator previousPhase", "agents", len(result.Items))
-}
-
-// previousPhaseLen returns the number of entries (test helper).
-func (d *memoryDeduper) previousPhaseLen() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return len(d.previousPhase)
-}
-
-// previousPhaseHas returns true if the agent has an entry (test helper).
-func (d *memoryDeduper) previousPhaseHas(agentID string) bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	_, ok := d.previousPhase[agentID]
-	return ok
 }
 
 // DBDriverPostgres is the sentinel value for a Postgres-backed hub. When the
@@ -360,6 +347,13 @@ func (e *LifecycleHookEvaluator) handleEvent(evt Event) {
 		return
 	}
 
+	// A halt is fired once, in-process, by the instance whose write halted
+	// the agent (fireHalted); its bus events, which every instance receives
+	// and heartbeats republish, fire nothing.
+	if statusEvt.Phase == string(state.PhaseHalted) {
+		return
+	}
+
 	// Only process v1 triggers.
 	trigger, ok := v1Triggers[state.Phase(statusEvt.Phase)]
 	if !ok {
@@ -398,6 +392,30 @@ func (e *LifecycleHookEvaluator) handleEvent(evt Event) {
 	}
 
 	e.evaluateAndExecute(ctx, agent, trigger)
+}
+
+// fireHalted fires the hooks of one halt of agent: the halted hooks, plus
+// the hooks of haltedFrom (stopped or error) when the halt replaced such a
+// write, so hooks on those triggers fire as they would have without the
+// halt. It first wins the transition to halted through the deduper (the
+// durable compare-and-set on Postgres), so a halt fires at most once.
+func (e *LifecycleHookEvaluator) fireHalted(ctx context.Context, agent *store.Agent, haltedFrom string) {
+	if e == nil || agent == nil || agent.ID == "" {
+		return
+	}
+	changed, err := e.deduper.IsTransition(ctx, agent.ID, string(state.PhaseHalted))
+	if err != nil {
+		e.log.Error("Failed to check transition dedup for halted agent",
+			"agent_id", agent.ID, "error", err)
+		return
+	}
+	if !changed {
+		return
+	}
+	e.evaluateAndExecute(ctx, agent, store.LifecycleHookTriggerHalted)
+	if trigger, ok := v1Triggers[state.Phase(haltedFrom)]; ok && haltedFrom != string(state.PhaseHalted) {
+		e.evaluateAndExecute(ctx, agent, trigger)
+	}
 }
 
 // evaluateAndExecute loads matching hooks and invokes the executor for each.

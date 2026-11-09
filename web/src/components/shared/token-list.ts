@@ -18,24 +18,37 @@
  * Shared Token List Component
  *
  * Full CRUD component for user access tokens. Renders a table with
- * create, revoke, and delete actions. Shows a one-time token display
- * modal after creation with a copy button.
+ * create, revoke, and delete actions. A token is issued under one boundary:
+ * a single project, or the hub (any project the user can currently
+ * access). Shows a one-time token display modal after creation with a
+ * copy button.
  */
 
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 
 import type { Project } from '../../shared/types.js';
-import { apiFetch, extractApiError } from '../../client/api.js';
+import { apiFetch, extractApiError, parseApiError } from '../../client/api.js';
 import { resourceStyles } from './resource-styles.js';
 import { showToast } from '../../utils/toast.js';
 import { showConfirm } from './confirm-dialog.js';
+import { formatInstantWithZone, formatRelative } from '../../utils/time.js';
+import { DisplayZoneController } from '../../utils/display-zone-controller.js';
 
-interface AccessToken {
+/** A boundary a token is issued under, or that scopes are listed for. */
+export type TokenBoundaryKind = 'project' | 'hub';
+
+export interface AccessToken {
   id: string;
   name: string;
   prefix: string;
-  projectId: string;
+  /** Authoritative boundary. Absent on responses from an older hub. */
+  boundary?: { kind: TokenBoundaryKind; projectId?: string };
+  /** Project-boundary shorthand; omitted for a hub token. */
+  projectId?: string;
+  /** Descriptive metadata set at creation; never changes afterwards. */
+  purpose?: string;
+  labels?: Record<string, string>;
   scopes: string[];
   revoked: boolean;
   expiresAt?: string | null;
@@ -43,43 +56,1102 @@ interface AccessToken {
   created: string;
 }
 
-const AVAILABLE_SCOPES = [
-  { value: 'project:read', label: 'project:read', description: 'Read project metadata' },
+interface ScopeOption {
+  value: string;
+  label: string;
+  description: string;
+  /** Resource type extracted from the scope id (e.g. "agent" from "agent:create"). */
+  resource: string;
+  /** Whether this scope is an alias that expands to multiple scopes. */
+  isAlias: boolean;
+  /** For aliases, the list of scopes this alias expands to. */
+  expandsTo?: string[];
+  /**
+   * "flat_role" or "relationship" (ptone/scion#2122). Relationship-eligible
+   * scopes (agent:attach, agent:port_access) are checked against the
+   * specific target on every later request -- own agents and their
+   * descendants, plus (for agent:port_access) agents in projects where the
+   * holder's role grants it -- never against a target enumerated at
+   * selection time.
+   */
+  eligibilityKind?: string | undefined;
+  /**
+   * Present only once eligibility was requested for a selected project.
+   * Answers only "may you select this restriction"; never a target list
+   * and never widened by anything the browser already holds.
+   */
+  eligible?: boolean | undefined;
+  /** Stable machine reason code, present only when eligible is false. */
+  eligibilityReason?: string | undefined;
+  /** For an alias, which expanded member scopes are not eligible. */
+  ineligibleMembers?: string[] | undefined;
+  /** Boundary kinds that may select this scope at creation, when known. */
+  allowedBoundaries?: string[] | undefined;
+}
+
+/** What the scope picker lists scopes for. */
+interface ScopesTarget {
+  kind: TokenBoundaryKind;
+  /** For a project target; empty or absent means no project chosen yet. */
+  projectId?: string;
+}
+
+/** Most label rows the create dialog accepts (the server limit). */
+export const MAX_TOKEN_LABELS = 8;
+/** Most bytes in a purpose (the server limit; the server validates). */
+export const MAX_TOKEN_PURPOSE_BYTES = 128;
+
+/**
+ * The boundary kind of a token, following the same rules as the CLI:
+ * boundary.kind when present, otherwise "project" when an older hub sent
+ * only projectId, otherwise "" (unknown, never shown as hub).
+ */
+export function tokenBoundaryKind(
+  token: Pick<AccessToken, 'boundary' | 'projectId'>
+): TokenBoundaryKind | '' {
+  if (token.boundary?.kind === 'hub' || token.boundary?.kind === 'project') {
+    return token.boundary.kind;
+  }
+  if (token.projectId) return 'project';
+  return '';
+}
+
+/** Scope cache key: "hub", "project:<id>", or "" for the plain catalog. */
+function scopesCacheKey(target: ScopesTarget): string {
+  if (target.kind === 'hub') return 'hub';
+  return target.projectId ? `project:${target.projectId}` : '';
+}
+
+/** One row of the labels editor; empty rows are ignored on submit. */
+interface LabelRow {
+  key: string;
+  value: string;
+}
+
+/**
+ * Turns the labels editor rows into the request map. Rows with neither key
+ * nor value are ignored. Returns an error message for a row with a value
+ * but no key, or for a duplicate key (same rule as the CLI --label flag).
+ */
+export function buildTokenLabels(rows: LabelRow[]): {
+  labels: Record<string, string> | undefined;
+  error?: string;
+} {
+  // A Map, so that any key (including "__proto__") is kept as a key.
+  const labels = new Map<string, string>();
+  for (const row of rows) {
+    const key = row.key.trim();
+    if (!key && !row.value) continue;
+    if (!key) return { labels: undefined, error: 'Each label needs a key' };
+    if (labels.has(key)) {
+      return { labels: undefined, error: `Duplicate label key "${key}"` };
+    }
+    labels.set(key, row.value);
+  }
+  // Object.fromEntries defines own properties, so "__proto__" stays a key.
+  return { labels: labels.size > 0 ? Object.fromEntries(labels) : undefined };
+}
+
+/** Human-readable text for a MintDenialReason code from the eligibility API. */
+const ELIGIBILITY_REASON_LABELS: Record<string, string> = {
+  flat_role_insufficient: 'your project role does not include this permission',
+  no_relationship_candidacy: 'not eligible under your current project access',
+  authority_required: 'your account has no current access that includes this permission',
+  unknown_selector: 'unknown scope',
+  // Appears per-scope only when at least one other scope in the response
+  // was eligible (ptone/scion#2122); a project with zero eligible scopes
+  // fails the whole request instead, so this label is never the only
+  // signal that the project itself is inaccessible.
+  project_access_required:
+    'you do not currently have authority for this permission in this project',
+};
+
+export function formatEligibilityReason(
+  reason?: string,
+  boundary: TokenBoundaryKind = 'project'
+): string {
+  if (!reason) return 'not currently selectable';
+  if (reason === 'boundary_not_allowed') {
+    return boundary === 'hub'
+      ? 'not selectable for a hub token'
+      : 'not selectable for a project token';
+  }
+  return ELIGIBILITY_REASON_LABELS[reason] || reason;
+}
+
+/**
+ * Badge text for a relationship-eligible scope. agent:port_access also
+ * reaches agents in projects where the holder's role grants port access
+ * (the built-in project owner and admin roles do).
+ */
+export function relationshipBadgeText(scope: string): string {
+  if (scope === 'agent:port_access') {
+    return 'Own agents & descendants, or any agent in the project if your role grants port access — checked per agent';
+  }
+  return 'Own agents & descendants — checked per agent';
+}
+
+/**
+ * Human-friendly labels for resource type groups in the scope selector.
+ */
+const RESOURCE_TYPE_LABELS: Record<string, string> = {
+  access_constraint: 'Access Constraint',
+  agent: 'Agent',
+  artifact: 'Artifact',
+  broker: 'Broker',
+  gcp_service_account: 'GCP Service Account',
+  group: 'Group',
+  harness_config: 'Harness Config',
+  hub: 'Hub',
+  project: 'Project',
+  role: 'Role',
+  role_binding: 'Role Binding',
+  skill: 'Skill',
+  template: 'Template',
+  test_identity: 'Test Identity',
+  user: 'User',
+};
+
+/**
+ * Fallback scope list used when the dynamic fetch from /api/v1/auth/scopes
+ * fails. This is a static, best-effort snapshot for that offline case only:
+ * it never carries eligibility (every entry is selectable), so it must not
+ * be used to answer "may I select this restriction" -- only the live
+ * /api/v1/auth/scopes response does that. The list mirrors every registry
+ * selector the server offers (reserved permissions' selectors are not
+ * offered), including boundary-restricted ones such as broker:create
+ * (hub-boundary tokens only): the live response marks those
+ * boundary_not_allowed for a project-scoped token, and the server rejects
+ * them on submit.
+ */
+const FALLBACK_SCOPES: ScopeOption[] = [
   {
-    value: 'agent:dispatch',
-    label: 'agent:dispatch',
-    description: 'Dispatch agents (create + start)',
+    value: 'access_constraint:admin',
+    label: 'access_constraint:admin',
+    description: 'Administer access constraints (create, update, delete)',
+    resource: 'access_constraint',
+    isAlias: false,
   },
-  { value: 'agent:read', label: 'agent:read', description: 'Read agent status/metadata' },
-  { value: 'agent:list', label: 'agent:list', description: 'List agents in the project' },
-  { value: 'agent:create', label: 'agent:create', description: 'Create agents' },
-  { value: 'agent:start', label: 'agent:start', description: 'Start/restart agents' },
-  { value: 'agent:stop', label: 'agent:stop', description: 'Stop agents' },
-  { value: 'agent:delete', label: 'agent:delete', description: 'Delete agents' },
-  { value: 'agent:message', label: 'agent:message', description: 'Send messages to agents' },
-  { value: 'agent:attach', label: 'agent:attach', description: 'Attach to agent sessions' },
+  {
+    value: 'access_constraint:read',
+    label: 'access_constraint:read',
+    description: 'Read access constraints',
+    resource: 'access_constraint',
+    isAlias: false,
+  },
+  {
+    value: 'agent:attach',
+    label: 'agent:attach',
+    description: 'Attach to agent sessions (terminal, exec, env, reset-auth)',
+    resource: 'agent',
+    isAlias: false,
+  },
+  {
+    value: 'agent:create',
+    label: 'agent:create',
+    description: 'Create agents',
+    resource: 'agent',
+    isAlias: false,
+  },
+  {
+    value: 'agent:delete',
+    label: 'agent:delete',
+    description: 'Delete agents',
+    resource: 'agent',
+    isAlias: false,
+  },
+  {
+    value: 'agent:lifecycle',
+    label: 'agent:lifecycle',
+    description: 'Start, stop, suspend, restart, restore, and reincarnate agents',
+    resource: 'agent',
+    isAlias: false,
+  },
+  {
+    value: 'agent:list',
+    label: 'agent:list',
+    description: 'List agents in the project',
+    resource: 'agent',
+    isAlias: false,
+  },
   {
     value: 'agent:manage',
     label: 'agent:manage',
-    description: 'All agent actions (convenience alias)',
+    description: 'All agent management operations',
+    resource: 'agent',
+    isAlias: true,
+    expandsTo: [
+      'agent:create',
+      'agent:delete',
+      'agent:lifecycle',
+      'agent:list',
+      'agent:message',
+      'agent:read',
+    ],
   },
-] as const;
+  {
+    value: 'agent:message',
+    label: 'agent:message',
+    description: 'Send messages to agents',
+    resource: 'agent',
+    isAlias: false,
+  },
+  {
+    value: 'agent:port_access',
+    label: 'agent:port_access',
+    description: 'Access agent forwarded ports',
+    resource: 'agent',
+    isAlias: false,
+  },
+  {
+    value: 'agent:read',
+    label: 'agent:read',
+    description: 'Read agent status/metadata',
+    resource: 'agent',
+    isAlias: false,
+  },
+  {
+    value: 'agent:set_message_mode',
+    label: 'agent:set_message_mode',
+    description: 'Change agent message mode',
+    resource: 'agent',
+    isAlias: false,
+  },
+  {
+    value: 'agent:stop_all',
+    label: 'agent:stop_all',
+    description: 'Stop all agents',
+    resource: 'agent',
+    isAlias: false,
+  },
+  {
+    value: 'agent:update',
+    label: 'agent:update',
+    description: 'Update agents (metadata, configuration, status, workspace sync)',
+    resource: 'agent',
+    isAlias: false,
+  },
+  {
+    value: 'artifact:create',
+    label: 'artifact:create',
+    description: 'Publish artifacts',
+    resource: 'artifact',
+    isAlias: false,
+  },
+  {
+    value: 'artifact:manage',
+    label: 'artifact:manage',
+    description: 'Manage artifact grants and share links',
+    resource: 'artifact',
+    isAlias: false,
+  },
+  {
+    value: 'artifact:read',
+    label: 'artifact:read',
+    description: 'Read artifacts',
+    resource: 'artifact',
+    isAlias: false,
+  },
+  {
+    value: 'artifact:steward',
+    label: 'artifact:steward',
+    description:
+      'Share and delete artifacts owned by agents in the project (no admin grants, no moves)',
+    resource: 'artifact',
+    isAlias: false,
+  },
+  {
+    value: 'broker:create',
+    label: 'broker:create',
+    description: 'Create brokers',
+    resource: 'broker',
+    isAlias: false,
+  },
+  {
+    value: 'broker:list',
+    label: 'broker:list',
+    description: 'List brokers',
+    resource: 'broker',
+    isAlias: false,
+  },
+  {
+    value: 'broker:read',
+    label: 'broker:read',
+    description: 'Read brokers',
+    resource: 'broker',
+    isAlias: false,
+  },
+  {
+    value: 'federation_token:mint',
+    label: 'federation_token:mint',
+    description:
+      'Obtain a short-lived user access credential for yourself to present to a peer hub',
+    resource: 'federation_token',
+    isAlias: false,
+  },
+  {
+    value: 'gcp_service_account:assign',
+    label: 'gcp_service_account:assign',
+    description: 'Assign GCP service accounts to agents',
+    resource: 'gcp_service_account',
+    isAlias: false,
+  },
+  {
+    value: 'gcp_service_account:list',
+    label: 'gcp_service_account:list',
+    description: 'List GCP service accounts',
+    resource: 'gcp_service_account',
+    isAlias: false,
+  },
+  {
+    value: 'gcp_service_account:read',
+    label: 'gcp_service_account:read',
+    description: 'Read GCP service accounts',
+    resource: 'gcp_service_account',
+    isAlias: false,
+  },
+  {
+    value: 'gcp_service_account:verify',
+    label: 'gcp_service_account:verify',
+    description: 'Verify GCP service accounts',
+    resource: 'gcp_service_account',
+    isAlias: false,
+  },
+  {
+    value: 'group:addMember',
+    label: 'group:addMember',
+    description: 'Add group members',
+    resource: 'group',
+    isAlias: false,
+  },
+  {
+    value: 'group:create',
+    label: 'group:create',
+    description: 'Create groups',
+    resource: 'group',
+    isAlias: false,
+  },
+  {
+    value: 'group:delete',
+    label: 'group:delete',
+    description: 'Delete groups',
+    resource: 'group',
+    isAlias: false,
+  },
+  {
+    value: 'group:list',
+    label: 'group:list',
+    description: 'List groups',
+    resource: 'group',
+    isAlias: false,
+  },
+  {
+    value: 'group:manage',
+    label: 'group:manage',
+    description: 'All group scopes (convenience alias)',
+    resource: 'group',
+    isAlias: true,
+    expandsTo: [
+      'group:addMember',
+      'group:create',
+      'group:delete',
+      'group:list',
+      'group:read',
+      'group:removeMember',
+      'group:update',
+    ],
+  },
+  {
+    value: 'group:read',
+    label: 'group:read',
+    description: 'Read groups',
+    resource: 'group',
+    isAlias: false,
+  },
+  {
+    value: 'group:removeMember',
+    label: 'group:removeMember',
+    description: 'Remove group members',
+    resource: 'group',
+    isAlias: false,
+  },
+  {
+    value: 'group:update',
+    label: 'group:update',
+    description: 'Update groups',
+    resource: 'group',
+    isAlias: false,
+  },
+  {
+    value: 'harness_config:create',
+    label: 'harness_config:create',
+    description: 'Create harness configs',
+    resource: 'harness_config',
+    isAlias: false,
+  },
+  {
+    value: 'harness_config:delete',
+    label: 'harness_config:delete',
+    description: 'Delete harness configs',
+    resource: 'harness_config',
+    isAlias: false,
+  },
+  {
+    value: 'harness_config:list',
+    label: 'harness_config:list',
+    description: 'List harness configs',
+    resource: 'harness_config',
+    isAlias: false,
+  },
+  {
+    value: 'harness_config:manage',
+    label: 'harness_config:manage',
+    description: 'All harness_config scopes (convenience alias)',
+    resource: 'harness_config',
+    isAlias: true,
+    expandsTo: [
+      'harness_config:create',
+      'harness_config:delete',
+      'harness_config:list',
+      'harness_config:read',
+      'harness_config:update',
+    ],
+  },
+  {
+    value: 'harness_config:read',
+    label: 'harness_config:read',
+    description: 'Read harness configs',
+    resource: 'harness_config',
+    isAlias: false,
+  },
+  {
+    value: 'harness_config:update',
+    label: 'harness_config:update',
+    description: 'Update harness configs',
+    resource: 'harness_config',
+    isAlias: false,
+  },
+  {
+    value: 'hub_config:read',
+    label: 'hub_config:read',
+    description: 'Read server configuration',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_config:update',
+    label: 'hub_config:update',
+    description: 'Update server configuration',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_experiments:update',
+    label: 'hub_experiments:update',
+    description: 'Read and update hub-wide experiment overrides',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_lifecycle_hooks:read',
+    label: 'hub_lifecycle_hooks:read',
+    description: 'Read lifecycle hooks',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_lifecycle_hooks:update',
+    label: 'hub_lifecycle_hooks:update',
+    description: 'Update lifecycle hooks',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_messaging:update',
+    label: 'hub_messaging:update',
+    description: 'Update messaging switches',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_project_defaults:read',
+    label: 'hub_project_defaults:read',
+    description: 'Read project defaults',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_project_defaults:update',
+    label: 'hub_project_defaults:update',
+    description: 'Update project defaults',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_settings:update',
+    label: 'hub_settings:update',
+    description: 'Update hub settings',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_scheduler:read',
+    label: 'hub_scheduler:read',
+    description: 'Read scheduler',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_health:read',
+    label: 'hub_health:read',
+    description: 'Read health summary',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_validate:execute',
+    label: 'hub_validate:execute',
+    description: 'Validate resources',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_allow_list:read',
+    label: 'hub_allow_list:read',
+    description: 'Read allow list',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_allow_list:update',
+    label: 'hub_allow_list:update',
+    description: 'Update allow list',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'test_identity:issue',
+    label: 'test_identity:issue',
+    description:
+      'Issue short-lived synthetic member or viewer test identities (only when the hub runs with --test-mode=member or above)',
+    resource: 'test_identity',
+    isAlias: false,
+  },
+  {
+    value: 'test_identity:issue_admin',
+    label: 'test_identity:issue_admin',
+    description:
+      'Issue short-lived test identities holding an expiring hub-admin role (only on hubs started with --test-mode=admin or above); held only by super-admin',
+    resource: 'test_identity',
+    isAlias: false,
+  },
+  {
+    value: 'test_identity:issue_super_admin',
+    label: 'test_identity:issue_super_admin',
+    description:
+      'Issue short-lived test identities holding an expiring super-admin role (only on hubs started with --test-mode=super-admin); held only by super-admin',
+    resource: 'test_identity',
+    isAlias: false,
+  },
+  {
+    value: 'hub_integrations:read',
+    label: 'hub_integrations:read',
+    description: 'Read integrations',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_integrations:update',
+    label: 'hub_integrations:update',
+    description:
+      'Update integration settings and restart integrations (install, update and credential settings need an interactive session)',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_teams_manifest:read',
+    label: 'hub_teams_manifest:read',
+    description: 'Read teams manifest',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_diagnostics:read',
+    label: 'hub_diagnostics:read',
+    description: 'Read diagnostics and logs',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_metrics:read',
+    label: 'hub_metrics:read',
+    description: 'Read metrics dashboard',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_audit:read',
+    label: 'hub_audit:read',
+    description: 'Explain authorization decisions for other principals and read effective access',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_github_app:read',
+    label: 'hub_github_app:read',
+    description: 'Read GitHub app configuration',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'hub_github_app:update',
+    label: 'hub_github_app:update',
+    description:
+      'Manage GitHub App installations, discover and sync permissions (configuration updates need an interactive session)',
+    resource: 'hub',
+    isAlias: false,
+  },
+  {
+    value: 'inbox:read',
+    label: 'inbox:read',
+    description: 'Read your own inbox, notifications and direct messages',
+    resource: 'inbox',
+    isAlias: false,
+  },
+  {
+    value: 'inbox:write',
+    label: 'inbox:write',
+    description: 'Send, change and remove your own inbox items and direct messages',
+    resource: 'inbox',
+    isAlias: false,
+  },
+  {
+    value: 'project:chat_post',
+    label: 'project:chat_post',
+    description:
+      "Keep project.chat_post on the token so it can grant roles that include it, such as project-member. It does not post: a token posts in a project's chat threads with inbox:write, and project.chat_post is checked on the account (project owner/admin/member, hub admin)",
+    resource: 'project',
+    isAlias: false,
+  },
+  {
+    value: 'project:clone',
+    label: 'project:clone',
+    description: 'Clone projects',
+    resource: 'project',
+    isAlias: false,
+  },
+  {
+    value: 'project:create',
+    label: 'project:create',
+    description:
+      'Create projects: project create, project register, and the new project of a clone',
+    resource: 'project',
+    isAlias: false,
+  },
+  {
+    value: 'project:list',
+    label: 'project:list',
+    description: 'List projects',
+    resource: 'project',
+    isAlias: false,
+  },
+  {
+    value: 'project:manage',
+    label: 'project:manage',
+    description:
+      'Manage project administration (RS1 membership operations). Not a read/write alias: it does not include project:read or project:list',
+    resource: 'project',
+    isAlias: false,
+  },
+  {
+    value: 'project:read',
+    label: 'project:read',
+    description: 'Read project metadata',
+    resource: 'project',
+    isAlias: false,
+  },
+  {
+    value: 'project:update',
+    label: 'project:update',
+    description: 'Update projects',
+    resource: 'project',
+    isAlias: false,
+  },
+  {
+    value: 'role:read',
+    label: 'role:read',
+    description: 'Read role definitions',
+    resource: 'role',
+    isAlias: false,
+  },
+  {
+    value: 'role_binding:read',
+    label: 'role_binding:read',
+    description: 'Read role bindings',
+    resource: 'role_binding',
+    isAlias: false,
+  },
+  {
+    value: 'role:create',
+    label: 'role:create',
+    description: 'Create custom role definitions',
+    resource: 'role',
+    isAlias: false,
+  },
+  {
+    value: 'role:update',
+    label: 'role:update',
+    description: 'Update custom role definitions',
+    resource: 'role',
+    isAlias: false,
+  },
+  {
+    value: 'role:delete',
+    label: 'role:delete',
+    description: 'Delete custom role definitions',
+    resource: 'role',
+    isAlias: false,
+  },
+  {
+    value: 'role_binding:create',
+    label: 'role_binding:create',
+    description: 'Create role bindings',
+    resource: 'role_binding',
+    isAlias: false,
+  },
+  {
+    value: 'role_binding:delete',
+    label: 'role_binding:delete',
+    description: 'Delete role bindings',
+    resource: 'role_binding',
+    isAlias: false,
+  },
+  {
+    value: 'project:set_messaging_policy',
+    label: 'project:set_messaging_policy',
+    description: 'Set project cross-project messaging policy (owner/admin only)',
+    resource: 'project',
+    isAlias: false,
+  },
+  {
+    value: 'quota:create',
+    label: 'quota:create',
+    description: 'Create limit definitions and entitlement bindings',
+    resource: 'quota',
+    isAlias: false,
+  },
+  {
+    value: 'quota:delete',
+    label: 'quota:delete',
+    description: 'Delete limit definitions and entitlement bindings',
+    resource: 'quota',
+    isAlias: false,
+  },
+  {
+    value: 'quota:read',
+    label: 'quota:read',
+    description: 'Read limit definitions, entitlements, and usage',
+    resource: 'quota',
+    isAlias: false,
+  },
+  {
+    value: 'quota:update',
+    label: 'quota:update',
+    description: 'Update limit definitions, entitlement bindings and broker settings',
+    resource: 'quota',
+    isAlias: false,
+  },
+  {
+    value: 'scheduled_event:create',
+    label: 'scheduled_event:create',
+    description: 'Create scheduled events and schedules',
+    resource: 'scheduled_event',
+    isAlias: false,
+  },
+  {
+    value: 'scheduled_event:delete',
+    label: 'scheduled_event:delete',
+    description: 'Cancel scheduled events and delete schedules',
+    resource: 'scheduled_event',
+    isAlias: false,
+  },
+  {
+    value: 'scheduled_event:list',
+    label: 'scheduled_event:list',
+    description: 'List scheduled events and schedules',
+    resource: 'scheduled_event',
+    isAlias: false,
+  },
+  {
+    value: 'scheduled_event:read',
+    label: 'scheduled_event:read',
+    description: 'Read scheduled events, schedules and schedule history',
+    resource: 'scheduled_event',
+    isAlias: false,
+  },
+  {
+    value: 'scheduled_event:update',
+    label: 'scheduled_event:update',
+    description: 'Update, pause and resume schedules',
+    resource: 'scheduled_event',
+    isAlias: false,
+  },
+  {
+    value: 'skill:create',
+    label: 'skill:create',
+    description: 'Create skills',
+    resource: 'skill',
+    isAlias: false,
+  },
+  {
+    value: 'skill:create_global',
+    label: 'skill:create_global',
+    description: 'Create skills in the global (hub) catalog',
+    resource: 'skill',
+    isAlias: false,
+  },
+  {
+    value: 'skill:delete',
+    label: 'skill:delete',
+    description: 'Delete skills',
+    resource: 'skill',
+    isAlias: false,
+  },
+  {
+    value: 'skill:list',
+    label: 'skill:list',
+    description: 'List skills',
+    resource: 'skill',
+    isAlias: false,
+  },
+  {
+    value: 'skill:manage',
+    label: 'skill:manage',
+    description: 'All skill scopes (convenience alias)',
+    resource: 'skill',
+    isAlias: true,
+    expandsTo: [
+      'skill:create',
+      'skill:delete',
+      'skill:list',
+      'skill:read',
+      'skill:register',
+      'skill:update',
+    ],
+  },
+  {
+    value: 'skill:read',
+    label: 'skill:read',
+    description: 'Read skills',
+    resource: 'skill',
+    isAlias: false,
+  },
+  {
+    value: 'skill:register',
+    label: 'skill:register',
+    description: 'Register skills in registries',
+    resource: 'skill',
+    isAlias: false,
+  },
+  {
+    value: 'skill:update',
+    label: 'skill:update',
+    description: 'Update skills',
+    resource: 'skill',
+    isAlias: false,
+  },
+  {
+    value: 'template:create',
+    label: 'template:create',
+    description: 'Create templates',
+    resource: 'template',
+    isAlias: false,
+  },
+  {
+    value: 'template:delete',
+    label: 'template:delete',
+    description: 'Delete templates',
+    resource: 'template',
+    isAlias: false,
+  },
+  {
+    value: 'template:list',
+    label: 'template:list',
+    description: 'List templates',
+    resource: 'template',
+    isAlias: false,
+  },
+  {
+    value: 'template:manage',
+    label: 'template:manage',
+    description: 'All template scopes (convenience alias)',
+    resource: 'template',
+    isAlias: true,
+    expandsTo: [
+      'template:create',
+      'template:delete',
+      'template:list',
+      'template:read',
+      'template:update',
+    ],
+  },
+  {
+    value: 'template:read',
+    label: 'template:read',
+    description: 'Read templates',
+    resource: 'template',
+    isAlias: false,
+  },
+  {
+    value: 'template:update',
+    label: 'template:update',
+    description: 'Update templates',
+    resource: 'template',
+    isAlias: false,
+  },
+  {
+    value: 'user:invite',
+    label: 'user:invite',
+    description: 'Invite users',
+    resource: 'user',
+    isAlias: false,
+  },
+  {
+    value: 'user:read',
+    label: 'user:read',
+    description: 'Read users',
+    resource: 'user',
+    isAlias: false,
+  },
+  {
+    value: 'user:list',
+    label: 'user:list',
+    description: 'List users',
+    resource: 'user',
+    isAlias: false,
+  },
+  {
+    value: 'user:update',
+    label: 'user:update',
+    description: 'Update the display name and preferences of other users',
+    resource: 'user',
+    isAlias: false,
+  },
+  {
+    value: 'user:suspend',
+    label: 'user:suspend',
+    description: 'Suspend or reactivate users',
+    resource: 'user',
+    isAlias: false,
+  },
+  {
+    value: 'user:promote',
+    label: 'user:promote',
+    description: 'Change other users between the member and viewer roles',
+    resource: 'user',
+    isAlias: false,
+  },
+  {
+    value: 'user:delete',
+    label: 'user:delete',
+    description: 'Delete users',
+    resource: 'user',
+    isAlias: false,
+  },
+  {
+    value: 'user_skill_injection:update',
+    label: 'user_skill_injection:update',
+    description: 'Change the skills injected into your own agents',
+    resource: 'user_skill_injection',
+    isAlias: false,
+  },
+];
+
+/** Groups scope options by resource type, preserving order. Returns [resourceType, scopes][] */
+function groupScopesByResource(scopes: ScopeOption[]): [string, ScopeOption[]][] {
+  const groups = new Map<string, ScopeOption[]>();
+  for (const scope of scopes) {
+    const key = scope.resource;
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+    groups.get(key)!.push(scope);
+  }
+  return Array.from(groups.entries());
+}
+
+/**
+ * The catalog without the scopes a token of this boundary may not select,
+ * for a hub that cannot answer boundary eligibility or when the eligibility
+ * request fails. Returns a new list; the cached catalog is not changed so
+ * the other boundary can still filter from it. A scope with no
+ * allowedBoundaries (e.g. the offline fallback list) is kept; an alias is
+ * kept only when none of its members was removed.
+ */
+function filterScopesForBoundary(scopes: ScopeOption[], kind: TokenBoundaryKind): ScopeOption[] {
+  const removed = new Set(
+    scopes
+      .filter((s) => !s.isAlias && s.allowedBoundaries && !s.allowedBoundaries.includes(kind))
+      .map((s) => s.value)
+  );
+  return scopes.filter((s) => {
+    if (removed.has(s.value)) return false;
+    if (s.isAlias) return !(s.expandsTo ?? []).some((m) => removed.has(m));
+    return true;
+  });
+}
 
 @customElement('scion-token-list')
 export class ScionTokenList extends LitElement {
+  /** Re-renders absolute times when the display timezone changes. */
+  readonly _zone = new DisplayZoneController(this);
+
   @state() private loading = true;
   @state() private tokens: AccessToken[] = [];
   @state() private projects: Project[] = [];
   @state() private error: string | null = null;
+  @state() private availableScopes: ScopeOption[] = [...FALLBACK_SCOPES];
+  /** Cached scope responses, keyed by scopesCacheKey(). */
+  private scopesCache: Map<string, ScopeOption[]> = new Map();
+  /**
+   * Monotonic counter guarding against out-of-order responses: each
+   * loadScopes() call captures the value at its start and checks it again
+   * after every await, so a slower, older request cannot overwrite the
+   * state a newer one already applied.
+   */
+  private scopesRequestSeq = 0;
+  /**
+   * Set to the cache key of the target whose eligibility fetch failed (403,
+   * or any other non-OK/network failure), so the picker can say so instead
+   * of silently showing a different target's eligibility. Cleared on any
+   * successful fetch. Compared against the current target's key at render
+   * time, so switching away from the failed target hides the message
+   * without an explicit reset.
+   */
+  @state() private scopesErrorKey: string | null = null;
+  /**
+   * Set to "hub" when the hub answered unsupported_boundary (it predates
+   * hub eligibility): the picker then shows the catalog filtered by each
+   * scope's allowed boundaries, with a notice.
+   */
+  @state() private scopesUnsupportedKey: string | null = null;
 
   // Create dialog
   @state() private createDialogOpen = false;
   @state() private createName = '';
+  @state() private createBoundaryKind: TokenBoundaryKind = 'project';
   @state() private createProjectId = '';
   @state() private createScopes: Set<string> = new Set();
   @state() private createExpiry = '90';
+  @state() private createPurpose = '';
+  @state() private createLabels: LabelRow[] = [];
   @state() private createLoading = false;
   @state() private createError: string | null = null;
+
+  /** Search filter for the scope selector. */
+  @state() private scopeFilter = '';
+  /** Tracks which resource type groups are collapsed in the scope selector. */
+  @state() private collapsedGroups: Set<string> = new Set();
 
   // Token reveal dialog (shown once after creation)
   @state() private revealDialogOpen = false;
@@ -170,10 +1242,75 @@ export class ScionTokenList extends LitElement {
         flex-shrink: 0;
       }
 
+      .scope-selector {
+        max-height: 360px;
+        overflow-y: auto;
+        border: 1px solid var(--scion-border, #e2e8f0);
+        border-radius: var(--scion-radius, 0.5rem);
+      }
+
+      .scope-search {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        padding: 0.5rem;
+        background: var(--scion-surface, #ffffff);
+        border-bottom: 1px solid var(--scion-border, #e2e8f0);
+      }
+
+      .scope-group {
+        border-bottom: 1px solid var(--scion-border, #e2e8f0);
+      }
+
+      .scope-group:last-child {
+        border-bottom: none;
+      }
+
+      .scope-group-header {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.5rem 0.75rem;
+        cursor: pointer;
+        user-select: none;
+        background: var(--scion-bg-subtle, #f8fafc);
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        color: var(--scion-text-muted, #64748b);
+        transition: background 0.15s ease;
+      }
+
+      .scope-group-header:hover {
+        background: var(--scion-bg-subtle, #f1f5f9);
+      }
+
+      .scope-group-header sl-icon {
+        font-size: 0.75rem;
+        transition: transform 0.15s ease;
+      }
+
+      .scope-group-header sl-icon.collapsed {
+        transform: rotate(-90deg);
+      }
+
+      .scope-group-header .scope-group-count {
+        margin-left: auto;
+        font-size: 0.6875rem;
+        font-weight: 400;
+        color: var(--scion-text-muted, #94a3b8);
+      }
+
+      .scope-group-items {
+        padding: 0.25rem 0;
+      }
+
       .scope-checkboxes {
         display: grid;
         grid-template-columns: 1fr 1fr;
-        gap: 0.5rem;
+        gap: 0.25rem;
+        padding: 0 0.5rem;
       }
 
       @media (max-width: 640px) {
@@ -186,6 +1323,12 @@ export class ScionTokenList extends LitElement {
         display: flex;
         align-items: flex-start;
         gap: 0.375rem;
+        padding: 0.25rem 0.25rem;
+        border-radius: 0.25rem;
+      }
+
+      .scope-checkbox-item:hover {
+        background: var(--scion-bg-subtle, #f8fafc);
       }
 
       .scope-checkbox-item sl-checkbox {
@@ -204,6 +1347,58 @@ export class ScionTokenList extends LitElement {
         font-family: inherit;
       }
 
+      .scope-alias-item {
+        background: var(--sl-color-primary-50, #eff6ff);
+        border: 1px solid var(--sl-color-primary-200, #bfdbfe);
+        border-radius: 0.375rem;
+        margin: 0.25rem 0.5rem;
+        padding: 0.375rem 0.5rem;
+      }
+
+      .scope-alias-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+        font-size: 0.625rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        color: var(--sl-color-primary-600, #2563eb);
+        margin-top: 0.125rem;
+      }
+
+      .scope-relationship-badge {
+        display: inline-block;
+        margin-left: 0.375rem;
+        font-size: 0.625rem;
+        font-weight: 500;
+        color: var(--scion-text-muted, #64748b);
+        font-family: inherit;
+      }
+
+      .scope-ineligible-reason {
+        font-size: 0.6875rem;
+        color: var(--sl-color-danger-600, #dc2626);
+        font-family: inherit;
+      }
+
+      sl-checkbox[disabled] .scope-checkbox-label {
+        color: var(--scion-text-muted, #94a3b8);
+      }
+
+      .scope-selected-count {
+        font-size: 0.75rem;
+        color: var(--scion-text-muted, #64748b);
+        margin-top: 0.25rem;
+      }
+
+      .scope-no-results {
+        padding: 1rem;
+        text-align: center;
+        color: var(--scion-text-muted, #64748b);
+        font-size: 0.8125rem;
+      }
+
       .field-label {
         font-size: 0.875rem;
         font-weight: 500;
@@ -219,12 +1414,199 @@ export class ScionTokenList extends LitElement {
       tr.revoked td {
         opacity: 0.6;
       }
+
+      .boundary-hub {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.125rem 0.5rem;
+        border-radius: 9999px;
+        font-size: 0.6875rem;
+        font-weight: 500;
+        background: var(--sl-color-neutral-100, #f1f5f9);
+        color: var(--sl-color-neutral-700, #334155);
+      }
+
+      .token-purpose {
+        font-size: 0.75rem;
+        color: var(--scion-text-muted, #64748b);
+      }
+
+      .token-labels {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.25rem;
+        margin-top: 0.125rem;
+      }
+
+      .label-chip {
+        display: inline-flex;
+        align-items: center;
+        padding: 0 0.375rem;
+        border-radius: 0.25rem;
+        font-size: 0.6875rem;
+        font-family: var(--scion-font-mono, monospace);
+        background: var(--scion-bg-subtle, #f1f5f9);
+        color: var(--scion-text-muted, #64748b);
+        border: 1px solid var(--scion-border, #e2e8f0);
+      }
+
+      .label-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr auto;
+        gap: 0.375rem;
+        align-items: center;
+        margin-bottom: 0.375rem;
+      }
     `,
   ];
 
   override connectedCallback(): void {
     super.connectedCallback();
+    void this.loadScopes({ kind: 'project' });
     void this.loadData();
+  }
+
+  /** The target the create dialog currently lists scopes for. */
+  private currentScopesTarget(): ScopesTarget {
+    return this.createBoundaryKind === 'hub'
+      ? { kind: 'hub' }
+      : { kind: 'project', projectId: this.createProjectId };
+  }
+
+  /**
+   * Fetch scopes from /api/v1/auth/scopes and cache the result per target.
+   * For a hub target (?boundary=hub) or a chosen project (?projectId=),
+   * each entry additionally carries mint eligibility for that boundary --
+   * computed fresh by the server for the current user, never inferred or
+   * cached across targets. A project target with no project yet gets the
+   * plain catalog. Falls back to the hardcoded FALLBACK_SCOPES list (with
+   * no eligibility at all) on failure.
+   *
+   * Guards against two races when the user switches targets quickly:
+   * responses are matched against a monotonic sequence number so a slower,
+   * older request cannot overwrite state a newer one already applied, and
+   * a non-OK response never leaves a DIFFERENT target's eligibility on
+   * screen -- it falls back to the plain catalog (no eligibility) and
+   * records which target failed, for an inline message.
+   *
+   * A hub that predates hub eligibility answers unsupported_boundary; the
+   * picker then shows the catalog without the scopes a hub token may not
+   * select, and the server still checks every scope on create.
+   *
+   * Scopes are enriched with `resource` (for grouping) and `isAlias` fields.
+   * Aliases are listed first within their resource group for visual separation.
+   */
+  private async loadScopes(target: ScopesTarget): Promise<void> {
+    const seq = ++this.scopesRequestSeq;
+    const cacheKey = scopesCacheKey(target);
+    const cached = this.scopesCache.get(cacheKey);
+    if (cached) {
+      this.availableScopes = cached;
+      this.scopesErrorKey = null;
+      this.scopesUnsupportedKey = null;
+      return;
+    }
+    try {
+      let url = '/api/v1/auth/scopes';
+      if (target.kind === 'hub') {
+        url = '/api/v1/auth/scopes?boundary=hub';
+      } else if (target.projectId) {
+        url = `/api/v1/auth/scopes?projectId=${encodeURIComponent(target.projectId)}`;
+      }
+      const res = await apiFetch(url);
+      if (seq !== this.scopesRequestSeq) return; // superseded by a newer request
+      if (!res.ok) {
+        const catalog = this.scopesCache.get('') ?? [...FALLBACK_SCOPES];
+        if (target.kind === 'hub' && res.status === 400) {
+          const info = await parseApiError(res, '');
+          if (seq !== this.scopesRequestSeq) return; // superseded while parsing
+          if (info.code === 'unsupported_boundary') {
+            this.availableScopes = filterScopesForBoundary(catalog, 'hub');
+            this.scopesErrorKey = null;
+            this.scopesUnsupportedKey = cacheKey;
+            return;
+          }
+        }
+        // Never keep a different target's eligibility on screen: fall
+        // back to the plain catalog (server enforcement still applies
+        // regardless of what this picker shows) and surface the failure --
+        // only when a boundary was requested; the parameterless catalog
+        // call has nothing to blame. Leave out the scopes a token of the
+        // target's boundary may not select, as on the path above; the
+        // cached catalog itself stays unfiltered.
+        this.availableScopes = filterScopesForBoundary(catalog, target.kind);
+        this.scopesUnsupportedKey = null;
+        if (cacheKey) this.scopesErrorKey = cacheKey;
+        return;
+      }
+      const data = (await res.json()) as {
+        scopes?: Array<{
+          id: string;
+          resource: string;
+          action: string;
+          description: string;
+          allowedBoundaries?: string[];
+          eligibilityKind?: string;
+          eligibility?: { eligible: boolean; reason?: string };
+        }>;
+        aliases?: Array<{
+          id: string;
+          description: string;
+          expands_to: string[];
+          eligibility?: { eligible: boolean; ineligibleMembers?: string[] };
+        }>;
+      };
+      if (seq !== this.scopesRequestSeq) return; // superseded while parsing
+      const scopes: ScopeOption[] = [];
+      for (const s of data.scopes || []) {
+        scopes.push({
+          value: s.id,
+          label: s.id,
+          description: s.description,
+          resource: s.resource,
+          isAlias: false,
+          allowedBoundaries: s.allowedBoundaries,
+          eligibilityKind: s.eligibilityKind,
+          eligible: s.eligibility?.eligible,
+          eligibilityReason: s.eligibility?.reason,
+        });
+      }
+      for (const a of data.aliases || []) {
+        // Extract resource from the alias id (e.g. "agent:manage" -> "agent")
+        const resource = a.id.split(':')[0];
+        scopes.push({
+          value: a.id,
+          label: a.id,
+          description: a.description,
+          resource,
+          isAlias: true,
+          expandsTo: a.expands_to,
+          eligible: a.eligibility?.eligible,
+          ineligibleMembers: a.eligibility?.ineligibleMembers,
+        });
+      }
+      // Sort: aliases first within each resource, then alphabetically
+      scopes.sort((a, b) => {
+        if (a.resource !== b.resource) return a.resource.localeCompare(b.resource);
+        // Aliases before individual scopes within a group
+        if (a.isAlias !== b.isAlias) return a.isAlias ? -1 : 1;
+        return a.value.localeCompare(b.value);
+      });
+      // Apply the result even when it is empty, so a target with no
+      // eligible scopes replaces the previous target's list instead of
+      // leaving it on screen.
+      this.scopesCache.set(cacheKey, scopes);
+      this.availableScopes = scopes;
+      this.scopesErrorKey = null;
+      this.scopesUnsupportedKey = null;
+    } catch {
+      if (seq !== this.scopesRequestSeq) return; // superseded before the catch
+      const catalog = this.scopesCache.get('') ?? [...FALLBACK_SCOPES];
+      this.availableScopes = filterScopesForBoundary(catalog, target.kind);
+      this.scopesUnsupportedKey = null;
+      if (cacheKey) this.scopesErrorKey = cacheKey;
+      console.warn('Failed to fetch scopes from /api/v1/auth/scopes');
+    }
   }
 
   private async loadData(): Promise<void> {
@@ -262,6 +1644,21 @@ export class ScionTokenList extends LitElement {
     return project?.name || project?.slug || projectId;
   }
 
+  /** The Boundary cell: a Hub badge, the project name, or "Unknown". */
+  private renderBoundaryCell(token: AccessToken) {
+    const kind = tokenBoundaryKind(token);
+    if (kind === 'hub') {
+      return html`<sl-tooltip content="Any project you can currently access">
+        <span class="boundary-hub">Hub</span>
+      </sl-tooltip>`;
+    }
+    const projectId = token.boundary?.projectId || token.projectId || '';
+    if (kind === 'project' && projectId) {
+      return html`<span class="project-name">${this.getProjectName(projectId)}</span>`;
+    }
+    return html`<span class="project-name">Unknown</span>`;
+  }
+
   private getTokenStatus(token: AccessToken): 'revoked' | 'expired' | 'active' {
     if (token.revoked) return 'revoked';
     if (token.expiresAt && new Date(token.expiresAt) < new Date()) return 'expired';
@@ -272,18 +1669,68 @@ export class ScionTokenList extends LitElement {
 
   private openCreateDialog(): void {
     this.createName = '';
+    this.createBoundaryKind = 'project';
     this.createProjectId = this.projects.length === 1 ? this.projects[0].id : '';
     this.createScopes = new Set();
     this.createExpiry = '90';
+    this.createPurpose = '';
+    this.createLabels = [];
     this.createError = null;
+    this.scopeFilter = '';
+    this.collapsedGroups = new Set();
     this.createDialogOpen = true;
+    void this.loadScopes(this.currentScopesTarget());
+  }
+
+  private handleBoundaryChange(kind: TokenBoundaryKind): void {
+    if (kind === this.createBoundaryKind) return;
+    this.createBoundaryKind = kind;
+    // Eligibility differs per boundary; clear the selection rather than
+    // silently submitting scopes chosen for the other boundary.
+    this.createScopes = new Set();
+    void this.loadScopes(this.currentScopesTarget());
+  }
+
+  private handleProjectChange(projectId: string): void {
+    this.createProjectId = projectId;
+    // Selected scopes may no longer be eligible under the new project;
+    // clear them rather than silently submitting a stale selection.
+    this.createScopes = new Set();
+    void this.loadScopes(this.currentScopesTarget());
+  }
+
+  private addLabelRow(): void {
+    if (this.createLabels.length >= MAX_TOKEN_LABELS) return;
+    this.createLabels = [...this.createLabels, { key: '', value: '' }];
+  }
+
+  private updateLabelRow(index: number, field: keyof LabelRow, value: string): void {
+    this.createLabels = this.createLabels.map((row, i) =>
+      i === index ? { ...row, [field]: value } : row
+    );
+  }
+
+  private removeLabelRow(index: number): void {
+    this.createLabels = this.createLabels.filter((_, i) => i !== index);
   }
 
   private closeCreateDialog(): void {
     this.createDialogOpen = false;
   }
 
+  private toggleGroup(resource: string): void {
+    const next = new Set(this.collapsedGroups);
+    if (next.has(resource)) {
+      next.delete(resource);
+    } else {
+      next.add(resource);
+    }
+    this.collapsedGroups = next;
+  }
+
   private toggleScope(scope: string): void {
+    const option = this.availableScopes.find((s) => s.value === scope);
+    if (option?.eligible === false) return; // defense in depth; checkbox is also disabled
     const next = new Set(this.createScopes);
     if (next.has(scope)) {
       next.delete(scope);
@@ -301,13 +1748,26 @@ export class ScionTokenList extends LitElement {
       this.createError = 'Name is required';
       return;
     }
-    if (!this.createProjectId) {
+    const isHub = this.createBoundaryKind === 'hub';
+    if (!isHub && !this.createProjectId) {
       this.createError = 'Project is required';
       return;
     }
 
     if (this.createScopes.size === 0) {
       this.createError = 'At least one scope is required';
+      return;
+    }
+
+    // Client-side hints only; the server validates purpose and labels.
+    const purpose = this.createPurpose.trim();
+    if (new TextEncoder().encode(purpose).length > MAX_TOKEN_PURPOSE_BYTES) {
+      this.createError = `Purpose must be at most ${MAX_TOKEN_PURPOSE_BYTES} bytes`;
+      return;
+    }
+    const { labels, error: labelsError } = buildTokenLabels(this.createLabels);
+    if (labelsError) {
+      this.createError = labelsError;
       return;
     }
 
@@ -319,19 +1779,31 @@ export class ScionTokenList extends LitElement {
       const expiresAt = new Date();
       expiresAt.setDate(expiresAt.getDate() + days);
 
+      const body: Record<string, unknown> = {
+        name,
+        boundary: isHub ? { kind: 'hub' } : { kind: 'project', projectId: this.createProjectId },
+        scopes: Array.from(this.createScopes),
+        expiresAt: expiresAt.toISOString(),
+      };
+      if (purpose) body.purpose = purpose;
+      if (labels) body.labels = labels;
+
       const response = await apiFetch('/api/v1/auth/tokens', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name,
-          projectId: this.createProjectId,
-          scopes: Array.from(this.createScopes),
-          expiresAt: expiresAt.toISOString(),
-        }),
+        body: JSON.stringify(body),
       });
 
       if (!response.ok) {
-        throw new Error(await extractApiError(response, 'Failed to create token'));
+        const info = await parseApiError(response, 'Failed to create token');
+        let message = info.message;
+        // scope_violation carries {selector, reason} (ptone/scion#2122); name
+        // the denied selector so the user knows which checkbox to remove,
+        // without duplicating the server's reason vocabulary here.
+        if (info.code === 'scope_violation' && typeof info.details?.selector === 'string') {
+          message = `${message} (scope: ${info.details.selector})`;
+        }
+        throw new Error(message);
       }
 
       const data = (await response.json()) as { token: string };
@@ -428,44 +1900,6 @@ export class ScionTokenList extends LitElement {
 
   // ── Formatting ─────────────────────────────────────────────────────
 
-  private formatRelativeTime(dateString: string): string {
-    try {
-      const date = new Date(dateString);
-      if (isNaN(date.getTime())) return dateString;
-      const diffMs = Date.now() - date.getTime();
-      const diffSeconds = Math.round(diffMs / 1000);
-      const diffMinutes = Math.round(diffMs / (1000 * 60));
-      const diffHours = Math.round(diffMs / (1000 * 60 * 60));
-      const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
-
-      const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
-
-      if (Math.abs(diffSeconds) < 60) {
-        return rtf.format(-diffSeconds, 'second');
-      } else if (Math.abs(diffMinutes) < 60) {
-        return rtf.format(-diffMinutes, 'minute');
-      } else if (Math.abs(diffHours) < 24) {
-        return rtf.format(-diffHours, 'hour');
-      } else {
-        return rtf.format(-diffDays, 'day');
-      }
-    } catch {
-      return dateString;
-    }
-  }
-
-  private formatDate(dateString: string): string {
-    try {
-      return new Date(dateString).toLocaleDateString('en-US', {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
-      });
-    } catch {
-      return dateString;
-    }
-  }
-
   // ── Rendering ──────────────────────────────────────────────────────
 
   override render() {
@@ -511,8 +1945,8 @@ export class ScionTokenList extends LitElement {
         <sl-icon name="key"></sl-icon>
         <h3>No Access Tokens</h3>
         <p>
-          Create personal access tokens to authenticate CI/CD pipelines and automation tools with
-          your projects.
+          Create user access tokens to authenticate CI/CD pipelines and automation tools with one
+          project, or with every project you can currently access.
         </p>
         <sl-button variant="primary" size="small" @click=${this.openCreateDialog}>
           <sl-icon slot="prefix" name="plus-lg"></sl-icon>
@@ -530,7 +1964,7 @@ export class ScionTokenList extends LitElement {
             <tr>
               <th>Name</th>
               <th>Status</th>
-              <th class="hide-mobile">Project</th>
+              <th class="hide-mobile">Boundary</th>
               <th class="hide-mobile">Scopes</th>
               <th class="hide-mobile">Created</th>
               <th class="hide-mobile">Last Used</th>
@@ -563,6 +1997,14 @@ export class ScionTokenList extends LitElement {
             <div>
               ${token.name}
               <div class="project-name">${token.prefix}</div>
+              ${token.purpose ? html`<div class="token-purpose">${token.purpose}</div>` : nothing}
+              ${token.labels && Object.keys(token.labels).length > 0
+                ? html`<div class="token-labels">
+                    ${Object.entries(token.labels)
+                      .sort(([a], [b]) => a.localeCompare(b))
+                      .map(([key, value]) => html`<span class="label-chip">${key}=${value}</span>`)}
+                  </div>`
+                : nothing}
             </div>
           </div>
         </td>
@@ -573,25 +2015,25 @@ export class ScionTokenList extends LitElement {
               ? html`<span class="status-expired">Expired</span>`
               : html`<span class="status-active">Active</span>`}
         </td>
-        <td class="hide-mobile">
-          <span class="project-name">${this.getProjectName(token.projectId)}</span>
-        </td>
+        <td class="hide-mobile">${this.renderBoundaryCell(token)}</td>
         <td class="hide-mobile">
           <div class="scopes-cell">
             ${token.scopes.map((scope) => html`<span class="scope-badge">${scope}</span>`)}
           </div>
         </td>
         <td class="hide-mobile">
-          <span class="meta-text">${this.formatRelativeTime(token.created)}</span>
+          <span class="meta-text">${formatRelative(token.created)}</span>
         </td>
         <td class="hide-mobile">
           <span class="meta-text">
-            ${token.lastUsed ? this.formatRelativeTime(token.lastUsed) : '\u2014'}
+            ${token.lastUsed ? formatRelative(token.lastUsed) : '\u2014'}
           </span>
         </td>
         <td>
           <span class="meta-text">
-            ${token.expiresAt ? this.formatDate(token.expiresAt) : '\u2014'}
+            ${token.expiresAt
+              ? formatInstantWithZone(token.expiresAt) || token.expiresAt
+              : '\u2014'}
           </span>
         </td>
         <td class="actions-cell">
@@ -616,7 +2058,27 @@ export class ScionTokenList extends LitElement {
     `;
   }
 
+  /**
+   * Filter scopes by the current search term, matching against
+   * the scope value, description, or resource type label.
+   */
+  private getFilteredScopes(): ScopeOption[] {
+    const filter = this.scopeFilter.toLowerCase().trim();
+    if (!filter) return this.availableScopes;
+    return this.availableScopes.filter(
+      (scope) =>
+        scope.value.toLowerCase().includes(filter) ||
+        scope.description.toLowerCase().includes(filter) ||
+        (RESOURCE_TYPE_LABELS[scope.resource] || scope.resource).toLowerCase().includes(filter)
+    );
+  }
+
   private renderCreateDialog() {
+    const filteredScopes = this.getFilteredScopes();
+    const groups = groupScopesByResource(filteredScopes);
+    const isHub = this.createBoundaryKind === 'hub';
+    const scopesKey = scopesCacheKey(this.currentScopesTarget());
+
     return html`
       <sl-dialog
         label="Create Access Token"
@@ -634,40 +2096,83 @@ export class ScionTokenList extends LitElement {
             required
           ></sl-input>
 
-          <sl-select
-            label="Project"
-            placeholder="Select a project"
-            value=${this.createProjectId}
+          <sl-radio-group
+            class="boundary-choice"
+            label="Boundary"
+            .value=${this.createBoundaryKind}
             @sl-change=${(e: Event) => {
-              this.createProjectId = (e.target as HTMLSelectElement).value;
+              this.handleBoundaryChange((e.target as HTMLInputElement).value as TokenBoundaryKind);
             }}
-            required
           >
-            ${this.projects.map(
-              (project) =>
-                html`<sl-option value=${project.id}
-                  >${project.name || project.slug || project.id}</sl-option
-                >`
-            )}
-          </sl-select>
+            <sl-radio value="project">Project</sl-radio>
+            <sl-radio value="hub">Hub: any project you can currently access</sl-radio>
+          </sl-radio-group>
+
+          ${isHub
+            ? nothing
+            : html`<sl-select
+                label="Project"
+                placeholder="Select a project"
+                value=${this.createProjectId}
+                @sl-change=${(e: Event) => {
+                  this.handleProjectChange((e.target as HTMLSelectElement).value);
+                }}
+                required
+              >
+                ${this.projects.map(
+                  (project) =>
+                    html`<sl-option value=${project.id}
+                      >${project.name || project.slug || project.id}</sl-option
+                    >`
+                )}
+              </sl-select>`}
+
+          <div class="dialog-hint reach-note">
+            Scopes set the most a token can do. Each request is allowed only if the token has the
+            scope and your account currently has that access. If your access changes, the token's
+            reach changes with it.
+          </div>
 
           <div>
-            <div class="field-label">Scopes</div>
-            <div class="scope-checkboxes">
-              ${AVAILABLE_SCOPES.map(
-                (scope) => html`
-                  <div class="scope-checkbox-item">
-                    <sl-checkbox
-                      ?checked=${this.createScopes.has(scope.value)}
-                      @sl-change=${() => this.toggleScope(scope.value)}
-                    >
-                      <span class="scope-checkbox-label">${scope.label}</span>
-                      <br />
-                      <span class="scope-checkbox-desc">${scope.description}</span>
-                    </sl-checkbox>
-                  </div>
-                `
-              )}
+            <div class="field-label">
+              Scopes
+              ${this.createScopes.size > 0
+                ? html`<span class="scope-selected-count"
+                    >(${this.createScopes.size} selected)</span
+                  >`
+                : nothing}
+            </div>
+            ${this.scopesErrorKey && this.scopesErrorKey === scopesKey
+              ? html`<div class="dialog-error">
+                  Could not check which scopes you can select for this
+                  ${isHub ? 'hub token' : 'project'}. Showing the catalog with no eligibility -- the
+                  server still enforces access when you submit.
+                </div>`
+              : nothing}
+            ${this.scopesUnsupportedKey && this.scopesUnsupportedKey === scopesKey
+              ? html`<div class="dialog-hint scopes-unsupported">
+                  Eligibility is not available on this hub; the server checks scopes when you create
+                  the token.
+                </div>`
+              : nothing}
+            <div class="scope-selector">
+              <div class="scope-search">
+                <sl-input
+                  aria-label="Filter scopes"
+                  placeholder="Filter scopes..."
+                  size="small"
+                  clearable
+                  value=${this.scopeFilter}
+                  @sl-input=${(e: Event) => {
+                    this.scopeFilter = (e.target as HTMLInputElement).value;
+                  }}
+                >
+                  <sl-icon name="search" slot="prefix"></sl-icon>
+                </sl-input>
+              </div>
+              ${groups.length === 0
+                ? html`<div class="scope-no-results">No scopes match "${this.scopeFilter}"</div>`
+                : groups.map(([resource, scopes]) => this.renderScopeGroup(resource, scopes))}
             </div>
           </div>
 
@@ -684,6 +2189,62 @@ export class ScionTokenList extends LitElement {
             <sl-option value="180">180 days</sl-option>
             <sl-option value="365">365 days (maximum)</sl-option>
           </sl-select>
+
+          <sl-input
+            label="Purpose (optional)"
+            help-text="Descriptive only. Cannot be changed after creation."
+            placeholder="e.g. nightly deploy from CI"
+            value=${this.createPurpose}
+            @sl-input=${(e: Event) => {
+              this.createPurpose = (e.target as HTMLInputElement).value;
+            }}
+          ></sl-input>
+
+          <div class="labels-editor">
+            <div class="field-label">Labels (optional)</div>
+            ${this.createLabels.map(
+              (row, i) => html`
+                <div class="label-row">
+                  <sl-input
+                    size="small"
+                    aria-label="Label key"
+                    placeholder="key"
+                    value=${row.key}
+                    @sl-input=${(e: Event) => {
+                      this.updateLabelRow(i, 'key', (e.target as HTMLInputElement).value);
+                    }}
+                  ></sl-input>
+                  <sl-input
+                    size="small"
+                    aria-label="Label value"
+                    placeholder="value"
+                    value=${row.value}
+                    @sl-input=${(e: Event) => {
+                      this.updateLabelRow(i, 'value', (e.target as HTMLInputElement).value);
+                    }}
+                  ></sl-input>
+                  <sl-icon-button
+                    name="x-lg"
+                    label="Remove label"
+                    @click=${() => this.removeLabelRow(i)}
+                  ></sl-icon-button>
+                </div>
+              `
+            )}
+            <sl-button
+              size="small"
+              variant="text"
+              ?disabled=${this.createLabels.length >= MAX_TOKEN_LABELS}
+              @click=${this.addLabelRow}
+            >
+              <sl-icon slot="prefix" name="plus-lg"></sl-icon>
+              Add label
+            </sl-button>
+            <div class="scope-selected-count">
+              Up to ${MAX_TOKEN_LABELS} key=value labels. Labels describe the token; they do not
+              identify an agent. Cannot be changed after creation.
+            </div>
+          </div>
 
           ${this.createError ? html`<div class="dialog-error">${this.createError}</div>` : nothing}
         </form>
@@ -709,6 +2270,106 @@ export class ScionTokenList extends LitElement {
     `;
   }
 
+  private renderScopeGroup(resource: string, scopes: ScopeOption[]) {
+    const isCollapsed = this.collapsedGroups.has(resource);
+    const label = RESOURCE_TYPE_LABELS[resource] || resource;
+    const selectedInGroup = scopes.filter((s) => this.createScopes.has(s.value)).length;
+    const aliases = scopes.filter((s) => s.isAlias);
+    const regularScopes = scopes.filter((s) => !s.isAlias);
+
+    return html`
+      <div class="scope-group">
+        <div
+          class="scope-group-header"
+          @click=${() => this.toggleGroup(resource)}
+          role="button"
+          tabindex="0"
+          aria-expanded=${!isCollapsed}
+          @keydown=${(e: KeyboardEvent) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              this.toggleGroup(resource);
+            }
+          }}
+        >
+          <sl-icon name="chevron-down" class=${isCollapsed ? 'collapsed' : ''}></sl-icon>
+          ${label}
+          <span class="scope-group-count"
+            >${selectedInGroup > 0 ? `${selectedInGroup}/` : ''}${scopes.length}</span
+          >
+        </div>
+        ${isCollapsed
+          ? nothing
+          : html`
+              <div class="scope-group-items">
+                ${aliases.map((scope) => this.renderAliasScope(scope))}
+                <div class="scope-checkboxes">
+                  ${regularScopes.map((scope) => this.renderScopeCheckbox(scope))}
+                </div>
+              </div>
+            `}
+      </div>
+    `;
+  }
+
+  private renderAliasScope(scope: ScopeOption) {
+    const ineligible = scope.eligible === false;
+    return html`
+      <div class="scope-alias-item">
+        <sl-checkbox
+          ?checked=${this.createScopes.has(scope.value)}
+          ?disabled=${ineligible}
+          @sl-change=${() => this.toggleScope(scope.value)}
+        >
+          <span class="scope-checkbox-label">${scope.label}</span>
+          <br />
+          <span class="scope-checkbox-desc">${scope.description}</span>
+          <br />
+          <span class="scope-alias-badge">
+            <sl-icon name="collection"></sl-icon>
+            Alias${scope.expandsTo ? ` — expands to ${scope.expandsTo.length} scopes` : ''}
+          </span>
+          ${ineligible
+            ? html`<br /><span class="scope-ineligible-reason"
+                  >Not
+                  selectable${scope.ineligibleMembers?.length
+                    ? `: missing ${scope.ineligibleMembers.join(', ')}`
+                    : ''}</span
+                >`
+            : nothing}
+        </sl-checkbox>
+      </div>
+    `;
+  }
+
+  private renderScopeCheckbox(scope: ScopeOption) {
+    const ineligible = scope.eligible === false;
+    return html`
+      <div class="scope-checkbox-item">
+        <sl-checkbox
+          ?checked=${this.createScopes.has(scope.value)}
+          ?disabled=${ineligible}
+          @sl-change=${() => this.toggleScope(scope.value)}
+        >
+          <span class="scope-checkbox-label">${scope.label}</span>
+          ${scope.eligibilityKind === 'relationship'
+            ? html`<span class="scope-relationship-badge"
+                >${relationshipBadgeText(scope.value)}</span
+              >`
+            : nothing}
+          <br />
+          <span class="scope-checkbox-desc">${scope.description}</span>
+          ${ineligible
+            ? html`<br /><span class="scope-ineligible-reason"
+                  >Not selectable:
+                  ${formatEligibilityReason(scope.eligibilityReason, this.createBoundaryKind)}</span
+                >`
+            : nothing}
+        </sl-checkbox>
+      </div>
+    `;
+  }
+
   private renderRevealDialog() {
     return html`
       <sl-dialog
@@ -716,6 +2377,10 @@ export class ScionTokenList extends LitElement {
         ?open=${this.revealDialogOpen}
         @sl-request-close=${() => {
           this.revealDialogOpen = false;
+        }}
+        @sl-after-hide=${(e: Event) => {
+          // Keep the token value only while the dialog is shown.
+          if (e.target === e.currentTarget) this.revealToken = '';
         }}
       >
         <div class="token-reveal">

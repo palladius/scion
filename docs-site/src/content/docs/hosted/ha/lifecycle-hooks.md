@@ -45,9 +45,27 @@ A hook fires on exactly one of these authoritative phase transitions:
 | `suspended` | Agent transitions to the suspended phase  |
 | `stopped`   | Agent transitions to the stopped phase    |
 | `error`     | Agent transitions to the error phase      |
+| `halted`    | The platform halts the agent (see below)  |
 
 Only *transitions* fire hooks. Repeated publications of the same phase (for
 example, heartbeats) are de-duplicated and do not re-fire.
+
+A failed delete can also fire `stopped`, because when the agent's launch or start
+ended while the delete was in progress, the failed delete restores the agent as
+stopped (a real transition) rather than to its earlier phase.
+
+### The `halted` trigger
+
+An agent is [halted](/scion/concepts/#halted-phase-the-platform-ended-the-run)
+when the platform ends a run that should still be running (for example a
+preempted or evicted pod, or an OOM kill). A halt fires the `halted` hooks
+once. When the halt replaces a write that would have stored `stopped` or
+`error`, the hooks for that trigger fire too, exactly as they would have
+without the halt. So existing `stopped` and `error` hooks, such as registry
+deregistration, keep firing for halted agents. When the agent was already
+`stopped` or `error` and a later report shows why it ended (for example an
+OOM kill reported after the crash), only the `halted` hooks fire: the
+`stopped` or `error` hooks already fired for that run.
 
 ## Admin CRUD API
 
@@ -175,6 +193,52 @@ At execution time, the executor resolves the record ID to the SA email, then use
 GCP IAM impersonation to generate a short-lived access token. This token is
 attached as a bearer token to `http`-type requests only.
 
+### The writer's authority is re-checked every time a token is minted
+
+Creating or updating a hook with an execution identity requires
+`hub.lifecycle_hooks.update` and, when the GCP IAM check is enforced, the
+writer's own `iam.serviceAccounts.actAs` permission on the service account.
+Before each token is minted for an `http` action, the Hub checks these again
+for the hook's **writer**: the user recorded in the hook's `createdBy` field.
+The token is minted only if all of the following hold:
+
+1. `createdBy` names an existing, active user, matched by email. A user who
+   is suspended, invited or deleted does not qualify. Neither does a user
+   created after the hook, even one with the same email.
+2. That user still holds `hub.lifecycle_hooks.update`.
+3. The service account is still verified and still in the hook's scope.
+4. When the GCP IAM check is enforced, that user can still act as the service
+   account. When the check is off, this step is skipped, as it is when the
+   hook is written.
+
+If any check fails, the request is **not sent**. The execution audit records
+a failure that starts with `hook writer no longer authorized` and names the
+check that failed: `writer_missing`, `writer_not_found`,
+`writer_newer_than_hook`, `writer_inactive`, `writer_lacks_permission`,
+`identity_not_admissible` or `writer_actas_denied`. The agent's state change
+is not affected. To keep a hook's log volume bounded, the refusal is recorded
+at most once every 10 minutes per hook and cause. The next record says how
+many refusals were left out.
+
+`webhook` actions mint no token and are not re-checked.
+
+**Remedy.** A hook stops minting when its writer is deleted, suspended,
+removed from the role that grants `hub.lifecycle_hooks.update`, or loses
+`actAs`. It also stops when the writer's email changes, for example when
+their identity provider reports a new address. Updating the hook does not
+change its writer, so a hook another admin re-saved still depends on its
+creator. To restore the hook, an admin who holds the authority today deletes
+it and creates it again. The new hook records that admin as its writer.
+
+**Hubs that use development authentication.** The development user's stored
+email is set when the Hub first starts with development authentication and is
+not updated afterwards. Hooks record the email of the development identity the
+Hub is configured with now (its configured email, or `<username>@localhost`).
+If the two differ, every `http` hook that identity writes fails with
+`writer_not_found`, and re-creating the hook does not help. To fix this, make
+the configured development email match the stored one again, or update the
+stored user's email to the configured one.
+
 ## Scope vs. selector
 
 Two fields determine where a hook applies, and they are not interchangeable:
@@ -218,6 +282,7 @@ may appear in the URL, headers, and body.
 | `TRIGGER`      | Trigger that fired (`running`, etc.) |
 | `PROJECT_ID`   | Agent's project ID                   |
 | `PROJECT_NAME` | Agent's project name                 |
+| `PROJECT_SLUG` | Agent's project slug                 |
 | `AGENT_ID`     | Agent record ID                      |
 | `AGENT_SLUG`   | Agent slug (hub-controlled)          |
 | `SA_EMAIL`     | Resolved SA email                    |
@@ -232,7 +297,8 @@ are subject to strict encoding rules.
 | `AGENT_NAME`   | Agent display name  |
 | `TASK_SUMMARY` | Agent task summary  |
 | `AGENT_STATUS` | Agent phase string  |
-| `ERROR_MSG`    | Agent error message |
+| `ERROR_MSG`    | Agent error message (not set for `halted`) |
+| `EXIT_REASON`  | Agent exit reason, one of a fixed set (for example `preempted`, `oom_killed`); not set for the agent-reported `signaled` |
 
 Security rules for untrusted variables:
 
@@ -375,6 +441,74 @@ deregisters it when it stops.
 You can add matching deregister hooks for the `suspended` and `error` triggers to
 ensure agents are removed from the registry in all terminal and inactive states.
 
+## Example: Google Cloud Agent Registry Integration
+
+Lifecycle hooks can register agents as A2A endpoints in the
+[Google Cloud Agent Registry](https://cloud.google.com/products/agent-registry) (preview).
+When an agent starts, a hook creates a Service in Agent Registry with
+an A2A Agent Card pointing to the agent's specific endpoint on the A2A
+Bridge. When the agent stops, another hook deletes the Service.
+
+### Prerequisites
+
+- A GCP service account with the `agentregistry.editor` role on the
+  target GCP project, registered as a managed SA in the Scion Hub.
+- The A2A Bridge deployed and accessible at an external URL.
+- `PROJECT_SLUG` and `AGENT_SLUG` variables are automatically available
+  as trusted lifecycle-hook variables.
+
+### Register hook (fires on `running`)
+
+The hook body constructs an A2A Agent Card with the per-agent endpoint
+URL from the A2A Bridge using the `PROJECT_SLUG` and `AGENT_SLUG`
+variables. The `serviceId` query parameter uses a deterministic name
+so the same hook can cleanly deregister.
+
+```json
+{
+  "name": "agent-registry-register",
+  "scopeType": "hub",
+  "trigger": "running",
+  "action": {
+    "type": "http",
+    "method": "POST",
+    "url": "https://agentregistry.googleapis.com/v1alpha/projects/<gcp-project>/locations/<region>/services?serviceId=scion-${PROJECT_SLUG}-${AGENT_SLUG}",
+    "headers": { "Content-Type": "application/json" },
+    "body": "{\"displayName\":\"Scion Agent: ${PROJECT_SLUG}/${AGENT_SLUG}\",\"agentSpec\":{\"type\":\"A2A_AGENT_CARD\",\"content\":{\"name\":\"${AGENT_SLUG}\",\"description\":\"Scion agent ${AGENT_SLUG} in project ${PROJECT_SLUG}\",\"version\":\"1.0.0\",\"supportedInterfaces\":[{\"url\":\"https://<a2a-bridge-url>/projects/${PROJECT_SLUG}/agents/${AGENT_SLUG}\",\"protocolBinding\":\"JSONRPC\",\"protocolVersion\":\"0.3\"}],\"capabilities\":{\"streaming\":true,\"pushNotifications\":true},\"defaultInputModes\":[\"text/plain\",\"application/json\"],\"defaultOutputModes\":[\"text/plain\",\"application/json\"],\"skills\":[{\"id\":\"${AGENT_SLUG}\",\"name\":\"${AGENT_SLUG}\",\"description\":\"Interact with agent ${AGENT_SLUG}\",\"tags\":[\"scion\",\"a2a\"]}],\"provider\":{\"organization\":\"Scion\",\"url\":\"https://github.com/GoogleCloudPlatform/scion\"}}}}",
+    "onError": "retry",
+    "timeoutSeconds": 15
+  },
+  "executionIdentity": "<sa-record-id>",
+  "enabled": true
+}
+```
+
+### Deregister hook (fires on `stopped`)
+
+```json
+{
+  "name": "agent-registry-deregister",
+  "scopeType": "hub",
+  "trigger": "stopped",
+  "action": {
+    "type": "http",
+    "method": "DELETE",
+    "url": "https://agentregistry.googleapis.com/v1alpha/projects/<gcp-project>/locations/<region>/services/scion-${PROJECT_SLUG}-${AGENT_SLUG}",
+    "headers": { "Content-Type": "application/json" },
+    "onError": "retry",
+    "timeoutSeconds": 15
+  },
+  "executionIdentity": "<sa-record-id>",
+  "enabled": true
+}
+```
+
+Add similar deregister hooks for the `suspended` and `error` triggers
+to ensure agents are removed from Agent Registry in all inactive states.
+
+Replace `<gcp-project>`, `<region>`, `<a2a-bridge-url>`, and
+`<sa-record-id>` with your actual values.
+
 ---
 
 ## In-Container Pre-Start Customization Hooks
@@ -449,6 +583,6 @@ Deleting or updating a hook only affects **future** agents. Agents already creat
 The following are intentionally **not** part of the first release:
 
 - `script` action types for **Hub-side lifecycle hooks** (only `http` and `webhook` are supported for Hub-side hooks; use **In-Container Pre-Start Customization Hooks** for in-container scripting).
-- Activity-change triggers for Hub-side hooks (only the four authoritative phase transitions fire hooks).
+- Activity-change triggers for Hub-side hooks (only the five authoritative phase transitions fire hooks).
 - Project-scoped Hub-side lifecycle hooks (`scopeType` is `hub` in v1; `project` is reserved for a future release — use the project-id selector to target specific projects instead).
 - Agent-label selectors (selectors match on `projectId` and `template` only).

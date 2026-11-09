@@ -21,34 +21,110 @@
  * `scion:access-denied` CustomEvent on the window when a 403 response is
  * received, allowing the app shell to display a toast notification.
  *
- * This is additive — existing components can continue using fetch() directly.
- * Phase 3 will migrate them to apiFetch().
+ * Every request from web/src goes through apiFetch(); ESLint
+ * (web/eslint.config.mjs) refuses a direct fetch() there except at the few
+ * commented exceptions (ptone/scion#353). A caller with its own handling
+ * of 401 and 403 passes `authErrors: 'caller'`.
  */
+
+import { dispatchTeardown } from '../utils/auth.js';
+import { recordHubDateHeader } from '../shared/hub-clock.js';
+import { loadPage } from './navigation.js';
 
 /** Detail payload for the scion:access-denied custom event. */
 export interface AccessDeniedDetail {
-  resource?: string;
-  action?: string;
-  reason?: string;
+  resource?: string | undefined;
+  action?: string | undefined;
+  reason?: string | undefined;
 }
+
+/** The parts of a 403 response body read by the access-denied handling. */
+interface AccessDeniedBody {
+  error?:
+    | {
+        code?: string;
+        message?: string;
+        details?: { denied_action?: string; resource_type?: string };
+      }
+    | string;
+  message?: string;
+}
+
+/**
+ * Fire the account-teardown event when we detect session expiry.
+ * Guarded against double-dispatch: the flag is shared with the redirect guard.
+ */
+let authExpiredTeardownDispatched = false;
+function dispatchAuthExpiredTeardown(): void {
+  if (authExpiredTeardownDispatched) return;
+  authExpiredTeardownDispatched = true;
+  dispatchTeardown('auth-expired');
+}
+
+/** Options for {@link apiFetch}, extending the standard RequestInit. */
+export interface ApiFetchOptions extends RequestInit {
+  /**
+   * When true, suppress the global `scion:access-denied` toast for 403 responses.
+   * Use this when the calling component renders the error inline (e.g. dialog error div,
+   * sl-alert) to prevent duplicate notifications (RC-C fix).
+   */
+  suppressAccessDeniedToast?: boolean;
+  /**
+   * Who handles a 401 or 403 answer. 'global' (the default): apiFetch
+   * redirects to the login page on a 401, and on a 403 reloads the page for
+   * a suspended account or dispatches `scion:access-denied`. 'caller':
+   * apiFetch does none of that and returns the response as is, for a caller
+   * that reads those statuses itself (a boot probe that may run signed out,
+   * a session check, a purpose-built 403 UI).
+   */
+  authErrors?: 'global' | 'caller';
+}
+
+/**
+ * User-safe reason for a 403 whose body could not be read because the
+ * request was aborted mid-read. Distinct from a server-sent 'Access denied'
+ * reason, which the toast shows as written; formatAccessDenied treats this
+ * one as generic.
+ */
+export const ACCESS_DENIED_UNREADABLE_REASON = "You don't have permission to perform this action.";
 
 /**
  * Fetch wrapper that includes credentials and handles 403 responses.
  *
  * Returns the raw Response object so callers can handle the body themselves.
  * On 403, dispatches a `scion:access-denied` event on `window` with parsed
- * error details, but does NOT re-throw or alter the response.
+ * error details (unless `suppressAccessDeniedToast` is set), but does NOT
+ * re-throw or alter the response.
  */
 const API_SLOW_THRESHOLD_MS = 2000;
 let sessionExpiredRedirectPending = false;
 
-export async function apiFetch(path: string, options?: RequestInit): Promise<Response> {
+/**
+ * When true, a `user_suspended` API response has been received and a full
+ * page reload is in progress. All subsequent 403 handling is suppressed to
+ * prevent a toast avalanche from concurrent API/SSE requests that each
+ * return the same denial.
+ */
+let userSuspendedRedirectPending = false;
+
+/** Exported for testing — resets the internal suspension redirect flag. */
+export function _resetSuspendedState(): void {
+  userSuspendedRedirectPending = false;
+}
+
+export async function apiFetch(path: string, options?: ApiFetchOptions): Promise<Response> {
   const start = performance.now();
+  const sentMs = Date.now();
+  // The apiFetch-only options are not part of the request.
+  const { suppressAccessDeniedToast, authErrors, ...init } = options ?? {};
+  // eslint-disable-next-line no-restricted-globals -- apiFetch is the shared request helper itself
   const response = await fetch(path, {
-    ...options,
+    ...init,
     credentials: 'include',
   });
   const elapsed = performance.now() - start;
+  // Hub clock estimate for the delete lease flip (ptone/scion#2952).
+  recordHubDateHeader(response.headers?.get?.('date'), sentMs, Date.now());
 
   if (elapsed > API_SLOW_THRESHOLD_MS) {
     console.warn(
@@ -56,33 +132,143 @@ export async function apiFetch(path: string, options?: RequestInit): Promise<Res
     );
   }
 
+  if (authErrors === 'caller') return response;
+
   if (response.status === 401) {
     // Session expired or signing key rotated — redirect to login.
     // Use a flag to prevent multiple concurrent redirects.
     if (!sessionExpiredRedirectPending) {
       sessionExpiredRedirectPending = true;
+      // Dispose terminal sessions before navigating to login so no hidden
+      // active terminals survive the transition (acceptance criterion 4).
+      dispatchAuthExpiredTeardown();
       const returnTo = encodeURIComponent(window.location.pathname);
-      window.location.href = `/login?error=session_expired&returnTo=${returnTo}`;
+      loadPage(`/login?error=session_expired&returnTo=${returnTo}`);
     }
     return response;
   }
 
   if (response.status === 403) {
-    let detail: AccessDeniedDetail = {};
-    try {
-      const body = await response.clone().json();
-      detail = {
-        resource: body.resource,
-        action: body.action,
-        reason: body.reason || body.error || body.message,
-      };
-    } catch {
-      // Body wasn't JSON — use empty detail
+    // If a suspension redirect is already in progress, suppress all further
+    // 403 handling to prevent a toast avalanche from concurrent requests.
+    if (userSuspendedRedirectPending) {
+      return response;
     }
-    window.dispatchEvent(new CustomEvent('scion:access-denied', { detail }));
+
+    let detail: AccessDeniedDetail = {};
+    let isSuspended = false;
+
+    try {
+      const body = (await response.clone().json()) as AccessDeniedBody;
+      // The backend error envelope is {error: {code, message, details?}}.
+      // When the central authorization path denied the request, details
+      // carries {resource_type, denied_action}; legacy/generic 403s omit
+      // details and degrade gracefully.
+      if (typeof body.error === 'object' && body.error) {
+        if (body.error.code === 'user_suspended') {
+          isSuspended = true;
+        }
+        const details = body.error.details;
+        detail = {
+          action: details?.denied_action ?? body.error.code,
+          resource: details?.resource_type,
+          reason: body.error.message,
+        };
+      } else {
+        detail = {
+          reason: body.message || body.error || 'Access denied',
+        };
+      }
+    } catch {
+      if (options?.signal?.aborted) {
+        // The caller aborted the request (e.g. a paginateAll page timeout)
+        // while the 403 body was still arriving, so the read failed for a
+        // reason that says nothing about the body. Report a generic denial
+        // rather than empty detail; the body was never seen, so this is
+        // not treated as user_suspended (ptone/scion#2583).
+        detail = { reason: ACCESS_DENIED_UNREADABLE_REASON };
+      }
+      // Otherwise the body wasn't JSON — use empty detail.
+    }
+
+    // A suspended account is terminal: trigger a full page reload so the
+    // server's suspended-user middleware renders the self-contained
+    // suspended page. This is preferred over a client-side route because
+    // the reload stops all pending API/SSE bootstrap fan-out.
+    if (isSuspended) {
+      userSuspendedRedirectPending = true;
+      window.location.reload();
+      return response;
+    }
+
+    if (!suppressAccessDeniedToast) {
+      window.dispatchEvent(new CustomEvent('scion:access-denied', { detail }));
+    }
   }
 
   return response;
+}
+
+/**
+ * Fetch all pages of a cursor-paginated API endpoint.
+ *
+ * Follows `nextCursor` values returned by the server until every page has been
+ * retrieved. The caller provides a `key` that names the array property in the
+ * JSON response (e.g. `"templates"`, `"harnessConfigs"`).
+ *
+ * The helper is intentionally simple: it concatenates all items into a single
+ * array and discards per-page metadata (totalCount, capabilities, …).
+ * This makes it suitable for "fetch everything" use-cases like dropdowns and
+ * selector lists.
+ *
+ * It never returns a partial list: a failed or malformed page, at any
+ * position, rejects, and so does a walk that still has a cursor after
+ * {@link MAX_PAGES} pages.
+ */
+/** Safety bound to prevent infinite pagination loops (e.g. server returning the same cursor). */
+const MAX_PAGES = 50;
+
+export async function apiFetchAllPages<T>(
+  baseUrl: string,
+  key: string,
+  options?: ApiFetchOptions
+): Promise<T[]> {
+  const allItems: T[] = [];
+  let cursor = '';
+  let page = 0;
+
+  do {
+    const sep = baseUrl.includes('?') ? '&' : '?';
+    const url = cursor ? `${baseUrl}${sep}cursor=${encodeURIComponent(cursor)}` : baseUrl;
+    const res = await apiFetch(url, options);
+    if (!res.ok) {
+      throw new Error(
+        page === 0
+          ? `Failed to fetch: ${res.status} ${res.statusText}`
+          : `Failed to fetch page ${page + 1}: ${res.status} ${res.statusText}`
+      );
+    }
+    let data: Record<string, unknown>;
+    try {
+      data = (await res.json()) as Record<string, unknown>;
+    } catch {
+      throw new Error(`Failed to parse page ${page + 1} response from ${baseUrl}`);
+    }
+    if (!data || typeof data !== 'object') {
+      throw new Error(`Invalid page ${page + 1} response format from ${baseUrl}`);
+    }
+    const items = data[key];
+    if (Array.isArray(items)) {
+      allItems.push(...(items as T[]));
+    }
+    cursor = (typeof data.nextCursor === 'string' && data.nextCursor) || '';
+    page++;
+  } while (cursor && page < MAX_PAGES);
+
+  if (cursor) {
+    throw new Error(`Stopped after ${MAX_PAGES} pages from ${baseUrl}: more pages remain`);
+  }
+  return allItems;
 }
 
 /**
@@ -93,22 +279,34 @@ export async function apiFetch(path: string, options?: RequestInit): Promise<Res
  */
 export async function extractApiError(res: Response, fallback: string): Promise<string> {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const data = (await res.json()) as any;
-    if (typeof data.error === 'object' && data.error?.message) {
-      let msg: string = data.error.message;
-      // Append guidance hint when available (e.g. clone/pull error details)
-      if (data.error?.details?.guidance) {
-        msg += ` — ${data.error.details.guidance}`;
-      }
-      return msg;
-    }
-    if (typeof data.message === 'string') return data.message;
-    if (typeof data.error === 'string') return data.error;
+    return apiErrorMessageFromBody(await res.json()) ?? fallback;
   } catch {
     // Response wasn't JSON
+    return fallback;
   }
-  return fallback;
+}
+
+/**
+ * The human-readable message in a parsed API error body, or undefined when
+ * it has none. Accepts the shapes the hub sends: `{error: {message}}` (with
+ * a string `error.details.guidance` appended when present, e.g. clone/pull
+ * errors), `{message}` and `{error: "..."}`. Empty strings are not messages.
+ */
+export function apiErrorMessageFromBody(data: unknown): string | undefined {
+  if (data === null || typeof data !== 'object') return undefined;
+  const body = data as { error?: unknown; message?: unknown };
+  if (body.error && typeof body.error === 'object') {
+    const error = body.error as { message?: unknown; details?: { guidance?: unknown } };
+    if (typeof error.message === 'string' && error.message) {
+      const guidance = error.details?.guidance;
+      return typeof guidance === 'string' && guidance
+        ? `${error.message} — ${guidance}`
+        : error.message;
+    }
+  }
+  if (typeof body.message === 'string' && body.message) return body.message;
+  if (typeof body.error === 'string' && body.error) return body.error;
+  return undefined;
 }
 
 /** Structured API error info returned by {@link parseApiError}. */

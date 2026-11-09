@@ -21,16 +21,12 @@ import (
 )
 
 // handleAdminValidateResources validates storage consistency for all global
-// resources (templates and harness-configs). Requires admin role.
+// resources (templates and harness-configs), and lists the templates, in
+// every scope, whose config holds values agents ignore
+// (templateConfigFindings). Requires admin role.
 func (s *Server) handleAdminValidateResources(w http.ResponseWriter, r *http.Request) {
-	user := GetUserIdentityFromContext(r.Context())
-	if user == nil || user.Role() != "admin" {
-		Forbidden(w)
-		return
-	}
-
 	if r.Method != http.MethodGet {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet)
 		return
 	}
 
@@ -94,8 +90,15 @@ func (s *Server) handleAdminValidateResources(w http.ResponseWriter, r *http.Req
 		}
 	}
 
+	findings, err := s.templateConfigFindings(ctx)
+	if err != nil {
+		RuntimeError(w, "failed to list templates: "+err.Error())
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"reports": reports,
+		"reports":                reports,
+		"templateConfigFindings": findings,
 		"summary": map[string]int{
 			"total":  len(reports),
 			"passed": passed,

@@ -280,13 +280,6 @@ func (s *OAuthService) GetAuthorizationURLForClient(clientType OAuthClientType, 
 	}
 }
 
-// getGoogleAuthURL generates a Google OAuth authorization URL using the default config.
-//
-//nolint:unused // Kept for direct OAuth flow compatibility.
-func (s *OAuthService) getGoogleAuthURL(callbackURL, state string) (string, error) {
-	return s.getGoogleAuthURLWithConfig(s.config.CLI.Google, callbackURL, state)
-}
-
 // getGoogleAuthURLWithConfig generates a Google OAuth authorization URL with the given config.
 func (s *OAuthService) getGoogleAuthURLWithConfig(cfg OAuthProviderConfig, callbackURL, state string) (string, error) {
 	if cfg.ClientID == "" {
@@ -304,13 +297,6 @@ func (s *OAuthService) getGoogleAuthURLWithConfig(cfg OAuthProviderConfig, callb
 	}
 
 	return googleAuthURL + "?" + params.Encode(), nil
-}
-
-// getGitHubAuthURL generates a GitHub OAuth authorization URL using the default config.
-//
-//nolint:unused // Kept for direct OAuth flow compatibility.
-func (s *OAuthService) getGitHubAuthURL(callbackURL, state string) (string, error) {
-	return s.getGitHubAuthURLWithConfig(s.config.CLI.GitHub, callbackURL, state)
 }
 
 // getGitHubAuthURLWithConfig generates a GitHub OAuth authorization URL with the given config.
@@ -352,13 +338,6 @@ func (s *OAuthService) ExchangeCodeForClient(ctx context.Context, clientType OAu
 	}
 }
 
-// exchangeGoogleCode exchanges a Google authorization code for user info.
-//
-//nolint:unused // Kept for direct OAuth flow compatibility.
-func (s *OAuthService) exchangeGoogleCode(ctx context.Context, code, callbackURL string) (*OAuthUserInfo, error) {
-	return s.exchangeGoogleCodeWithConfig(ctx, s.config.CLI.Google, code, callbackURL)
-}
-
 // exchangeGoogleCodeWithConfig exchanges a Google authorization code for user info using the given config.
 func (s *OAuthService) exchangeGoogleCodeWithConfig(ctx context.Context, cfg OAuthProviderConfig, code, callbackURL string) (*OAuthUserInfo, error) {
 	if cfg.ClientID == "" || cfg.ClientSecret == "" {
@@ -378,13 +357,6 @@ func (s *OAuthService) exchangeGoogleCodeWithConfig(ctx context.Context, cfg OAu
 	}
 
 	return userInfo, nil
-}
-
-// exchangeGitHubCode exchanges a GitHub authorization code for user info.
-//
-//nolint:unused // Kept for direct OAuth flow compatibility.
-func (s *OAuthService) exchangeGitHubCode(ctx context.Context, code, callbackURL string) (*OAuthUserInfo, error) {
-	return s.exchangeGitHubCodeWithConfig(ctx, s.config.CLI.GitHub, code, callbackURL)
 }
 
 // exchangeGitHubCodeWithConfig exchanges a GitHub authorization code for user info using the given config.
@@ -445,8 +417,8 @@ func (s *OAuthService) exchangeCodeForToken(ctx context.Context, tokenURL, clien
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("token exchange failed: %s - %s", resp.Status, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorBodyReadLimit))
+		return nil, fmt.Errorf("token exchange failed: %d - %s", resp.StatusCode, upstreamText(string(body)))
 	}
 
 	var tokenResp tokenResponse
@@ -455,13 +427,6 @@ func (s *OAuthService) exchangeCodeForToken(ctx context.Context, tokenURL, clien
 	}
 
 	return &tokenResp, nil
-}
-
-// exchangeGitHubCodeForToken exchanges a GitHub authorization code for an access token.
-//
-//nolint:unused // Kept for direct OAuth flow compatibility.
-func (s *OAuthService) exchangeGitHubCodeForToken(ctx context.Context, code, callbackURL string) (*tokenResponse, error) {
-	return s.exchangeGitHubCodeForTokenWithConfig(ctx, s.config.CLI.GitHub, code, callbackURL)
 }
 
 // exchangeGitHubCodeForTokenWithConfig exchanges a GitHub authorization code for an access token using the given config.
@@ -487,22 +452,45 @@ func (s *OAuthService) exchangeGitHubCodeForTokenWithConfig(ctx context.Context,
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("token exchange failed: %s - %s", resp.Status, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorBodyReadLimit))
+		return nil, fmt.Errorf("token exchange failed: %d - %s", resp.StatusCode, upstreamText(string(body)))
+	}
+
+	// Read the body once: GitHub answers a failed exchange with 200 and the
+	// error in the body, which the decoder would otherwise have consumed.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, oauthResponseMaxBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read token response: %w", err)
 	}
 
 	var tokenResp tokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, fmt.Errorf("failed to decode token response: %w", err)
 	}
 
 	if tokenResp.AccessToken == "" {
-		// GitHub sometimes returns error in the body
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("no access token in response: %s", string(body))
+		return nil, fmt.Errorf("no access token in response: %s", githubTokenErrorText(body))
 	}
 
 	return &tokenResp, nil
+}
+
+// oauthResponseMaxBytes bounds a successful OAuth token endpoint response
+// the hub reads into memory.
+const oauthResponseMaxBytes = 1 << 20
+
+// githubTokenErrorText renders the error fields of a GitHub token response
+// that carried no access token, through upstreamText. Only the error and
+// error_description fields are rendered, never the rest of the body.
+func githubTokenErrorText(body []byte) string {
+	var e struct {
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+	}
+	if err := json.Unmarshal(body, &e); err != nil || (e.Error == "" && e.ErrorDescription == "") {
+		return "no error field"
+	}
+	return upstreamText(e.Error + ": " + e.ErrorDescription)
 }
 
 // googleUserInfo represents the response from Google's userinfo endpoint.
@@ -531,8 +519,8 @@ func (s *OAuthService) getGoogleUserInfo(ctx context.Context, accessToken string
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to get user info: %s - %s", resp.Status, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorBodyReadLimit))
+		return nil, fmt.Errorf("failed to get user info: %d - %s", resp.StatusCode, upstreamText(string(body)))
 	}
 
 	var userInfo googleUserInfo
@@ -540,9 +528,14 @@ func (s *OAuthService) getGoogleUserInfo(ctx context.Context, accessToken string
 		return nil, fmt.Errorf("failed to decode user info: %w", err)
 	}
 
+	email, err := requireVerifiedEmail(hubclient.OAuthProviderGoogle, userInfo.Email, userInfo.VerifiedEmail)
+	if err != nil {
+		return nil, err
+	}
+
 	return &OAuthUserInfo{
 		ID:          userInfo.ID,
-		Email:       userInfo.Email,
+		Email:       email,
 		DisplayName: userInfo.Name,
 		AvatarURL:   userInfo.Picture,
 		Provider:    "google",
@@ -582,8 +575,8 @@ func (s *OAuthService) getGitHubUserInfo(ctx context.Context, accessToken string
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to get user info: %s - %s", resp.Status, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorBodyReadLimit))
+		return nil, fmt.Errorf("failed to get user info: %d - %s", resp.StatusCode, upstreamText(string(body)))
 	}
 
 	var user githubUser
@@ -591,13 +584,19 @@ func (s *OAuthService) getGitHubUserInfo(ctx context.Context, accessToken string
 		return nil, fmt.Errorf("failed to decode user info: %w", err)
 	}
 
-	// If email is not public, fetch from emails endpoint
-	email := user.Email
-	if email == "" {
-		email, err = s.getGitHubPrimaryEmail(ctx, accessToken)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get user email: %w", err)
-		}
+	// The profile's public email (if any) is not itself evidence of
+	// verification — GitHub's user endpoint documents it only as "the
+	// publicly visible email address", nothing more. Always consult the
+	// emails endpoint (requires the user:email scope, requested in every
+	// login flow that reaches this function) and let it settle whether the
+	// profile address, or a fallback, is actually usable.
+	emails, err := s.getGitHubEmails(ctx, accessToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user email: %w", err)
+	}
+	email, err := selectVerifiedGitHubEmail(emails, user.Email)
+	if err != nil {
+		return nil, err
 	}
 
 	displayName := user.Name
@@ -614,51 +613,75 @@ func (s *OAuthService) getGitHubUserInfo(ctx context.Context, accessToken string
 	}, nil
 }
 
-// getGitHubPrimaryEmail fetches the primary email from GitHub's emails endpoint.
-func (s *OAuthService) getGitHubPrimaryEmail(ctx context.Context, accessToken string) (string, error) {
+// getGitHubEmails fetches the caller's full email list from GitHub's emails
+// endpoint. Requires the user:email OAuth scope.
+func (s *OAuthService) getGitHubEmails(ctx context.Context, accessToken string) ([]githubEmail, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", githubEmailURL, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("failed to get emails: %s - %s", resp.Status, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorBodyReadLimit))
+		return nil, fmt.Errorf("failed to get emails: %d - %s", resp.StatusCode, upstreamText(string(body)))
 	}
 
 	var emails []githubEmail
 	if err := json.NewDecoder(resp.Body).Decode(&emails); err != nil {
-		return "", fmt.Errorf("failed to decode emails: %w", err)
+		return nil, fmt.Errorf("failed to decode emails: %w", err)
 	}
+	return emails, nil
+}
 
-	// Find primary verified email
-	for _, e := range emails {
-		if e.Primary && e.Verified {
-			return e.Email, nil
+// selectVerifiedGitHubEmail chooses the email a GitHub login should use from
+// the caller's full email list, preferring (in order): the profile's public
+// email if the list itself marks that same address verified; else the
+// primary verified email; else any verified email. The result is gated
+// through requireVerifiedEmail — an empty list, a 403, or an all-unverified
+// list all end up there and are rejected the same way; this never returns
+// an address GitHub has not verified. profileEmail may be empty.
+func selectVerifiedGitHubEmail(emails []githubEmail, profileEmail string) (string, error) {
+	var candidate githubEmail
+	if profileEmail != "" {
+		for _, e := range emails {
+			if e.Verified && strings.EqualFold(e.Email, profileEmail) {
+				candidate = e
+				break
+			}
 		}
 	}
-
-	// Fall back to any verified email
-	for _, e := range emails {
-		if e.Verified {
-			return e.Email, nil
+	if candidate.Email == "" {
+		for _, e := range emails {
+			if e.Primary && e.Verified {
+				candidate = e
+				break
+			}
 		}
 	}
-
-	// Fall back to any email
-	if len(emails) > 0 {
-		return emails[0].Email, nil
+	if candidate.Email == "" {
+		for _, e := range emails {
+			if e.Verified {
+				candidate = e
+				break
+			}
+		}
+	}
+	if candidate.Email == "" && len(emails) > 0 {
+		// No verified candidate at all: fall through with GitHub's first
+		// listed address only so requireVerifiedEmail below can report a
+		// clear, consistent error. It never returns this unverified.
+		candidate = emails[0]
 	}
 
-	return "", fmt.Errorf("no email found")
+	return requireVerifiedEmail(hubclient.OAuthProviderGitHub, candidate.Email, candidate.Verified)
 }
 
 // DeviceCodeResponse holds the response from a device authorization request.
@@ -729,8 +752,8 @@ func (s *OAuthService) requestGoogleDeviceCode(ctx context.Context, cfg OAuthPro
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("device code request failed: %s - %s", resp.Status, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorBodyReadLimit))
+		return nil, fmt.Errorf("device code request failed: %d - %s", resp.StatusCode, upstreamText(string(body)))
 	}
 
 	// Google returns "verification_url" instead of the RFC 8628 "verification_uri"
@@ -773,8 +796,8 @@ func (s *OAuthService) requestGitHubDeviceCode(ctx context.Context, cfg OAuthPro
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("device code request failed: %s - %s", resp.Status, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorBodyReadLimit))
+		return nil, fmt.Errorf("device code request failed: %d - %s", resp.StatusCode, upstreamText(string(body)))
 	}
 
 	var result DeviceCodeResponse
@@ -826,7 +849,7 @@ func (s *OAuthService) pollGoogleDeviceToken(ctx context.Context, cfg OAuthProvi
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, oauthResponseMaxBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read device token response: %w", err)
 	}
@@ -842,14 +865,14 @@ func (s *OAuthService) pollGoogleDeviceToken(ctx context.Context, cfg OAuthProvi
 	// Parse error response
 	var errResp deviceTokenErrorResponse
 	if err := json.Unmarshal(body, &errResp); err != nil {
-		return nil, fmt.Errorf("device token poll failed: %s - %s", resp.Status, string(body))
+		return nil, fmt.Errorf("device token poll failed: %d - %s", resp.StatusCode, upstreamText(string(body)))
 	}
 
 	switch errResp.Error {
 	case "authorization_pending", "slow_down", "expired_token":
 		return nil, &DeviceAuthError{Code: errResp.Error, Interval: errResp.Interval}
 	default:
-		return nil, fmt.Errorf("device token poll failed: %s", errResp.Error)
+		return nil, fmt.Errorf("device token poll failed: %s", upstreamText(errResp.Error))
 	}
 }
 
@@ -873,7 +896,7 @@ func (s *OAuthService) pollGitHubDeviceToken(ctx context.Context, cfg OAuthProvi
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, oauthResponseMaxBytes))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read device token response: %w", err)
 	}
@@ -885,7 +908,7 @@ func (s *OAuthService) pollGitHubDeviceToken(ctx context.Context, cfg OAuthProvi
 		case "authorization_pending", "slow_down", "expired_token":
 			return nil, &DeviceAuthError{Code: errCheck.Error, Interval: errCheck.Interval}
 		default:
-			return nil, fmt.Errorf("device token poll failed: %s", errCheck.Error)
+			return nil, fmt.Errorf("device token poll failed: %s", upstreamText(errCheck.Error))
 		}
 	}
 
@@ -895,12 +918,12 @@ func (s *OAuthService) pollGitHubDeviceToken(ctx context.Context, cfg OAuthProvi
 			return nil, fmt.Errorf("failed to decode token response: %w", err)
 		}
 		if tokenResp.AccessToken == "" {
-			return nil, fmt.Errorf("no access token in response: %s", string(body))
+			return nil, fmt.Errorf("no access token in response: %s", githubTokenErrorText(body))
 		}
 		return &tokenResp, nil
 	}
 
-	return nil, fmt.Errorf("device token poll failed: %s - %s", resp.Status, string(body))
+	return nil, fmt.Errorf("device token poll failed: %d - %s", resp.StatusCode, upstreamText(string(body)))
 }
 
 // --- OIDC Login Methods ---
@@ -997,7 +1020,7 @@ func (s *OAuthService) getOIDCUserInfo(ctx context.Context, accessToken, userinf
 	if resp.StatusCode != http.StatusOK {
 		// Limit error body to 1 KB to avoid OOM on malicious responses.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
-		return nil, fmt.Errorf("OIDC userinfo endpoint returned %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("OIDC userinfo endpoint returned %d: %s", resp.StatusCode, upstreamText(string(body)))
 	}
 
 	var userInfo oidcUserInfoResponse
@@ -1006,18 +1029,22 @@ func (s *OAuthService) getOIDCUserInfo(ctx context.Context, accessToken, userinf
 		return nil, fmt.Errorf("failed to decode OIDC userinfo response: %w", err)
 	}
 
-	// The "sub" claim is the primary user identifier in OIDC; it must be present.
+	// The "sub" claim is the primary user identifier in OIDC; it must be
+	// present. This is an OIDC-specific requirement, not part of the shared
+	// email-ownership invariant, so it stays a direct check here.
 	if userInfo.Sub == "" {
 		return nil, fmt.Errorf("OIDC provider did not return a 'sub' claim; the identity provider must include a subject identifier")
 	}
 
-	if userInfo.Email == "" {
-		return nil, fmt.Errorf("OIDC provider did not return an email claim; ensure the 'email' scope is requested and the user has an email address configured in the identity provider")
-	}
-
-	if !userInfo.EmailVerified {
-		return nil, fmt.Errorf("OIDC provider returned an unverified email address %q; "+
-			"the user must verify their email in the identity provider before logging in", userInfo.Email)
+	email, err := requireVerifiedEmail(hubclient.OAuthProviderOIDC, userInfo.Email, userInfo.EmailVerified)
+	if err != nil {
+		if strings.TrimSpace(userInfo.Email) == "" {
+			// The shared message only names what's missing; OIDC configuration
+			// is the one case here where an operator can readily fix the
+			// upstream cause, so keep pointing at it.
+			return nil, fmt.Errorf("%w; ensure the 'email' scope is requested and the user has an email address configured in the identity provider", err)
+		}
+		return nil, err
 	}
 
 	// Determine display name: prefer Name, fall back to PreferredUsername, then Email.
@@ -1026,12 +1053,12 @@ func (s *OAuthService) getOIDCUserInfo(ctx context.Context, accessToken, userinf
 		displayName = userInfo.PreferredUsername
 	}
 	if displayName == "" {
-		displayName = userInfo.Email
+		displayName = email
 	}
 
 	return &OAuthUserInfo{
 		ID:          userInfo.Sub,
-		Email:       userInfo.Email,
+		Email:       email,
 		DisplayName: displayName,
 		AvatarURL:   userInfo.Picture,
 		Provider:    hubclient.OAuthProviderOIDC,

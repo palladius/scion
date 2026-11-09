@@ -45,9 +45,9 @@ func TestSettingsOverlay_Update_Apply(t *testing.T) {
 	dbRuntimes := map[string]V1RuntimeConfig{
 		"cloudrun": {
 			Type: "cloudrun-instances",
-			CloudRun: &V1CloudRunConfig{
-				Project: "my-project",
-				Region:  "us-central1",
+			CloudRun: &CloudRunConfig{
+				ProjectID: "my-project",
+				Location:  "us-central1",
 			},
 			Env: map[string]string{"GCP_PROJECT": "my-project"},
 		},
@@ -58,7 +58,8 @@ func TestSettingsOverlay_Update_Apply(t *testing.T) {
 			ImageRegistry: "us-docker.pkg.dev/my-project/scion",
 		},
 	}
-	o.Update(dbRuntimes, dbProfiles, nil, "us-docker.pkg.dev/my-project/scion")
+	o.Update(dbRuntimes, dbProfiles, nil)
+	o.UpdateImageRegistryInputs(ImageRegistryHubInputs{ManagedTop: "us-docker.pkg.dev/my-project/scion"})
 
 	// Apply should replace file values with DB values.
 	o.Apply(vs)
@@ -73,7 +74,7 @@ func TestSettingsOverlay_Update_Apply(t *testing.T) {
 	if cr.Type != "cloudrun-instances" {
 		t.Errorf("expected type 'cloudrun-instances', got %q", cr.Type)
 	}
-	if cr.CloudRun == nil || cr.CloudRun.Project != "my-project" {
+	if cr.CloudRun == nil || cr.CloudRun.ProjectID != "my-project" {
 		t.Error("CloudRun config not applied correctly")
 	}
 	if cr.Env["GCP_PROJECT"] != "my-project" {
@@ -91,8 +92,8 @@ func TestSettingsOverlay_Update_Apply(t *testing.T) {
 		t.Errorf("expected profile runtime 'cloudrun', got %q", p.Runtime)
 	}
 
-	if vs.ImageRegistry != "us-docker.pkg.dev/my-project/scion" {
-		t.Errorf("expected image_registry override, got %q", vs.ImageRegistry)
+	if got := vs.SettingsImageRegistry("none"); got != "us-docker.pkg.dev/my-project/scion" {
+		t.Errorf("expected the overlay's hub image_registry, got %q", got)
 	}
 }
 
@@ -102,25 +103,25 @@ func TestSettingsOverlay_DeepCopy(t *testing.T) {
 	original := map[string]V1RuntimeConfig{
 		"cloudrun": {
 			Type: "cloudrun-instances",
-			CloudRun: &V1CloudRunConfig{
-				Project: "project-a",
-				Region:  "us-central1",
+			CloudRun: &CloudRunConfig{
+				ProjectID: "project-a",
+				Location:  "us-central1",
 			},
 			Env: map[string]string{"KEY": "value-a"},
 		},
 	}
-	o.Update(original, nil, nil, "")
+	o.Update(original, nil, nil)
 
 	// Mutate the original — should NOT affect the overlay.
-	original["cloudrun"].CloudRun.Project = "project-b"
+	original["cloudrun"].CloudRun.ProjectID = "project-b"
 	original["cloudrun"].Env["KEY"] = "value-b"
 
 	vs := &VersionedSettings{}
 	o.Apply(vs)
 
 	cr := vs.Runtimes["cloudrun"]
-	if cr.CloudRun.Project != "project-a" {
-		t.Errorf("overlay mutation leaked: expected project-a, got %q", cr.CloudRun.Project)
+	if cr.CloudRun.ProjectID != "project-a" {
+		t.Errorf("overlay mutation leaked: expected project-a, got %q", cr.CloudRun.ProjectID)
 	}
 	if cr.Env["KEY"] != "value-a" {
 		t.Errorf("overlay mutation leaked: expected value-a, got %q", cr.Env["KEY"])
@@ -142,11 +143,11 @@ func TestSettingsOverlay_NilMapNoChange(t *testing.T) {
 	// First update sets runtimes.
 	o.Update(
 		map[string]V1RuntimeConfig{"docker": {Type: "docker"}},
-		nil, nil, "",
+		nil, nil,
 	)
 
 	// Second update with nil runtimes should keep the first.
-	o.Update(nil, map[string]V1ProfileConfig{"p": {Runtime: "docker"}}, nil, "")
+	o.Update(nil, map[string]V1ProfileConfig{"p": {Runtime: "docker"}}, nil)
 
 	vs := &VersionedSettings{}
 	o.Apply(vs)
@@ -164,7 +165,7 @@ func TestSettingsOverlay_ConcurrentAccess(t *testing.T) {
 	o.Update(
 		map[string]V1RuntimeConfig{"docker": {Type: "docker"}},
 		map[string]V1ProfileConfig{"default": {Runtime: "docker"}},
-		nil, "registry.io",
+		nil,
 	)
 
 	var wg sync.WaitGroup
@@ -174,7 +175,7 @@ func TestSettingsOverlay_ConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			o.Update(
 				map[string]V1RuntimeConfig{"docker": {Type: "docker"}},
-				nil, nil, "",
+				nil, nil,
 			)
 		}()
 		go func() {
@@ -186,42 +187,6 @@ func TestSettingsOverlay_ConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-func TestSettingsOverlay_ImageRegistryEnvVarWins(t *testing.T) {
-	// When SCION_IMAGE_REGISTRY env var is set, the overlay must NOT overwrite
-	// ImageRegistry — the env var takes precedence over DB values.
-	t.Setenv("SCION_IMAGE_REGISTRY", "env-registry.io")
-
-	o := NewSettingsOverlay()
-	o.Update(nil, nil, nil, "db-registry.io")
-
-	vs := &VersionedSettings{
-		ImageRegistry: "env-registry.io", // as LoadEffectiveSettings would set it
-	}
-	o.Apply(vs)
-
-	if vs.ImageRegistry != "env-registry.io" {
-		t.Errorf("env var should win over DB overlay: expected %q, got %q",
-			"env-registry.io", vs.ImageRegistry)
-	}
-}
-
-func TestSettingsOverlay_ImageRegistryDBWinsWhenNoEnvVar(t *testing.T) {
-	// When SCION_IMAGE_REGISTRY env var is NOT set, the overlay's DB value
-	// should be applied.
-	// t.Setenv is not called — SCION_IMAGE_REGISTRY is unset.
-
-	o := NewSettingsOverlay()
-	o.Update(nil, nil, nil, "db-registry.io")
-
-	vs := &VersionedSettings{}
-	o.Apply(vs)
-
-	if vs.ImageRegistry != "db-registry.io" {
-		t.Errorf("DB overlay should win when no env var: expected %q, got %q",
-			"db-registry.io", vs.ImageRegistry)
-	}
-}
-
 func TestSettingsOverlay_GlobalOverlay(t *testing.T) {
 	// Clean state.
 	old := GetGlobalSettingsOverlay()
@@ -230,7 +195,7 @@ func TestSettingsOverlay_GlobalOverlay(t *testing.T) {
 	o := NewSettingsOverlay()
 	o.Update(
 		map[string]V1RuntimeConfig{"test": {Type: "test"}},
-		nil, nil, "",
+		nil, nil,
 	)
 	SetGlobalSettingsOverlay(o)
 

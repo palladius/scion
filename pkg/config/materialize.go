@@ -42,6 +42,22 @@ func MaterializeBundledTemplates(globalDir string, opts MaterializeOptions) erro
 	return nil
 }
 
+// MaterializeBundledHarnessConfigs writes only the bundled Harness-configs to
+// the local filesystem. With Force=false, bundle-owned files (config.yaml and
+// the provisioner scripts provision.py, scion_harness.py and capture_auth.py)
+// are refreshed from the bundle, and other existing files are preserved. Use
+// this in hosted mode to ensure newly added harness configs from binary
+// updates are materialized without a full InitGlobal.
+func MaterializeBundledHarnessConfigs(globalDir string, opts MaterializeOptions) error {
+	for _, res := range resources.BuiltinHarnessConfigs() {
+		targetDir := filepath.Join(globalDir, harnessConfigsDirName, res.Name)
+		if err := SeedHarnessConfigFromDir(targetDir, res.FS, res.Root, opts.Force); err != nil {
+			return fmt.Errorf("failed to materialize harness-config %q: %w", res.Name, err)
+		}
+	}
+	return nil
+}
+
 // MaterializeBundledResources writes bundled Templates and Harness-configs to
 // the local filesystem for workstation compatibility. It uses the same
 // resources.BuiltinResources() catalog as the hosted bootstrap path.

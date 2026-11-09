@@ -23,7 +23,9 @@ Grok-build-native concerns handled here:
     written to ~/.grok/auth.json from a staged file secret.
   - MCP servers translate to TOML [mcp_servers.*] entries in
     ~/.grok/config.toml (stdio→command/args/env, sse/http→url/headers).
-  - Instructions project to AGENTS.md (configurable via instructions_file).
+  - Instructions project to .grok/AGENTS.md (configurable via instructions_file).
+  - System prompt is written to .grok/system-prompt.md and passed via
+    --system-prompt-override (native routing).
   - ~/.grok/config.toml gets hardened defaults (auto-update off, telemetry
     off, memory off, subagents off).
   - Hook wiring to sciontool via ~/.grok/hooks/scion.json.
@@ -36,7 +38,6 @@ import os
 import re as _re
 import sys
 from typing import Any
-from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -64,12 +65,17 @@ AUTH = scion_harness.AuthSpec(
         ),
         scion_harness.env_method(
             "vertex-ai",
-            all_of=["GOOGLE_CLOUD_PROJECT"],
+            any_of=["GOOGLE_CLOUD_PROJECT", "SCION_METADATA_PROJECT_ID"],
             hint="set GOOGLE_CLOUD_PROJECT for Vertex AI model routing",
         ),
     ],
     fallback_to_none_on_error=True,
 )
+
+
+def _grok_config_dir(ctx: scion_harness.ProvisionContext) -> str:
+    """Resolve the grok config directory, respecting GROK_HOME if set."""
+    return os.environ.get("GROK_HOME") or os.path.join(ctx.home, ".grok")
 
 
 def _read_token(ctx: scion_harness.ProvisionContext, env_key: str) -> str:
@@ -105,7 +111,7 @@ def _write_auth_file(ctx: scion_harness.ProvisionContext) -> None:
         raise scion_harness.ProvisionError(
             f"GROK_AUTH secret is not valid JSON: {exc}"
         ) from exc
-    config_dir = os.environ.get("GROK_HOME") or scion_harness.expand_path("~/.grok")
+    config_dir = _grok_config_dir(ctx)
     os.makedirs(config_dir, exist_ok=True)
     target = os.path.join(config_dir, "auth.json")
     tmp = target + ".tmp"
@@ -113,6 +119,33 @@ def _write_auth_file(ctx: scion_harness.ProvisionContext) -> None:
         f.write(content)
     os.chmod(tmp, 0o600)
     os.replace(tmp, target)
+
+
+def _apply_native_system_prompt(ctx: scion_harness.ProvisionContext) -> None:
+    """Write the staged system prompt to the native grok CLI location.
+
+    config.yaml declares system_prompt_file (.grok/system-prompt.md) and
+    system_prompt_mode (native), so the prompt goes into its own file rather
+    than being prepended to the instructions file. The Go-side harness reads
+    this file and passes it via --system-prompt-override.
+    """
+    system_prompt = ctx.read_input_text("system-prompt.md")
+    if not system_prompt.strip():
+        return
+
+    target = str(ctx.harness_config.get("system_prompt_file") or "")
+    if not target:
+        return
+
+    full = os.path.join(ctx.home, target)
+    parent = os.path.dirname(full)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = full + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(system_prompt)
+    os.replace(tmp, full)
+    ctx.info(f"wrote system prompt to {full}")
 
 
 # ---------------------------------------------------------------------------
@@ -137,19 +170,28 @@ def _configure_vertex_ai(
     """
     project = _read_token(ctx, "GOOGLE_CLOUD_PROJECT")
     if not project:
+        # Fallback: when GCP identity is assigned, the platform injects the
+        # project ID as SCION_METADATA_PROJECT_ID.
+        project = os.environ.get("SCION_METADATA_PROJECT_ID", "").strip()
+    if not project:
         raise scion_harness.ProvisionError(
             "vertex-ai auth selected but GOOGLE_CLOUD_PROJECT is empty"
         )
     env["GOOGLE_CLOUD_PROJECT"] = project
 
     # Region is optional — when empty, use the global multi-region endpoint.
-    region = ""
-    for key in ("GOOGLE_CLOUD_REGION", "CLOUD_ML_REGION", "GOOGLE_CLOUD_LOCATION"):
-        val = _read_token(ctx, key)
-        if val:
-            region = val
-            env[key] = val
-            break
+    # Shared precedence: LOCATION > REGION > CLOUD_ML_REGION (ptone/scion#4719).
+    region_key, region = scion_harness.resolve_vertex_location(
+        lambda k: _read_token(ctx, k), warn_fn=ctx.warn,
+    )
+    if region_key:
+        env[region_key] = region
+
+    # Normalize "global" to empty — the global Vertex AI endpoint uses the
+    # plain hostname (aiplatform.googleapis.com), not a region-prefixed one.
+    region = region.strip()
+    if region.lower() == "global":
+        region = ""
 
     # Construct Vertex AI base URL.
     if region:
@@ -173,12 +215,45 @@ def _configure_vertex_ai(
         env["GOOGLE_APPLICATION_CREDENTIALS"] = adc_target
         ctx.info(f"placed ADC credentials at {adc_target}")
 
-    # Resolve model ID — allow SCION_MODEL to override the default.
+    # Resolve model ID — aliases map to the default Vertex AI model since
+    # Vertex AI Model Garden may not have all xAI models available.
     raw_model = os.environ.get("SCION_MODEL", "").strip()
-    model_id = raw_model if raw_model else _VERTEX_MODEL_ID
+    if raw_model:
+        aliases = ctx.harness_config.get("model_aliases")
+        if not isinstance(aliases, dict):
+            aliases = {}
+        if raw_model.lower() in aliases:
+            # Scion size alias (small, medium, large) — use default Vertex model.
+            model_id = _VERTEX_MODEL_ID
+            ctx.info(f"vertex-ai: resolved alias '{raw_model}' to {_VERTEX_MODEL_ID}")
+        elif "/" not in raw_model:
+            # Pre-resolved model name without publisher prefix (e.g., "grok-4"
+            # from broker alias resolution). Not a valid Vertex AI model ID —
+            # Vertex requires <publisher>/<model> format.
+            model_id = _VERTEX_MODEL_ID
+            ctx.info(
+                f"vertex-ai: model '{raw_model}' lacks publisher prefix, "
+                f"using default {_VERTEX_MODEL_ID}"
+            )
+        else:
+            # Fully-qualified model ID with publisher prefix (e.g., "xai/grok-4.2").
+            model_id = raw_model
+    else:
+        model_id = _VERTEX_MODEL_ID
 
     # Write Vertex AI model config to config.toml.
     _write_vertex_config(ctx, base_url, model_id)
+
+    # Create a model config block matching the raw SCION_MODEL name so that
+    # --model <name> on the command line (injected by the Go side) routes
+    # through vertex-ai instead of falling back to the direct xAI API.
+    if raw_model and raw_model != _VERTEX_MODEL_CONFIG_NAME:
+        _write_vertex_model_alias(ctx, base_url, model_id, raw_model)
+
+    # Set GROK_DEFAULT_MODEL so grok uses the vertex-grok config block.
+    # This is belt-and-suspenders alongside [models] default in config.toml —
+    # the env var cannot be overwritten by grok's /model command at runtime.
+    env["GROK_DEFAULT_MODEL"] = _VERTEX_MODEL_CONFIG_NAME
 
     ctx.info(f"vertex-ai: project={project} model={model_id} base_url={base_url}")
 
@@ -191,7 +266,7 @@ def _write_vertex_config(
     model_id: str,
 ) -> None:
     """Append Vertex AI auth_provider and model config to config.toml."""
-    config_path = os.path.join(ctx.home, ".grok", "config.toml")
+    config_path = os.path.join(_grok_config_dir(ctx), "config.toml")
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
 
     existing = ""
@@ -220,6 +295,8 @@ command = "gcloud auth print-access-token"
 model = "{scion_harness.toml_escape(model_id)}"
 base_url = "{scion_harness.toml_escape(base_url)}"
 auth_provider = "{_VERTEX_AUTH_PROVIDER_NAME}"
+api_backend = "chat_completions"
+supports_backend_search = false
 
 [models]
 default = "{_VERTEX_MODEL_CONFIG_NAME}"'''
@@ -229,7 +306,103 @@ default = "{_VERTEX_MODEL_CONFIG_NAME}"'''
         content += "\n\n"
     content += vertex_toml + "\n"
 
-    scion_harness.atomic_write_text(config_path, content)
+    # Key-path managed keys (rather than bare "auth_provider"/"model") so
+    # this write can't be fooled into silently accepting damage to some
+    # other tool's [auth_provider.*] or [model.*] sub-table — only the
+    # named vertex-grok ones are actually written here. "models" stays a
+    # bare top-level key: the whole [models] table (just `default = ...`)
+    # is unconditionally replaced by this write, not a shared table this
+    # site owns only part of.
+    if not scion_harness.write_toml_if_preserves(
+        ctx, config_path, existing, content,
+        managed_keys={
+            ("auth_provider", _VERTEX_AUTH_PROVIDER_NAME),
+            ("model", _VERTEX_MODEL_CONFIG_NAME),
+            "models",
+        },
+        what="vertex-ai auth/model config",
+    ):
+        # A vertex-auth agent with no vertex config is guaranteed broken —
+        # grok would fall back to the direct xAI API and fail auth outright
+        # — so this must fail loudly rather than continue as if it
+        # succeeded (ptone/scion#2427 review round 1, R2). The caller
+        # (_configure_vertex_ai) must not reach its GROK_DEFAULT_MODEL env
+        # export or success log after this.
+        raise scion_harness.ProvisionError(
+            f"vertex-ai: failed to write auth_provider/model/models config "
+            f"to {config_path}; grok would start without vertex routing "
+            "configured (see the preceding warning for what blocked the "
+            "write)"
+        )
+
+
+def _write_vertex_model_alias(
+    ctx: scion_harness.ProvisionContext,
+    base_url: str,
+    model_id: str,
+    alias_name: str,
+) -> None:
+    """Add a model config block that aliases a raw model name to vertex-ai.
+
+    When the Go side injects --model <name> on the command line, grok looks
+    for [model.<name>] in config.toml. Without this block, grok falls back to
+    the direct xAI API and gets a 401 when vertex-ai auth is in use.
+    """
+    config_path = os.path.join(_grok_config_dir(ctx), "config.toml")
+    if not os.path.isfile(config_path):
+        return  # _write_vertex_config should have created it
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        original = f.read()
+
+    # Strip any existing block with this alias name to avoid duplicates.
+    # Only match the bare-key form ([model.<alias_name>]) when alias_name is
+    # actually a valid TOML bare key: for a dotted name like "grok-4.2" (the
+    # realistic case — model names commonly contain dots), that bare-looking
+    # header is a *different* TOML path ([model.grok-4]["2"], not
+    # [model."grok-4.2"]), so matching it here would strip and discard an
+    # unrelated user table instead of leaving it alone, turning a harmless
+    # hand-written overlay into a hard ProvisionError from the ("model",
+    # alias_name) key-path check below (ptone/scion#2427 review round 3).
+    escaped_alias = scion_harness.toml_escape(alias_name)
+    headers = {f'[model."{escaped_alias}"]'}
+    if _TOML_BARE_KEY_RE.match(alias_name):
+        headers.add(f"[model.{alias_name}]")
+    content = scion_harness.strip_toml_sections(original, lambda line: line in headers)
+
+    # Append the alias block.  Use quoted key so dots in the model name
+    # (e.g. "grok-4.6") are treated as a single key, not a TOML path.
+    alias_toml = f'''
+[model."{escaped_alias}"]
+model = "{scion_harness.toml_escape(model_id)}"
+base_url = "{scion_harness.toml_escape(base_url)}"
+auth_provider = "{_VERTEX_AUTH_PROVIDER_NAME}"
+api_backend = "chat_completions"
+supports_backend_search = false'''
+
+    content = content.rstrip("\n") + "\n" + alias_toml + "\n"
+    # Key-path ("model", alias_name), not bare "model": this write owns
+    # only its own alias sub-table, not the whole shared [model.*] table
+    # (which also holds _write_vertex_config's own vertex-grok block and
+    # possibly a user's [model.custom]).
+    if not scion_harness.write_toml_if_preserves(
+        ctx, config_path, original, content,
+        managed_keys={("model", alias_name)},
+        what=f"vertex-ai model alias '{alias_name}'",
+    ):
+        # Without this alias block, grok falls back to the direct xAI API
+        # for --model <alias_name> and gets a 401 when vertex-ai auth is in
+        # use — the same guaranteed-broken-if-missing outcome
+        # _write_vertex_config's own raise is about, so this must also fail
+        # loudly instead of warning and continuing into a misleading
+        # success log (ptone/scion#2427 review round 2, R2-a).
+        raise scion_harness.ProvisionError(
+            f"vertex-ai: failed to write model alias '{alias_name}' to "
+            f"{config_path}; grok would fall back to the direct xAI API "
+            "for this model and fail auth (see the preceding warning for "
+            "what blocked the write)"
+        )
+    ctx.info(f"vertex-ai: created model alias '{alias_name}' -> vertex endpoint")
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +416,7 @@ _TOML_BARE_KEY_RE = _re.compile(r"^[A-Za-z0-9_-]+$")
 
 def _write_mcp_toml(ctx: scion_harness.ProvisionContext, servers: dict[str, Any]) -> None:
     """Write MCP servers to ~/.grok/config.toml as [mcp_servers.*] sections."""
-    config_path = os.path.join(ctx.home, ".grok", "config.toml")
+    config_path = os.path.join(_grok_config_dir(ctx), "config.toml")
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
 
     existing = ""
@@ -289,7 +462,10 @@ def _write_mcp_toml(ctx: scion_harness.ProvisionContext, servers: dict[str, Any]
     elif new_content:
         new_content += "\n"
 
-    scion_harness.atomic_write_text(config_path, new_content)
+    scion_harness.write_toml_if_preserves(
+        ctx, config_path, existing, new_content,
+        managed_keys={"mcp_servers"}, what="MCP server registration",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +494,7 @@ enabled = false
 
 def _harden_config(ctx: scion_harness.ProvisionContext) -> None:
     """Write hardened settings to ~/.grok/config.toml with managed markers."""
-    config_path = os.path.join(ctx.home, ".grok", "config.toml")
+    config_path = os.path.join(_grok_config_dir(ctx), "config.toml")
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
 
     existing = ""
@@ -353,15 +529,33 @@ def _harden_config(ctx: scion_harness.ProvisionContext) -> None:
         content += "\n\n"
     content += _HARDENING_TOML + "\n"
 
-    scion_harness.atomic_write_text(config_path, content)
+    scion_harness.write_toml_if_preserves(
+        ctx, config_path, existing, content,
+        managed_keys={"cli", "features", "memory", "subagents"},
+        what="config hardening",
+    )
 
 
 # ---------------------------------------------------------------------------
 # Telemetry – native OTel export
 # ---------------------------------------------------------------------------
+#
+# Grok's native OTel export always targets sciontool's local receiver.
+# Previously this fell back to the shared SCION_OTEL_ENDPOINT (the cloud
+# telemetry config alias) and copied cloud headers/CA into the harness env,
+# which sent native telemetry straight to the cloud endpoint, bypassing
+# sciontool's redaction and identity stamping entirely (fork issue #2053,
+# phase 0). Grok's own OTel env vars (GROK_TELEMETRY_ENABLED,
+# GROK_EXTERNAL_OTEL) and its exact protocol support are unverified against
+# primary docs (findings-q4-harness-matrix.md); this phase keeps the
+# pre-existing gRPC-on-4317 assumption, which already matches sciontool's
+# local gRPC receiver default (the same one claude/codex use), and fixes only
+# the endpoint/header/CA bypass. Verifying Grok's actual OTel wire support is
+# left to a follow-up, alongside grok-build usage derivation (out of scope,
+# D6/D8).
 
-_DEFAULT_OTEL_ENDPOINT = "http://localhost:4317"
-_DEFAULT_OTEL_PROTOCOL = "grpc"
+_OTEL_PROTOCOL = "grpc"
+_DEFAULT_OTEL_GRPC_PORT = "4317"
 
 
 def _telemetry_enabled(telemetry: dict[str, Any] | None) -> bool:
@@ -374,98 +568,48 @@ def _telemetry_enabled(telemetry: dict[str, Any] | None) -> bool:
     return bool(enabled)
 
 
-def _resolve_endpoint(telemetry: dict[str, Any] | None, env: dict[str, str] | None) -> str:
-    """Resolve the OTLP endpoint from env overrides or telemetry config."""
+def _resolve_endpoint(env: dict[str, str] | None) -> str:
+    """Resolve the OTLP endpoint Grok's native exporter is pointed at.
+
+    Always the local sciontool receiver, unless SCION_GROK_BUILD_OTEL_ENDPOINT
+    is set. That override is a local-debugging escape hatch only: it bypasses
+    sciontool's redaction and identity stamping entirely, so it must never be
+    pointed at anything but a local collector. The generic SCION_OTEL_ENDPOINT
+    (the shared cloud-config alias) and telemetry.cloud.endpoint are
+    deliberately NOT honored here anymore.
+    """
     env = env or {}
-    for key in ("SCION_GROK_BUILD_OTEL_ENDPOINT", "SCION_OTEL_ENDPOINT"):
-        v = (env.get(key) or os.environ.get(key) or "").strip()
-        if v:
-            return v
-    if telemetry and isinstance(telemetry.get("cloud"), dict):
-        ep = (telemetry["cloud"].get("endpoint") or "").strip()
-        if ep:
-            return ep
-    return _DEFAULT_OTEL_ENDPOINT
+    override = (env.get("SCION_GROK_BUILD_OTEL_ENDPOINT") or os.environ.get("SCION_GROK_BUILD_OTEL_ENDPOINT") or "").strip()
+    if override:
+        return override
+    port = str(env.get("SCION_OTEL_GRPC_PORT") or os.environ.get("SCION_OTEL_GRPC_PORT") or _DEFAULT_OTEL_GRPC_PORT)
+    if not port.isdecimal() or not 1 <= int(port) <= 65535:
+        raise scion_harness.ProvisionError("invalid local telemetry gRPC port")
+    return f"http://127.0.0.1:{port}"
 
 
-def _resolve_protocol(telemetry: dict[str, Any] | None, env: dict[str, str] | None) -> str:
-    """Resolve the OTLP protocol from env overrides or telemetry config."""
-    env = env or {}
-    for key in ("SCION_GROK_BUILD_OTEL_PROTOCOL", "SCION_OTEL_PROTOCOL"):
-        v = (env.get(key) or os.environ.get(key) or "").strip()
-        if v:
-            return v
-    if telemetry and isinstance(telemetry.get("cloud"), dict):
-        proto = (telemetry["cloud"].get("protocol") or "").strip()
-        if proto:
-            return proto
-    return _DEFAULT_OTEL_PROTOCOL
-
-
-def _build_telemetry_env(telemetry: dict[str, Any], env: dict[str, str] | None) -> dict[str, str]:
+def _build_telemetry_env(env: dict[str, str] | None) -> dict[str, str]:
     """Build env vars that direct Grok's native OTel emitter to sciontool.
 
     Grok's OTel export honours standard OpenTelemetry SDK environment
     variables (OTEL_*) and the grok-specific GROK_TELEMETRY_ENABLED and
-    GROK_EXTERNAL_OTEL flags.
+    GROK_EXTERNAL_OTEL flags. This always targets the local receiver -- see
+    _resolve_endpoint.
     """
-    env = env or {}
-    endpoint = _resolve_endpoint(telemetry, env)
-    protocol = _resolve_protocol(telemetry, env)
-
-    otel_env: dict[str, str] = {
+    return {
         "GROK_TELEMETRY_ENABLED": "true",
         "GROK_EXTERNAL_OTEL": "true",
-        "OTEL_EXPORTER_OTLP_ENDPOINT": endpoint,
-        "OTEL_EXPORTER_OTLP_PROTOCOL": protocol,
+        "OTEL_EXPORTER_OTLP_ENDPOINT": _resolve_endpoint(env),
+        "OTEL_EXPORTER_OTLP_PROTOCOL": _OTEL_PROTOCOL,
         "OTEL_METRICS_EXPORTER": "otlp",
         "OTEL_LOGS_EXPORTER": "otlp",
         "OTEL_METRIC_EXPORT_INTERVAL": "30000",
     }
 
-    # Propagate custom headers when present.
-    headers: dict[str, str] = {}
-    for key in ("SCION_GROK_BUILD_OTEL_HEADERS", "SCION_OTEL_HEADERS"):
-        v = (env.get(key) or os.environ.get(key) or "").strip()
-        if v:
-            try:
-                parsed = json.loads(v)
-                if isinstance(parsed, dict):
-                    headers = parsed
-                    break
-            except json.JSONDecodeError:
-                pass
-    if not headers:
-        cloud = telemetry.get("cloud") or {}
-        if isinstance(cloud, dict) and isinstance(cloud.get("headers"), dict):
-            headers = cloud["headers"]
-    if headers:
-        parts = [f"{k}={quote(str(v), safe='')}" for k, v in headers.items()]
-        otel_env["OTEL_EXPORTER_OTLP_HEADERS"] = ",".join(sorted(parts))
-
-    # TLS CA file for non-localhost collectors.
-    ca_file = ""
-    for key in ("SCION_GROK_BUILD_OTEL_CA_FILE", "SCION_OTEL_CA_FILE"):
-        v = (env.get(key) or os.environ.get(key) or "").strip()
-        if v:
-            ca_file = v
-            break
-    if not ca_file:
-        cloud = telemetry.get("cloud") or {}
-        if isinstance(cloud, dict) and isinstance(cloud.get("tls"), dict):
-            ca_file = str(cloud["tls"].get("ca_file") or "").strip()
-    if ca_file:
-        otel_env["OTEL_EXPORTER_OTLP_CERTIFICATE"] = ca_file
-
-    return otel_env
-
 
 # ---------------------------------------------------------------------------
 # Hooks – sciontool event bridge
 # ---------------------------------------------------------------------------
-
-# Events that send synthetic echo payloads (no stdin from grok).
-_ECHO_EVENTS = {"SessionStart", "SessionEnd"}
 
 # All hook events.
 _GROK_HOOK_EVENTS = [
@@ -480,11 +624,15 @@ _GROK_HOOK_EVENTS = [
     "PostToolUseFailure",
     "SubagentStop",
     "Notification",
+    "PermissionDenied",
+    "SubagentStart",
+    "PreCompact",
+    "PostCompact",
 ]
 
 
-def _write_hooks(home: str) -> None:
-    """Write ~/.grok/hooks/scion.json wiring Grok events to sciontool.
+def _write_hooks(ctx: scion_harness.ProvisionContext) -> None:
+    """Write hooks/scion.json under the grok config dir, wiring events to sciontool.
 
     Each hook fires ``sciontool hook --dialect=grok-build`` which processes
     the event through the grok-build mapping dialect.
@@ -495,14 +643,19 @@ def _write_hooks(home: str) -> None:
     """
     hooks: dict[str, list[dict[str, Any]]] = {}
     for event in _GROK_HOOK_EVENTS:
-        if event in _ECHO_EVENTS:
+        if event == "SessionStart":
             cmd = (
-                f"echo '{{\"hookEventName\": \"{event}\"}}' "
-                f"| sciontool hook --dialect=grok-build"
+                "echo '{\"hookEventName\": \"SessionStart\", \"source\": \"new\"}' "
+                "| sciontool hook --dialect=grok-build"
+            )
+        elif event == "SessionEnd":
+            cmd = (
+                "echo '{\"hookEventName\": \"SessionEnd\", \"reason\": \"end_turn\"}' "
+                "| sciontool hook --dialect=grok-build"
             )
         else:
             cmd = "cat | sciontool hook --dialect=grok-build"
-        timeout = 10 if event == "Stop" else 5
+        timeout = 60 if event in ("Stop", "SubagentStop") else 5
         hooks[event] = [
             {
                 "hooks": [
@@ -517,7 +670,7 @@ def _write_hooks(home: str) -> None:
 
     hooks_data: dict[str, Any] = {"hooks": hooks}
 
-    hooks_dir = os.path.join(home, ".grok", "hooks")
+    hooks_dir = os.path.join(_grok_config_dir(ctx), "hooks")
     os.makedirs(hooks_dir, exist_ok=True)
     hooks_path = os.path.join(hooks_dir, "scion.json")
     try:
@@ -566,17 +719,11 @@ def provision(ctx: scion_harness.ProvisionContext) -> None:
         extra = _configure_vertex_ai(ctx, env)
 
     # --- Model resolution ---------------------------------------------------
-    # The Go side does not populate ctx.model_resolution for out-of-tree
-    # harnesses. Use the SCION_MODEL env var and resolve via model_aliases.
-    # When vertex-ai is selected, model routing is handled by the config.toml
-    # [models] block, so skip GROK_DEFAULT_MODEL to avoid conflicts.
+    # vertex-ai sets GROK_DEFAULT_MODEL in _configure_vertex_ai.
     if resolved.method != "vertex-ai":
-        raw_model = os.environ.get("SCION_MODEL", "").strip()
-        aliases = ctx.harness_config.get("model_aliases") or {}
-        resolved_model = aliases.get(raw_model.lower(), raw_model) if raw_model else ""
+        resolved_model = scion_harness.resolve_model(ctx)
         if resolved_model:
             env["GROK_DEFAULT_MODEL"] = resolved_model
-    # vertex-ai model resolution handled in _configure_vertex_ai
 
     # --- Telemetry: inject native OTel env vars when enabled ----------------
     telemetry_payload = ctx.telemetry
@@ -585,23 +732,30 @@ def provision(ctx: scion_harness.ProvisionContext) -> None:
     if not isinstance(env_overlay, dict):
         env_overlay = None
 
-    if _telemetry_enabled(telemetry if isinstance(telemetry, dict) else None):
-        otel_env = _build_telemetry_env(telemetry or {}, env_overlay)
+    telemetry_enabled = _telemetry_enabled(telemetry if isinstance(telemetry, dict) else None)
+    if telemetry_enabled:
+        otel_env = _build_telemetry_env(env_overlay)
         env.update(otel_env)
         ctx.info(f"telemetry: injected {len(otel_env)} OTel env var(s)")
+    # SCION_NATIVE_TELEMETRY_POLICY lets the env guard (hooks/envoverlay.go)
+    # protect the OTEL_* vars above from being overridden at runtime.
+    env["SCION_NATIVE_TELEMETRY_POLICY"] = "enabled" if telemetry_enabled else "disabled"
     # --- end telemetry ------------------------------------------------------
 
     ctx.write_outputs(resolved, env=env, extra=extra)
 
+    # --- System prompt (native routing) -------------------------------------
+    _apply_native_system_prompt(ctx)
+
     # --- Instructions projection --------------------------------------------
     harness_cfg = ctx.harness_config
-    instructions_file = harness_cfg.get("instructions_file") or "AGENTS.md"
+    instructions_file = harness_cfg.get("instructions_file") or ".grok/AGENTS.md"
     target = os.path.join(ctx.home, instructions_file)
     os.makedirs(os.path.dirname(target), exist_ok=True)
     # include_skills left at default False: config.yaml declares skills_dir,
     # so the host-side provisioner installs skills as individual files.
     try:
-        scion_harness.project_instructions(ctx, target)
+        scion_harness.project_instructions(ctx, target, system_prompt_mode="none")
     except OSError as exc:
         ctx.warn(f"failed to project instructions: {exc}")
 
@@ -647,7 +801,7 @@ def provision(ctx: scion_harness.ProvisionContext) -> None:
     _harden_config(ctx)
 
     # --- Hook wiring --------------------------------------------------------
-    _write_hooks(ctx.home)
+    _write_hooks(ctx)
 
     ctx.info(f"method={resolved.method}")
 

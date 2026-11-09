@@ -1,0 +1,1871 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package messaging
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
+)
+
+// mockConversationUpserter is a test double for ConversationUpserter,
+// ParticipantAdder, and ParticipantEnsurer.
+type mockConversationUpserter struct {
+	// lastConv captures the most recent conversation passed to Upsert.
+	lastConv *store.Conversation
+	// returnConv is the conversation returned by Upsert.
+	returnConv *store.Conversation
+	// returnErr is the error returned by Upsert.
+	returnErr error
+	// participants captures AddParticipant calls.
+	participants []store.ConversationParticipant
+	// addPartErr is the injected error for AddParticipant.
+	addPartErr error
+	// ensuredParticipants captures EnsureParticipant calls (tracked separately).
+	ensuredParticipants []store.ConversationParticipant
+	// ensurePartErr is the injected error for EnsureParticipant.
+	ensurePartErr error
+}
+
+func (m *mockConversationUpserter) UpsertConversationByExternalRef(
+	_ context.Context, conv *store.Conversation,
+) (*store.Conversation, error) {
+	m.lastConv = conv
+	if m.returnErr != nil {
+		return nil, m.returnErr
+	}
+	if m.returnConv != nil {
+		return m.returnConv, nil
+	}
+	// Default: echo back with an ID.
+	result := *conv
+	result.ID = "conv-id-123"
+	return &result, nil
+}
+
+func (m *mockConversationUpserter) AddParticipant(_ context.Context, p *store.ConversationParticipant) error {
+	if m.addPartErr != nil {
+		return m.addPartErr
+	}
+	m.participants = append(m.participants, *p)
+	return nil
+}
+
+func (m *mockConversationUpserter) EnsureParticipant(_ context.Context, p *store.ConversationParticipant) error {
+	if m.ensurePartErr != nil {
+		return m.ensurePartErr
+	}
+	m.ensuredParticipants = append(m.ensuredParticipants, *p)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// ResolveOrCreateDMConversation tests
+// ---------------------------------------------------------------------------
+
+func TestResolveOrCreateDMConversation_HappyPath(t *testing.T) {
+	mock := &mockConversationUpserter{
+		returnConv: &store.Conversation{ID: "conv-abc", ExternalRef: "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000"},
+	}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	got, err := ResolveOrCreateDMConversation(context.Background(), mock, mock, logger,
+		"agent", "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+		"user", "550e8400-e29b-41d4-a716-446655440000")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if got.ConversationID != "conv-abc" {
+		t.Errorf("expected conv-abc, got %q", got.ConversationID)
+	}
+	if got.ExternalRef != "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000" {
+		t.Errorf("expected ExternalRef from mock, got %q", got.ExternalRef)
+	}
+}
+
+func TestResolveOrCreateDMConversation_EmptySender(t *testing.T) {
+	mock := &mockConversationUpserter{}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	got, err := ResolveOrCreateDMConversation(context.Background(), mock, mock, logger, "user", "", "agent", "6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got != nil {
+		t.Errorf("expected nil for empty sender, got %+v", got)
+	}
+	if mock.lastConv != nil {
+		t.Error("upsert should not have been called with empty sender")
+	}
+}
+
+func TestResolveOrCreateDMConversation_EmptyRecipient(t *testing.T) {
+	mock := &mockConversationUpserter{}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	got, err := ResolveOrCreateDMConversation(context.Background(), mock, mock, logger, "user", "550e8400-e29b-41d4-a716-446655440000", "agent", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got != nil {
+		t.Errorf("expected nil for empty recipient, got %+v", got)
+	}
+	if mock.lastConv != nil {
+		t.Error("upsert should not have been called with empty recipient")
+	}
+}
+
+func TestResolveOrCreateDMConversation_UpsertError(t *testing.T) {
+	mock := &mockConversationUpserter{
+		returnErr: errors.New("db connection lost"),
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	got, err := ResolveOrCreateDMConversation(context.Background(), mock, mock, logger,
+		"user", "550e8400-e29b-41d4-a716-446655440000",
+		"agent", "6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got != nil {
+		t.Errorf("expected nil on upsert error, got %+v", got)
+	}
+	if !strings.Contains(err.Error(), "conversation upsert failed") {
+		t.Errorf("expected upsert error message, got: %s", err.Error())
+	}
+}
+
+func TestResolveOrCreateDMConversation_ExternalRefIsKindEncoded(t *testing.T) {
+	mock := &mockConversationUpserter{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	// Call with user first, agent second — ref should sort to agent:...:user:...
+	_, _ = ResolveOrCreateDMConversation(context.Background(), mock, mock, logger,
+		"user", "550e8400-e29b-41d4-a716-446655440000",
+		"agent", "6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	if mock.lastConv == nil {
+		t.Fatal("expected upsert to be called")
+	}
+	expected := "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000"
+	if mock.lastConv.ExternalRef != expected {
+		t.Errorf("expected external_ref %q, got %q", expected, mock.lastConv.ExternalRef)
+	}
+}
+
+func TestResolveOrCreateDMConversation_ProjectIDAlwaysNil(t *testing.T) {
+	mock := &mockConversationUpserter{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	// DM conversations must never have ProjectID set (design 2.4.1).
+	_, _ = ResolveOrCreateDMConversation(context.Background(), mock, mock, logger,
+		"user", "550e8400-e29b-41d4-a716-446655440000",
+		"agent", "6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	if mock.lastConv == nil {
+		t.Fatal("expected upsert to be called")
+	}
+	if mock.lastConv.ProjectID != nil {
+		t.Errorf("expected ProjectID to be nil for DM conversations, got %v", *mock.lastConv.ProjectID)
+	}
+}
+
+func TestResolveOrCreateDMConversation_ReturnsExternalRefFromDB(t *testing.T) {
+	// Verify that the ExternalRef in the result comes from the DB response,
+	// not reconstructed from inputs.
+	mock := &mockConversationUpserter{
+		returnConv: &store.Conversation{
+			ID:          "conv-from-db",
+			ExternalRef: "dm:actual-from-db",
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	got, err := ResolveOrCreateDMConversation(context.Background(), mock, mock, logger,
+		"user", "550e8400-e29b-41d4-a716-446655440000",
+		"agent", "6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if got.ExternalRef != "dm:actual-from-db" {
+		t.Errorf("expected ExternalRef from DB 'dm:actual-from-db', got %q", got.ExternalRef)
+	}
+}
+
+func TestResolveOrCreateDMConversation_EmptyKindReturnsNil(t *testing.T) {
+	// Belt-and-suspenders: even if a hub handler accidentally passes an empty
+	// senderKind (the primary defense is to not call this function at all),
+	// ResolveOrCreateDMConversation must reject it via DMConversationKey
+	// validation, returning nil and creating no conversation row.
+	mock := &mockConversationUpserter{}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	got, err := ResolveOrCreateDMConversation(context.Background(), mock, mock, logger,
+		"", "550e8400-e29b-41d4-a716-446655440000",
+		"agent", "6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got != nil {
+		t.Errorf("expected nil for empty kind, got %+v", got)
+	}
+	if mock.lastConv != nil {
+		t.Error("upsert should not have been called — no conversation row should be created")
+	}
+}
+
+func TestResolveOrCreateDMConversation_InvalidKindReturnsNil(t *testing.T) {
+	mock := &mockConversationUpserter{}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	got, err := ResolveOrCreateDMConversation(context.Background(), mock, mock, logger,
+		"bot", "550e8400-e29b-41d4-a716-446655440000",
+		"agent", "6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got != nil {
+		t.Errorf("expected nil for invalid kind, got %+v", got)
+	}
+	if mock.lastConv != nil {
+		t.Error("upsert should not have been called with invalid kind")
+	}
+	if !strings.Contains(err.Error(), "invalid DM key inputs") {
+		t.Errorf("expected error about invalid DM key, got: %s", err.Error())
+	}
+}
+
+func TestResolveOrCreateDMConversation_RegistersBothParticipants(t *testing.T) {
+	mock := &mockConversationUpserter{
+		returnConv: &store.Conversation{ID: "conv-part-test", ExternalRef: "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000"},
+	}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	got, err := ResolveOrCreateDMConversation(context.Background(), mock, mock, logger,
+		"agent", "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+		"user", "550e8400-e29b-41d4-a716-446655440000")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if len(mock.ensuredParticipants) != 2 {
+		t.Fatalf("expected 2 ensured participants, got %d", len(mock.ensuredParticipants))
+	}
+	// Sender is registered first.
+	if mock.ensuredParticipants[0].PrincipalKind != "agent" || mock.ensuredParticipants[0].PrincipalID != "6ba7b810-9dad-11d1-80b4-00c04fd430c8" {
+		t.Errorf("unexpected sender participant: %+v", mock.ensuredParticipants[0])
+	}
+	if mock.ensuredParticipants[0].Role != "member" {
+		t.Errorf("expected role 'member', got %q", mock.ensuredParticipants[0].Role)
+	}
+	// Recipient is registered second.
+	if mock.ensuredParticipants[1].PrincipalKind != "user" || mock.ensuredParticipants[1].PrincipalID != "550e8400-e29b-41d4-a716-446655440000" {
+		t.Errorf("unexpected recipient participant: %+v", mock.ensuredParticipants[1])
+	}
+	if mock.ensuredParticipants[1].Role != "member" {
+		t.Errorf("expected role 'member', got %q", mock.ensuredParticipants[1].Role)
+	}
+	// Both point at the same conversation.
+	if mock.ensuredParticipants[0].ConversationID != "conv-part-test" || mock.ensuredParticipants[1].ConversationID != "conv-part-test" {
+		t.Error("participant conversation IDs should match the resolved conversation")
+	}
+}
+
+func TestResolveOrCreateDMConversation_ParticipantErrorIsNonFatal(t *testing.T) {
+	mock := &mockConversationUpserter{
+		returnConv:    &store.Conversation{ID: "conv-err", ExternalRef: "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000"},
+		ensurePartErr: errors.New("db error"),
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	got, err := ResolveOrCreateDMConversation(context.Background(), mock, mock, logger,
+		"agent", "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+		"user", "550e8400-e29b-41d4-a716-446655440000")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result — participant registration failure must not block resolution")
+	}
+	if got.ConversationID != "conv-err" {
+		t.Errorf("expected conv-err, got %q", got.ConversationID)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "participant registration failed") {
+		t.Errorf("expected warning log about participant failure, got: %s", output)
+	}
+}
+
+func TestResolveOrCreateDMConversation_ThirdPartyGuardDocumented(t *testing.T) {
+	// The D-1 guard (rejecting a third participant in a direct conversation)
+	// is exercised in conversation_store_test.go
+	// (TestAddParticipant_DM_ThirdPartyRejection). Here we verify that
+	// ResolveOrCreateDMConversation registers exactly the two principals
+	// named in the key — no more, no less.
+	mock := &mockConversationUpserter{
+		returnConv: &store.Conversation{ID: "conv-guard", ExternalRef: "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000"},
+	}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	_, _ = ResolveOrCreateDMConversation(context.Background(), mock, mock, logger,
+		"agent", "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+		"user", "550e8400-e29b-41d4-a716-446655440000")
+
+	if len(mock.ensuredParticipants) != 2 {
+		t.Fatalf("expected exactly 2 ensured participants from ResolveOrCreateDMConversation, got %d", len(mock.ensuredParticipants))
+	}
+
+	// Verify the two principals match the key inputs.
+	kinds := map[string]string{
+		mock.ensuredParticipants[0].PrincipalID: mock.ensuredParticipants[0].PrincipalKind,
+		mock.ensuredParticipants[1].PrincipalID: mock.ensuredParticipants[1].PrincipalKind,
+	}
+	if kinds["6ba7b810-9dad-11d1-80b4-00c04fd430c8"] != "agent" {
+		t.Error("expected agent participant")
+	}
+	if kinds["550e8400-e29b-41d4-a716-446655440000"] != "user" {
+		t.Error("expected user participant")
+	}
+}
+
+func TestResolveOrCreateDMConversation_IdempotentEnsure(t *testing.T) {
+	// EnsureParticipant returns nil for already-existing rows (no
+	// ErrAlreadyExists to swallow). The function must succeed silently.
+	mock := &mockConversationUpserter{
+		returnConv: &store.Conversation{ID: "conv-idem", ExternalRef: "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000"},
+		// ensurePartErr is nil — simulating the "row already exists" case.
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	got, err := ResolveOrCreateDMConversation(context.Background(), mock, mock, logger,
+		"agent", "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+		"user", "550e8400-e29b-41d4-a716-446655440000")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result when EnsureParticipant returns nil")
+	}
+	if got.ConversationID != "conv-idem" {
+		t.Errorf("expected conv-idem, got %q", got.ConversationID)
+	}
+	output := buf.String()
+	if strings.Contains(output, "participant registration failed") {
+		t.Errorf("nil return from EnsureParticipant should produce no warning log, got: %s", output)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ResolveOrCreateThreadConversation tests
+// ---------------------------------------------------------------------------
+
+func TestResolveOrCreateThreadConversation_HappyPath(t *testing.T) {
+	mock := &mockConversationUpserter{
+		returnConv: &store.Conversation{
+			ID:          "conv-thread-abc",
+			ExternalRef: "thread:proj1:thread-123",
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	got, err := ResolveOrCreateThreadConversation(context.Background(), mock, logger, "thread-123", "proj1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if got.ConversationID != "conv-thread-abc" {
+		t.Errorf("expected conv-thread-abc, got %q", got.ConversationID)
+	}
+	if got.ExternalRef != "thread:proj1:thread-123" {
+		t.Errorf("expected ExternalRef thread:proj1:thread-123, got %q", got.ExternalRef)
+	}
+}
+
+func TestResolveOrCreateThreadConversation_EmptyThreadID(t *testing.T) {
+	mock := &mockConversationUpserter{}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	got, err := ResolveOrCreateThreadConversation(context.Background(), mock, logger, "", "proj1")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got != nil {
+		t.Errorf("expected nil for empty threadID, got %+v", got)
+	}
+	if mock.lastConv != nil {
+		t.Error("upsert should not have been called with empty threadID")
+	}
+}
+
+func TestResolveOrCreateThreadConversation_EmptyProjectID(t *testing.T) {
+	mock := &mockConversationUpserter{}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	got, err := ResolveOrCreateThreadConversation(context.Background(), mock, logger, "thread-123", "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got != nil {
+		t.Errorf("expected nil for empty projectID, got %+v", got)
+	}
+	if mock.lastConv != nil {
+		t.Error("upsert should not have been called with empty projectID")
+	}
+}
+
+func TestResolveOrCreateThreadConversation_UpsertError(t *testing.T) {
+	mock := &mockConversationUpserter{
+		returnErr: errors.New("db error"),
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	got, err := ResolveOrCreateThreadConversation(context.Background(), mock, logger, "thread-123", "proj1")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got != nil {
+		t.Errorf("expected nil on upsert error, got %+v", got)
+	}
+	if !strings.Contains(err.Error(), "conversation upsert failed") {
+		t.Errorf("expected upsert error message, got: %s", err.Error())
+	}
+}
+
+func TestResolveOrCreateThreadConversation_ExternalRefFormat(t *testing.T) {
+	mock := &mockConversationUpserter{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	_, _ = ResolveOrCreateThreadConversation(context.Background(), mock, logger, "thread-ABC", "proj-42")
+	if mock.lastConv == nil {
+		t.Fatal("expected upsert to be called")
+	}
+	expected := "thread:proj-42:thread-ABC"
+	if mock.lastConv.ExternalRef != expected {
+		t.Errorf("expected external_ref %q, got %q", expected, mock.lastConv.ExternalRef)
+	}
+}
+
+func TestResolveOrCreateThreadConversation_ProjectIDSet(t *testing.T) {
+	mock := &mockConversationUpserter{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	_, _ = ResolveOrCreateThreadConversation(context.Background(), mock, logger, "thread-ABC", "proj-42")
+	if mock.lastConv == nil {
+		t.Fatal("expected upsert to be called")
+	}
+	if mock.lastConv.ProjectID == nil {
+		t.Fatal("expected ProjectID to be set for thread conversations")
+	}
+	if *mock.lastConv.ProjectID != "proj-42" {
+		t.Errorf("expected ProjectID proj-42, got %q", *mock.lastConv.ProjectID)
+	}
+}
+
+func TestResolveOrCreateThreadConversation_KindIsGroup(t *testing.T) {
+	mock := &mockConversationUpserter{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	_, _ = ResolveOrCreateThreadConversation(context.Background(), mock, logger, "thread-ABC", "proj-42")
+	if mock.lastConv == nil {
+		t.Fatal("expected upsert to be called")
+	}
+	if mock.lastConv.Kind != "group" {
+		t.Errorf("expected Kind 'group', got %q", mock.lastConv.Kind)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC-DEF15-5: write-then-read tests
+//
+// These use mockConversationStore from backfill_test.go, which implements
+// both ConversationUpserter and ConversationReader with in-memory storage.
+// ---------------------------------------------------------------------------
+
+func TestWriteThenRead_DMPrefixedThreadID(t *testing.T) {
+	// AC-DEF15-5: Write with dm:-prefixed ThreadID, then read with same inputs.
+	// The read must find the row the write created (same ConversationID).
+	cs := &mockConversationStore{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	dmKey := "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000"
+
+	writeResult, err := ResolveOrCreateThreadConversation(
+		context.Background(), cs, logger, dmKey, "")
+	if err != nil {
+		t.Fatalf("write: unexpected error: %v", err)
+	}
+	if writeResult == nil {
+		t.Fatal("write: expected non-nil result for dm:-prefixed ThreadID")
+	}
+
+	readResult := ResolveThreadConversationForRead(
+		context.Background(), cs, logger, dmKey, "")
+	if readResult == nil {
+		t.Fatal("read: expected non-nil result — should find the row the write created")
+	}
+
+	if readResult.ConversationID != writeResult.ConversationID {
+		t.Errorf("ConversationID mismatch: write=%q, read=%q",
+			writeResult.ConversationID, readResult.ConversationID)
+	}
+	if readResult.ExternalRef != writeResult.ExternalRef {
+		t.Errorf("ExternalRef mismatch: write=%q, read=%q",
+			writeResult.ExternalRef, readResult.ExternalRef)
+	}
+}
+
+func TestWriteThenRead_NonDMThreadID(t *testing.T) {
+	// AC-DEF15-5: Write with a non-dm ThreadID, then read with same inputs.
+	cs := &mockConversationStore{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	writeResult, err := ResolveOrCreateThreadConversation(
+		context.Background(), cs, logger, "thread-xyz", "proj-1")
+	if err != nil {
+		t.Fatalf("write: unexpected error: %v", err)
+	}
+	if writeResult == nil {
+		t.Fatal("write: expected non-nil result for non-dm ThreadID")
+	}
+
+	readResult := ResolveThreadConversationForRead(
+		context.Background(), cs, logger, "thread-xyz", "proj-1")
+	if readResult == nil {
+		t.Fatal("read: expected non-nil result — should find the row the write created")
+	}
+
+	if readResult.ConversationID != writeResult.ConversationID {
+		t.Errorf("ConversationID mismatch: write=%q, read=%q",
+			writeResult.ConversationID, readResult.ConversationID)
+	}
+	if readResult.ExternalRef != writeResult.ExternalRef {
+		t.Errorf("ExternalRef mismatch: write=%q, read=%q",
+			writeResult.ExternalRef, readResult.ExternalRef)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Delegation tests — verify distinct log text (Change 5)
+// ---------------------------------------------------------------------------
+
+func TestResolveOrCreateThreadConversation_DMKeyRefusalLogsDistinctly(t *testing.T) {
+	// A non-canonical dm: key must be logged as "conversation key derivation
+	// refused" — distinct from "thread conversation resolution failed" so it's
+	// visible on the divergence board.
+	mock := &mockConversationUpserter{}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// Non-canonical: user before agent (canonical order is agent before user).
+	nonCanonical := "dm:user:550e8400-e29b-41d4-a716-446655440000:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+
+	got, err := ResolveOrCreateThreadConversation(context.Background(), mock, logger,
+		nonCanonical, "")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got != nil {
+		t.Errorf("expected nil for non-canonical dm key, got %+v", got)
+	}
+	if mock.lastConv != nil {
+		t.Error("upsert should not have been called for refused key")
+	}
+	if !strings.Contains(err.Error(), "conversation key derivation refused") {
+		t.Errorf("expected distinct refusal error, got: %s", err.Error())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// B7 nil-pe guard test
+// ---------------------------------------------------------------------------
+
+func TestResolveOrCreateDMConversation_NilParticipantEnsurer(t *testing.T) {
+	// B7: a nil ParticipantEnsurer must not panic. The function advertises
+	// non-fatal semantics for participant registration, and a nil pe that
+	// panics violates that contract. Assert: returns non-nil ConversationResult
+	// AND no panic.
+	mock := &mockConversationUpserter{
+		returnConv: &store.Conversation{
+			ID:          "conv-nil-pe",
+			ExternalRef: "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000",
+		},
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// Pass nil as pe — must not panic.
+	got, err := ResolveOrCreateDMConversation(context.Background(), mock, nil, logger,
+		"agent", "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+		"user", "550e8400-e29b-41d4-a716-446655440000")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil ConversationResult with nil pe — conversation itself resolved")
+	}
+	if got.ConversationID != "conv-nil-pe" {
+		t.Errorf("expected ConversationID conv-nil-pe, got %q", got.ConversationID)
+	}
+	if got.ExternalRef != "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000" {
+		t.Errorf("expected ExternalRef from mock, got %q", got.ExternalRef)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "nil ParticipantEnsurer") {
+		t.Errorf("expected warning log about nil ParticipantEnsurer, got: %s", output)
+	}
+}
+
+func TestResolveThreadConversationForRead_DMKeyWithEmptyProjectID(t *testing.T) {
+	// dm:-prefixed ThreadIDs should work without projectID — the old code
+	// would have returned nil for empty projectID before even trying.
+	cs := &mockConversationStore{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	dmKey := "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000"
+
+	// Write first.
+	writeResult, err := ResolveOrCreateThreadConversation(
+		context.Background(), cs, logger, dmKey, "")
+	if err != nil {
+		t.Fatalf("write: unexpected error: %v", err)
+	}
+	if writeResult == nil {
+		t.Fatal("write: expected non-nil result")
+	}
+
+	// Read with empty projectID — should still find the DM.
+	readResult := ResolveThreadConversationForRead(
+		context.Background(), cs, logger, dmKey, "")
+	if readResult == nil {
+		t.Fatal("read: expected non-nil result for dm key with empty projectID")
+	}
+	if readResult.ConversationID != writeResult.ConversationID {
+		t.Errorf("ConversationID mismatch: write=%q, read=%q",
+			writeResult.ConversationID, readResult.ConversationID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// mockTopicLookup — test double for TopicConversationLookup
+// ---------------------------------------------------------------------------
+
+type mockTopicLookup struct {
+	// topics maps topicID -> conversationID. Empty string means topic exists
+	// but has no conversation_id. Missing key means topic not found.
+	topics map[string]string
+
+	// deleted is the set of topicIDs that are soft-deleted. A topic in
+	// deleted must also have an entry in topics (it still exists, just
+	// tombstoned). GetTopicConversationID returns ErrNotFound for these;
+	// GetTopicConversationIDIncludingDeleted returns the conversation_id.
+	deleted map[string]bool
+
+	// projects maps topicID -> projectID. A topic with no entry belongs
+	// to every project.
+	projects map[string]string
+
+	// calledMethod records which method was last called, so tests can
+	// verify the sink calls the correct accessor.
+	calledMethod string
+}
+
+func (m *mockTopicLookup) GetTopicConversationIDInProject(_ context.Context, projectID, topicID string) (string, error) {
+	m.calledMethod = "GetTopicConversationIDInProject"
+	if !m.inProject(projectID, topicID) {
+		return "", fmt.Errorf("topic not found in project %s: %w", topicID, store.ErrNotFound)
+	}
+	// User-facing: hides soft-deleted topics.
+	if m.deleted[topicID] {
+		return "", fmt.Errorf("topic not found (deleted) %s: %w", topicID, store.ErrNotFound)
+	}
+	convID, ok := m.topics[topicID]
+	if !ok {
+		return "", fmt.Errorf("topic not found %s: %w", topicID, store.ErrNotFound)
+	}
+	return convID, nil
+}
+
+// inProject reports whether topicID belongs to projectID; topics without a
+// recorded project belong to every project.
+func (m *mockTopicLookup) inProject(projectID, topicID string) bool {
+	p, ok := m.projects[topicID]
+	return !ok || p == projectID
+}
+
+func (m *mockTopicLookup) GetTopicConversationIDIncludingDeletedInProject(_ context.Context, projectID, topicID string) (string, error) {
+	m.calledMethod = "GetTopicConversationIDIncludingDeletedInProject"
+	if !m.inProject(projectID, topicID) {
+		return "", fmt.Errorf("topic not found in project %s: %w", topicID, store.ErrNotFound)
+	}
+	// Mint guard: sees soft-deleted topics.
+	convID, ok := m.topics[topicID]
+	if !ok {
+		return "", fmt.Errorf("topic not found %s: %w", topicID, store.ErrNotFound)
+	}
+	return convID, nil
+}
+
+// mockTopicLookupWithError returns a configurable error for any topicID.
+type mockTopicLookupWithError struct {
+	err error
+}
+
+func (m *mockTopicLookupWithError) GetTopicConversationIDInProject(_ context.Context, _, _ string) (string, error) {
+	return "", m.err
+}
+
+func (m *mockTopicLookupWithError) GetTopicConversationIDIncludingDeletedInProject(_ context.Context, _, _ string) (string, error) {
+	return "", m.err
+}
+
+// ---------------------------------------------------------------------------
+// AC-U-3: The message path NEVER mints a surface=native conversation for a
+// thread ID that has no topic row (with topic lookup enabled).
+// ---------------------------------------------------------------------------
+
+func TestAC_U3_NoMintForNativeTopicWithoutRow(t *testing.T) {
+	// Scenario: threadID is a topic UUID that does NOT exist in webchat_topic.
+	// With the sink-level guard (DEF-20 unify), store.ErrNotFound means "not a
+	// native topic" and falls through to upsert. This is correct because the
+	// lookup is now injected unconditionally (not just for web channels), so
+	// non-native surface threads (Discord, Telegram) will naturally get
+	// ErrNotFound and should proceed to upsert.
+	mock := &mockConversationUpserter{
+		returnConv: &store.Conversation{
+			ID:          "conv-minted",
+			ExternalRef: "thread:proj-1:topic-uuid-nonexistent",
+		},
+	}
+	lookup := &mockTopicLookup{topics: map[string]string{}} // empty = no topics
+
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	// Thread ID that looks like a topic UUID but doesn't exist.
+	got, err := ResolveOrCreateThreadConversation(
+		context.Background(), mock, logger,
+		"topic-uuid-nonexistent", "proj-1",
+		WithTopicLookup(lookup))
+
+	// When topic lookup returns store.ErrNotFound, the sink falls through to
+	// upsert — this is the expected behavior for non-native surface threads.
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result — ErrNotFound should fall through to upsert")
+	}
+	if got.ConversationID != "conv-minted" {
+		t.Errorf("ConversationID: got %q, want %q", got.ConversationID, "conv-minted")
+	}
+	if mock.lastConv == nil {
+		t.Error("upsert must be called when topic is not found (ErrNotFound)")
+	}
+}
+
+func TestAC_U3_NoMintForTopicWithoutConversationID(t *testing.T) {
+	// Scenario: threadID is a webchat topic UUID that EXISTS but has no
+	// conversation_id yet (not yet backfilled). The function must return nil
+	// (unresolved) and MUST NOT mint a new conversation row.
+	mock := &mockConversationUpserter{}
+	lookup := &mockTopicLookup{
+		topics: map[string]string{
+			"topic-no-conv": "", // exists but no conversation_id
+		},
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	got, err := ResolveOrCreateThreadConversation(
+		context.Background(), mock, logger,
+		"topic-no-conv", "proj-1",
+		WithTopicLookup(lookup))
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if got != nil {
+		t.Errorf("expected nil for topic without conversation_id, got %+v", got)
+	}
+	if mock.lastConv != nil {
+		t.Error("upsert MUST NOT be called — no conversation row should be minted")
+	}
+	if !strings.Contains(err.Error(), "topic has no conversation_id") {
+		t.Errorf("expected error about missing conversation_id, got: %s", err.Error())
+	}
+}
+
+func TestAC_U3_ResolveViaTopicLookup(t *testing.T) {
+	// Scenario: threadID is a webchat topic UUID that EXISTS and HAS a
+	// conversation_id. The function must return the linked conversation_id
+	// without calling the upserter.
+	mock := &mockConversationUpserter{}
+	lookup := &mockTopicLookup{
+		topics: map[string]string{
+			"topic-with-conv": "conv-linked-123",
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	got, err := ResolveOrCreateThreadConversation(
+		context.Background(), mock, logger,
+		"topic-with-conv", "proj-1",
+		WithTopicLookup(lookup))
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result for topic with conversation_id")
+	}
+	if got.ConversationID != "conv-linked-123" {
+		t.Errorf("expected conversation_id conv-linked-123, got %q", got.ConversationID)
+	}
+	if mock.lastConv != nil {
+		t.Error("upsert MUST NOT be called when topic lookup succeeds")
+	}
+}
+
+func TestAC_U3_DMPrefixFallsThrough(t *testing.T) {
+	// Scenario: threadID is a dm:-prefixed key. Even with topic lookup enabled,
+	// dm: keys should fall through to the existing DeriveConversationKey path
+	// because they are not native topics.
+	mock := &mockConversationUpserter{
+		returnConv: &store.Conversation{
+			ID:          "conv-dm-fallthrough",
+			ExternalRef: "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000",
+		},
+	}
+	lookup := &mockTopicLookup{topics: map[string]string{}} // no topics
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	dmKey := "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000"
+	got, err := ResolveOrCreateThreadConversation(
+		context.Background(), mock, logger,
+		dmKey, "",
+		WithTopicLookup(lookup))
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result — dm: keys must fall through to upsert")
+	}
+	if got.ConversationID != "conv-dm-fallthrough" {
+		t.Errorf("expected conv-dm-fallthrough, got %q", got.ConversationID)
+	}
+}
+
+func TestAC_U3_WithoutTopicLookup_StillMints(t *testing.T) {
+	// Backwards compatibility: without the WithTopicLookup option,
+	// the function must still mint conversations as before.
+	mock := &mockConversationUpserter{
+		returnConv: &store.Conversation{
+			ID:          "conv-minted",
+			ExternalRef: "thread:proj-1:topic-uuid",
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	got, err := ResolveOrCreateThreadConversation(
+		context.Background(), mock, logger,
+		"topic-uuid", "proj-1") // no WithTopicLookup
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil result — without lookup, must mint as before")
+	}
+	if got.ConversationID != "conv-minted" {
+		t.Errorf("expected conv-minted, got %q", got.ConversationID)
+	}
+	if mock.lastConv == nil {
+		t.Error("upsert must have been called (backwards compat)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEF-21 regression: infrastructure error must NOT fall through to upsert
+// ---------------------------------------------------------------------------
+
+func TestDEF21_InfraErrorMustNotMint(t *testing.T) {
+	// DEF-21: When GetTopicConversationID returns an infrastructure error
+	// (e.g. DB connection lost — NOT store.ErrNotFound), the function must
+	// NOT fall through to the upsert path and mint a spurious conversation.
+	// It must return nil (non-fatal contract) without calling the upserter.
+	mock := &mockConversationUpserter{
+		returnConv: &store.Conversation{
+			ID:          "conv-spurious",
+			ExternalRef: "thread:proj-1:some-topic",
+		},
+	}
+	lookup := &mockTopicLookupWithError{
+		err: errors.New("connection refused"), // infra error, NOT ErrNotFound
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	got, err := ResolveOrCreateThreadConversation(
+		context.Background(), mock, logger,
+		"some-topic", "proj-1",
+		WithTopicLookup(lookup))
+
+	// After the DEF-21 fix:
+	// - err must be non-nil (infra error propagated)
+	// - got must be nil (no spurious conversation minted)
+	// - mock.lastConv must be nil (upserter must NOT be called)
+	if err == nil {
+		t.Fatal("DEF-21: expected error on infra error, got nil")
+	}
+	if got != nil {
+		t.Errorf("DEF-21: expected nil on infra error, got %+v (spurious mint!)", got)
+	}
+	if mock.lastConv != nil {
+		t.Errorf("DEF-21: upserter was called on infra error — spurious conversation minted")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEF-100: ResolveThreadConversationForRead topic-lookup intercept tests
+// ---------------------------------------------------------------------------
+
+func TestDEF100_ReadResolveViaTopicLookup(t *testing.T) {
+	// DEF-100: native topic with conversation_id — the read path must resolve
+	// via the topic's linked conversation_id, NOT via external_ref (which is '').
+	cs := &mockConversationStore{}
+	lookup := &mockTopicLookup{
+		topics: map[string]string{
+			"native-topic-1": "conv-linked-abc",
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	got := ResolveThreadConversationForRead(
+		context.Background(), cs, logger,
+		"native-topic-1", "proj-1",
+		WithReadTopicLookup(lookup))
+
+	if got == nil {
+		t.Fatal("DEF-100: expected non-nil result for native topic with conversation_id")
+	}
+	if got.ConversationID != "conv-linked-abc" {
+		t.Errorf("DEF-100: expected conversation_id conv-linked-abc, got %q", got.ConversationID)
+	}
+	if lookup.calledMethod != "GetTopicConversationIDIncludingDeletedInProject" {
+		t.Errorf("DEF-100: expected GetTopicConversationIDIncludingDeletedInProject, got %q", lookup.calledMethod)
+	}
+}
+
+func TestDEF100_ReadResolveTopicNoConversationID(t *testing.T) {
+	// Topic exists but has no conversation_id (not yet backfilled). Must return nil.
+	cs := &mockConversationStore{}
+	lookup := &mockTopicLookup{
+		topics: map[string]string{
+			"topic-no-conv": "", // exists but no conversation_id
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	got := ResolveThreadConversationForRead(
+		context.Background(), cs, logger,
+		"topic-no-conv", "proj-1",
+		WithReadTopicLookup(lookup))
+
+	if got != nil {
+		t.Errorf("DEF-100: expected nil for topic without conversation_id, got %+v", got)
+	}
+}
+
+func TestDEF100_ReadResolveFallsThroughForNonNativeTopic(t *testing.T) {
+	// Thread is NOT a native topic (store.ErrNotFound) — must fall through
+	// to external_ref lookup and find the conversation that way. This is the
+	// path for non-native surfaces (Discord, Telegram) that have a well-formed
+	// external_ref on the conversations row.
+	cs := &mockConversationStore{}
+	lookup := &mockTopicLookup{
+		topics: map[string]string{}, // empty = no topics
+	}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	// Write a conversation with a well-formed external_ref (as non-native
+	// surfaces do).
+	writeResult, err := ResolveOrCreateThreadConversation(
+		context.Background(), cs, logger,
+		"non-native-thread-1", "proj-1")
+	if err != nil {
+		t.Fatalf("write: unexpected error: %v", err)
+	}
+
+	got := ResolveThreadConversationForRead(
+		context.Background(), cs, logger,
+		"non-native-thread-1", "proj-1",
+		WithReadTopicLookup(lookup))
+
+	if got == nil {
+		t.Fatal("DEF-100: expected non-nil result — non-native thread should resolve via external_ref")
+	}
+	if got.ConversationID != writeResult.ConversationID {
+		t.Errorf("ConversationID mismatch: write=%q, read=%q",
+			writeResult.ConversationID, got.ConversationID)
+	}
+}
+
+func TestDEF100_ReadResolveInfraError(t *testing.T) {
+	// Infrastructure error from topic lookup must NOT fall through to
+	// external_ref lookup — must return nil.
+	cs := &mockConversationStore{}
+	lookup := &mockTopicLookupWithError{
+		err: errors.New("connection refused"),
+	}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	// Write a conversation so it exists in the store.
+	_, err := ResolveOrCreateThreadConversation(
+		context.Background(), cs, logger,
+		"thread-infra-err", "proj-1")
+	if err != nil {
+		t.Fatalf("write: unexpected error: %v", err)
+	}
+
+	got := ResolveThreadConversationForRead(
+		context.Background(), cs, logger,
+		"thread-infra-err", "proj-1",
+		WithReadTopicLookup(lookup))
+
+	if got != nil {
+		t.Errorf("DEF-100: expected nil on infra error, got %+v — must not fall through", got)
+	}
+}
+
+func TestDEF100_ReadResolveWithoutTopicLookup_BackwardsCompat(t *testing.T) {
+	// Without WithReadTopicLookup, the function must behave exactly as before —
+	// resolve via external_ref. This is backwards compatibility.
+	cs := &mockConversationStore{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	writeResult, err := ResolveOrCreateThreadConversation(
+		context.Background(), cs, logger,
+		"thread-compat", "proj-1")
+	if err != nil {
+		t.Fatalf("write: unexpected error: %v", err)
+	}
+
+	got := ResolveThreadConversationForRead(
+		context.Background(), cs, logger,
+		"thread-compat", "proj-1") // no WithReadTopicLookup
+
+	if got == nil {
+		t.Fatal("expected non-nil result — backwards compat with no topic lookup")
+	}
+	if got.ConversationID != writeResult.ConversationID {
+		t.Errorf("ConversationID mismatch: write=%q, read=%q",
+			writeResult.ConversationID, got.ConversationID)
+	}
+}
+
+func TestDEF100_ReadResolveDMKeyBypassesTopicLookup(t *testing.T) {
+	// dm:-prefixed ThreadIDs must NOT trigger the topic lookup intercept.
+	// DeriveConversationKey returns kind="direct" for dm: keys, and the
+	// intercept only fires for kind="group" — so this is implicitly safe.
+	// Test it explicitly.
+	cs := &mockConversationStore{}
+	lookup := &mockTopicLookup{
+		topics: map[string]string{}, // empty = no topics
+	}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	dmKey := "dm:agent:6ba7b810-9dad-11d1-80b4-00c04fd430c8:user:550e8400-e29b-41d4-a716-446655440000"
+
+	// Write the DM conversation first.
+	_, err := ResolveOrCreateThreadConversation(
+		context.Background(), cs, logger, dmKey, "")
+	if err != nil {
+		t.Fatalf("write: unexpected error: %v", err)
+	}
+
+	got := ResolveThreadConversationForRead(
+		context.Background(), cs, logger,
+		dmKey, "",
+		WithReadTopicLookup(lookup))
+
+	if got == nil {
+		t.Fatal("expected non-nil result for dm: key with topic lookup option")
+	}
+	// The topic lookup should NOT have been called (kind="direct", not "group").
+	if lookup.calledMethod != "" {
+		t.Errorf("topic lookup should not have been called for dm: key, got %q", lookup.calledMethod)
+	}
+}
+
+func TestDEF100_ReadResolveSoftDeletedTopic(t *testing.T) {
+	// Soft-deleted native topic: GetTopicConversationIDIncludingDeleted still
+	// returns the conversation_id. The read path must resolve it.
+	cs := &mockConversationStore{}
+	lookup := &mockTopicLookup{
+		topics: map[string]string{
+			"deleted-topic": "conv-deleted-123",
+		},
+		deleted: map[string]bool{
+			"deleted-topic": true,
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	got := ResolveThreadConversationForRead(
+		context.Background(), cs, logger,
+		"deleted-topic", "proj-1",
+		WithReadTopicLookup(lookup))
+
+	if got == nil {
+		t.Fatal("DEF-100: expected non-nil result for soft-deleted native topic")
+	}
+	if got.ConversationID != "conv-deleted-123" {
+		t.Errorf("expected conversation_id conv-deleted-123, got %q", got.ConversationID)
+	}
+	if lookup.calledMethod != "GetTopicConversationIDIncludingDeletedInProject" {
+		t.Errorf("expected GetTopicConversationIDIncludingDeletedInProject, got %q", lookup.calledMethod)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEF-140: WithThreadSurface tests
+// ---------------------------------------------------------------------------
+
+func TestResolveOrCreateThreadConversation_WithThreadSurface_Discord(t *testing.T) {
+	// DEF-140: When a channel plugin supplies "discord", the upserted
+	// conversation row must carry surface="discord", not the default "native".
+	mock := &mockConversationUpserter{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	_, err := ResolveOrCreateThreadConversation(
+		context.Background(), mock, logger, "thread-123", "proj-1",
+		WithThreadSurface("discord"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.lastConv == nil {
+		t.Fatal("expected upsert to be called")
+	}
+	if mock.lastConv.Surface != "discord" {
+		t.Errorf("expected surface 'discord', got %q", mock.lastConv.Surface)
+	}
+}
+
+func TestResolveOrCreateThreadConversation_WithThreadSurface_Slack(t *testing.T) {
+	// DEF-140: Verify "slack" channel is forwarded correctly.
+	mock := &mockConversationUpserter{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	_, err := ResolveOrCreateThreadConversation(
+		context.Background(), mock, logger, "thread-123", "proj-1",
+		WithThreadSurface("slack"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.lastConv == nil {
+		t.Fatal("expected upsert to be called")
+	}
+	if mock.lastConv.Surface != "slack" {
+		t.Errorf("expected surface 'slack', got %q", mock.lastConv.Surface)
+	}
+}
+
+func TestResolveOrCreateThreadConversation_DefaultSurfaceIsNative(t *testing.T) {
+	// DEF-140/R3: Without WithThreadSurface the default "native" must survive.
+	mock := &mockConversationUpserter{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	_, err := ResolveOrCreateThreadConversation(
+		context.Background(), mock, logger, "thread-123", "proj-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.lastConv == nil {
+		t.Fatal("expected upsert to be called")
+	}
+	if mock.lastConv.Surface != "native" {
+		t.Errorf("expected default surface 'native', got %q", mock.lastConv.Surface)
+	}
+}
+
+func TestResolveOrCreateThreadConversation_EmptyChannelKeepsNative(t *testing.T) {
+	// DEF-140/R3: An empty channel must NOT override the default. The
+	// WithThreadSurface guard checks for non-empty, but verify the invariant
+	// end-to-end.
+	mock := &mockConversationUpserter{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	_, err := ResolveOrCreateThreadConversation(
+		context.Background(), mock, logger, "thread-123", "proj-1",
+		WithThreadSurface(""))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.lastConv == nil {
+		t.Fatal("expected upsert to be called")
+	}
+	if mock.lastConv.Surface != "native" {
+		t.Errorf("expected surface 'native' when channel is empty, got %q", mock.lastConv.Surface)
+	}
+}
+
+// surfaceTrackingUpserter records every upsert call keyed by (surface, externalRef)
+// and returns a different conversation ID for each unique pair — mirroring the
+// real (surface, external_ref) unique index behaviour. Validates the surface
+// against the production validSurfaces whitelist (which is itself cross-checked
+// against the ent enum by TestValidSurfaces_MatchesEntEnum).
+type surfaceTrackingUpserter struct {
+	rows map[string]*store.Conversation // key = surface + "|" + externalRef
+	seq  int
+}
+
+func newSurfaceTrackingUpserter() *surfaceTrackingUpserter {
+	return &surfaceTrackingUpserter{rows: make(map[string]*store.Conversation)}
+}
+
+func (s *surfaceTrackingUpserter) UpsertConversationByExternalRef(
+	_ context.Context, conv *store.Conversation,
+) (*store.Conversation, error) {
+	// Validate surface against the production whitelist — reject values that
+	// the real store would reject, so the test double cannot hide write denials.
+	if !validSurfaces[conv.Surface] {
+		return nil, fmt.Errorf("surface validation failed: invalid enum value %q (test double uses production validSurfaces whitelist)", conv.Surface)
+	}
+	key := conv.Surface + "|" + conv.ExternalRef
+	if existing, ok := s.rows[key]; ok {
+		return existing, nil
+	}
+	s.seq++
+	created := *conv
+	created.ID = fmt.Sprintf("conv-%d", s.seq)
+	s.rows[key] = &created
+	return &created, nil
+}
+
+func TestDEF140_DiscordThreadCreatesSeparateConversation(t *testing.T) {
+	// DEF-140 split test: an existing (native, thread:P:T) row and a new
+	// (discord, thread:P:T) inbound must resolve to DIFFERENT conversation ids.
+	// The old row must remain untouched.
+	upsert := newSurfaceTrackingUpserter()
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	// Step 1: Create the native conversation (simulates historical web-chat usage).
+	nativeResult, err := ResolveOrCreateThreadConversation(
+		context.Background(), upsert, logger, "thread-T", "proj-P")
+	if err != nil {
+		t.Fatalf("native resolve: %v", err)
+	}
+	if nativeResult == nil {
+		t.Fatal("native resolve: expected non-nil result")
+	}
+
+	// Step 2: Resolve the same thread from discord — must get a different ID.
+	discordResult, err := ResolveOrCreateThreadConversation(
+		context.Background(), upsert, logger, "thread-T", "proj-P",
+		WithThreadSurface("discord"))
+	if err != nil {
+		t.Fatalf("discord resolve: %v", err)
+	}
+	if discordResult == nil {
+		t.Fatal("discord resolve: expected non-nil result")
+	}
+
+	if nativeResult.ConversationID == discordResult.ConversationID {
+		t.Fatalf("DEF-140 violation: native and discord resolved to same conversation %q — "+
+			"expected different conversations under the (surface, external_ref) index",
+			nativeResult.ConversationID)
+	}
+
+	// Step 3: Verify the native row is untouched — re-resolve and confirm same ID.
+	nativeAgain, err := ResolveOrCreateThreadConversation(
+		context.Background(), upsert, logger, "thread-T", "proj-P")
+	if err != nil {
+		t.Fatalf("native re-resolve: %v", err)
+	}
+	if nativeAgain.ConversationID != nativeResult.ConversationID {
+		t.Errorf("native row mutated: expected %q, got %q",
+			nativeResult.ConversationID, nativeAgain.ConversationID)
+	}
+
+	// Step 4: Verify surfaces are correct on the stored rows.
+	nativeRow := upsert.rows["native|thread:proj-P:thread-T"]
+	if nativeRow == nil {
+		t.Fatal("expected native row in store")
+	}
+	if nativeRow.Surface != "native" {
+		t.Errorf("native row surface: expected 'native', got %q", nativeRow.Surface)
+	}
+
+	discordRow := upsert.rows["discord|thread:proj-P:thread-T"]
+	if discordRow == nil {
+		t.Fatal("expected discord row in store")
+	}
+	if discordRow.Surface != "discord" {
+		t.Errorf("discord row surface: expected 'discord', got %q", discordRow.Surface)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEF-140: ChannelToSurface mapping tests
+// ---------------------------------------------------------------------------
+
+func TestChannelToSurface_ValidChannels(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	tests := []struct {
+		channel string
+		want    string
+	}{
+		{"discord", "discord"},
+		{"slack", "slack"},
+		{"telegram", "telegram"},
+		{"gchat", "gchat"},
+		{"teams", "teams"},
+		{"native", "native"},
+	}
+	for _, tt := range tests {
+		got := ChannelToSurface(tt.channel, logger)
+		if got != tt.want {
+			t.Errorf("ChannelToSurface(%q) = %q, want %q", tt.channel, got, tt.want)
+		}
+	}
+}
+
+func TestChannelToSurface_WebMapsToNative(t *testing.T) {
+	// "web" is the web-chat channel; its surface is "native".
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	got := ChannelToSurface("web", logger)
+	if got != "native" {
+		t.Errorf("ChannelToSurface(\"web\") = %q, want \"native\"", got)
+	}
+}
+
+func TestChannelToSurface_EmptyFallsBackToNative(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	got := ChannelToSurface("", logger)
+	if got != "native" {
+		t.Errorf("ChannelToSurface(\"\") = %q, want \"native\"", got)
+	}
+}
+
+func TestChannelToSurface_UnknownFallsBackToNative(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	got := ChannelToSurface("irc", logger)
+	if got != "native" {
+		t.Errorf("ChannelToSurface(\"irc\") = %q, want \"native\"", got)
+	}
+	// Verify a warning was logged.
+	if !strings.Contains(buf.String(), "unmapped channel") {
+		t.Errorf("expected warning log for unmapped channel, got: %s", buf.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ChannelToSurfaceStrict — DEF-156 P3: refuses unmappable channels
+// ---------------------------------------------------------------------------
+
+func TestChannelToSurfaceStrict_ValidChannels(t *testing.T) {
+	tests := []struct {
+		channel string
+		want    string
+	}{
+		{"discord", "discord"},
+		{"slack", "slack"},
+		{"telegram", "telegram"},
+		{"gchat", "gchat"},
+		{"teams", "teams"},
+		{"native", "native"},
+		{"web", "native"}, // alias
+		{"", "native"},    // empty → native
+	}
+	for _, tt := range tests {
+		got, err := ChannelToSurfaceStrict(tt.channel)
+		if err != nil {
+			t.Errorf("ChannelToSurfaceStrict(%q) unexpected error: %v", tt.channel, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("ChannelToSurfaceStrict(%q) = %q, want %q", tt.channel, got, tt.want)
+		}
+	}
+}
+
+func TestChannelToSurfaceStrict_RefusesUnmappable(t *testing.T) {
+	// ChannelToSurfaceStrict must refuse unknown channels with an error,
+	// NOT coerce them to "native" as the lenient ChannelToSurface does.
+	for _, ch := range []string{"irc", "matrix", "xmpp", "unknown-channel"} {
+		surface, err := ChannelToSurfaceStrict(ch)
+		if err == nil {
+			t.Errorf("ChannelToSurfaceStrict(%q) = %q, want error", ch, surface)
+		}
+		if surface != "" {
+			t.Errorf("ChannelToSurfaceStrict(%q) returned non-empty surface %q on error", ch, surface)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SurfaceToChannel — the inverse of ChannelToSurface.
+// ---------------------------------------------------------------------------
+
+func TestSurfaceToChannel_NativeMapsToWeb(t *testing.T) {
+	// The "web" channel maps to surface "native" (channelToSurface).
+	// The inverse must produce "web" for surface "native".
+	// Precedent: sendAgentRouted (handlers_chat_v2.go:1059) writes
+	// Channel:"web" for native-surface conversations.
+	ch, err := SurfaceToChannel("native")
+	if err != nil {
+		t.Fatalf("SurfaceToChannel(\"native\") error: %v", err)
+	}
+	if ch != "web" {
+		t.Errorf("SurfaceToChannel(\"native\") = %q, want \"web\"", ch)
+	}
+}
+
+func TestSurfaceToChannel_IdentitySurfaces(t *testing.T) {
+	// Surfaces that are also valid channel names pass through as themselves.
+	for _, surface := range []string{"discord", "slack", "telegram", "gchat", "teams"} {
+		ch, err := SurfaceToChannel(surface)
+		if err != nil {
+			t.Errorf("SurfaceToChannel(%q) error: %v", surface, err)
+			continue
+		}
+		if ch != surface {
+			t.Errorf("SurfaceToChannel(%q) = %q, want %q", surface, ch, surface)
+		}
+	}
+}
+
+func TestSurfaceToChannel_EmptyRefused(t *testing.T) {
+	_, err := SurfaceToChannel("")
+	if err == nil {
+		t.Error("SurfaceToChannel(\"\") must return an error, not a default")
+	}
+}
+
+func TestSurfaceToChannel_UnknownRefused(t *testing.T) {
+	for _, surface := range []string{"irc", "matrix", "xmpp", "unknown"} {
+		ch, err := SurfaceToChannel(surface)
+		if err == nil {
+			t.Errorf("SurfaceToChannel(%q) = %q, want error", surface, ch)
+		}
+	}
+}
+
+func TestInvertChannelMap_CollidingMap_ReturnsError(t *testing.T) {
+	// Two channels mapping to the same surface must produce an error that
+	// names both channels. This exercises the guard that init() relies on.
+	colliding := map[string]string{
+		"web":     "native",
+		"webchat": "native",
+	}
+	inv, err := invertChannelMap(colliding)
+	if err == nil {
+		t.Fatalf("invertChannelMap should error on collision, got %v", inv)
+	}
+	// The error must name both channels so the developer sees the conflict.
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "web") || !strings.Contains(errMsg, "webchat") {
+		t.Errorf("error should name both colliding channels, got: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "native") {
+		t.Errorf("error should name the colliding surface, got: %s", errMsg)
+	}
+}
+
+func TestInvertChannelMap_RealMap_NoCollision(t *testing.T) {
+	// The production channelToSurface map must invert without collision.
+	// This calls the same function that init() calls — if the guard is
+	// ever deleted from init(), this test catches the regression.
+	inv, err := invertChannelMap(channelToSurface)
+	if err != nil {
+		t.Fatalf("invertChannelMap(channelToSurface) error: %v", err)
+	}
+	if len(inv) != len(channelToSurface) {
+		t.Errorf("inverse has %d entries, want %d", len(inv), len(channelToSurface))
+	}
+}
+
+func TestDEF140_UnknownChannelResolvesConversationSuccessfully(t *testing.T) {
+	// DEF-140/R3: A message whose channel is NOT a valid surface must still
+	// resolve a conversation successfully and land on "native". This is the
+	// end-to-end proof that ChannelToSurface prevents write denials from
+	// unknown channels.
+	upsert := newSurfaceTrackingUpserter()
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	// Map the unknown channel through ChannelToSurface, as callers do.
+	surface := ChannelToSurface("irc", logger)
+
+	var opts []ThreadConversationOption
+	if surface != "native" {
+		opts = append(opts, WithThreadSurface(surface))
+	}
+
+	result, err := ResolveOrCreateThreadConversation(
+		context.Background(), upsert, logger, "thread-T", "proj-P", opts...)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	// Must have landed on "native", not on "irc".
+	row := upsert.rows["native|thread:proj-P:thread-T"]
+	if row == nil {
+		t.Fatal("expected native row in store — unknown channel should map to native")
+	}
+	if row.Surface != "native" {
+		t.Errorf("expected surface 'native', got %q", row.Surface)
+	}
+
+	// Verify that passing "irc" directly WOULD fail the enum validation.
+	_, directErr := upsert.UpsertConversationByExternalRef(context.Background(), &store.Conversation{
+		Surface:     "irc",
+		ExternalRef: "thread:proj-P:thread-T",
+		Kind:        "group",
+	})
+	if directErr == nil {
+		t.Fatal("expected enum validation error for raw 'irc' surface — test double should reject invalid enum values")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEF-140: validSurfaces ↔ schema cross-check (source-scanning)
+//
+// Precedent: pkg/hub/consistency_check_guard_test.go (DEF-139 structural guard).
+// ---------------------------------------------------------------------------
+
+// surfaceSchemaRelPath is the path from the repo root to the ent schema file
+// that declares the surface enum. Used by the cross-check test.
+const surfaceSchemaRelPath = "pkg/ent/schema/conversation.go"
+
+// parseSurfaceValuesFromSchema reads the ent schema source file and extracts
+// the Values(...) arguments for the "surface" enum field. Returns the set of
+// values and any error. Callers MUST treat an empty set as a failure — the
+// schema is known to have values, and an empty parse means the scanner missed.
+func parseSurfaceValuesFromSchema(schemaPath string) (map[string]bool, error) {
+	data, err := os.ReadFile(schemaPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read schema file %s: %w", schemaPath, err)
+	}
+
+	// Match the surface enum declaration:
+	//   field.Enum("surface").
+	//       Values("native", "discord", ...),
+	// The Values(...) call may be on the same line or the next.
+	// We scan for field.Enum("surface") then capture the Values(...) args.
+	surfaceEnumRe := regexp.MustCompile(
+		`field\.Enum\("surface"\)\.\s*\n?\s*Values\(([^)]+)\)`,
+	)
+	match := surfaceEnumRe.FindSubmatch(data)
+	if match == nil {
+		return nil, fmt.Errorf("cannot find field.Enum(\"surface\").Values(...) declaration in %s", schemaPath)
+	}
+
+	// Extract individual quoted values from the captured group.
+	valueRe := regexp.MustCompile(`"([^"]+)"`)
+	valueMatches := valueRe.FindAllSubmatch(match[1], -1)
+	if len(valueMatches) == 0 {
+		return nil, fmt.Errorf("found surface Values() declaration but extracted zero values from %s", schemaPath)
+	}
+
+	result := make(map[string]bool, len(valueMatches))
+	for _, vm := range valueMatches {
+		result[string(vm[1])] = true
+	}
+	return result, nil
+}
+
+// repoRoot returns the repository root by walking up from the test file's
+// directory until it finds go.mod. This avoids hard-coding an absolute path
+// and works regardless of where `go test` is invoked.
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	// runtime.Caller(0) gives us this test file's path.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed — cannot locate test file")
+	}
+	dir := filepath.Dir(thisFile)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("could not find go.mod walking up from %s", thisFile)
+		}
+		dir = parent
+	}
+}
+
+func TestValidSurfaces_MatchesSchemaEnum(t *testing.T) {
+	// This test scans the ent schema source file — the single source of truth
+	// for the surface enum — and asserts that validSurfaces matches it exactly
+	// in both directions. Unlike a hand-written list of constants, this test
+	// cannot silently pass when a value is added to the schema.
+	//
+	// Fail-closed: if the file cannot be found, the pattern cannot be matched,
+	// or zero values are extracted, the test FAILS with a clear message.
+
+	root := repoRoot(t)
+	schemaPath := filepath.Join(root, surfaceSchemaRelPath)
+
+	schemaValues, err := parseSurfaceValuesFromSchema(schemaPath)
+	if err != nil {
+		t.Fatalf("schema scan failed (fail-closed): %v", err)
+	}
+	if len(schemaValues) == 0 {
+		t.Fatal("schema scan returned zero values — the schema is known to declare surface values; this means the scanner is broken")
+	}
+
+	// Direction 1: every schema value must be in validSurfaces.
+	for sv := range schemaValues {
+		if !validSurfaces[sv] {
+			t.Errorf("schema declares surface %q but validSurfaces does not contain it — add it to pkg/messaging/conversation.go validSurfaces", sv)
+		}
+	}
+
+	// Direction 2: every validSurfaces key must be in the schema.
+	for vs := range validSurfaces {
+		if !schemaValues[vs] {
+			t.Errorf("validSurfaces contains %q but the schema does not declare it — remove it from pkg/messaging/conversation.go validSurfaces or add it to the schema", vs)
+		}
+	}
+
+	// Cardinality check.
+	if len(validSurfaces) != len(schemaValues) {
+		var vsKeys []string
+		for k := range validSurfaces {
+			vsKeys = append(vsKeys, k)
+		}
+		sort.Strings(vsKeys)
+		var svKeys []string
+		for k := range schemaValues {
+			svKeys = append(svKeys, k)
+		}
+		sort.Strings(svKeys)
+		t.Errorf("cardinality mismatch: validSurfaces=%v (%d), schema=%v (%d)",
+			vsKeys, len(vsKeys), svKeys, len(svKeys))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WithReadSurface tests — surface-aware thread read resolution (#1494)
+// ---------------------------------------------------------------------------
+
+// TestReadSurface_DiscordThreadNotFoundWithoutOption verifies that a thread
+// conversation created on surface "discord" is NOT found by the default
+// (native) read path.
+func TestReadSurface_DiscordThreadNotFoundWithoutOption(t *testing.T) {
+	cs := &mockConversationStore{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	// Seed a discord-surface thread conversation directly in the store.
+	projID := "proj-discord-1"
+	extRef := "thread:proj-discord-1:disc-thread-001"
+	cs.conversations = append(cs.conversations, store.Conversation{
+		ID:          "conv-discord-1",
+		ProjectID:   &projID,
+		Kind:        "group",
+		Surface:     "discord",
+		ExternalRef: extRef,
+	})
+
+	// Read WITHOUT WithReadSurface — defaults to "native".
+	result := ResolveThreadConversationForRead(
+		context.Background(), cs, logger, "disc-thread-001", projID)
+	if result != nil {
+		t.Fatalf("expected nil result when reading discord thread without WithReadSurface, got ConversationID=%q", result.ConversationID)
+	}
+}
+
+// TestReadSurface_DiscordThreadFoundWithOption verifies that a thread
+// conversation created on surface "discord" IS found when WithReadSurface("discord")
+// is passed.
+func TestReadSurface_DiscordThreadFoundWithOption(t *testing.T) {
+	cs := &mockConversationStore{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	projID := "proj-discord-2"
+	extRef := "thread:proj-discord-2:disc-thread-002"
+	cs.conversations = append(cs.conversations, store.Conversation{
+		ID:          "conv-discord-2",
+		ProjectID:   &projID,
+		Kind:        "group",
+		Surface:     "discord",
+		ExternalRef: extRef,
+	})
+
+	// Read WITH WithReadSurface("discord") — should find the conversation.
+	result := ResolveThreadConversationForRead(
+		context.Background(), cs, logger, "disc-thread-002", projID,
+		WithReadSurface("discord"))
+	if result == nil {
+		t.Fatal("expected non-nil result when reading discord thread with WithReadSurface(\"discord\")")
+	}
+	if result.ConversationID != "conv-discord-2" {
+		t.Errorf("expected ConversationID conv-discord-2, got %q", result.ConversationID)
+	}
+	if result.Surface != "discord" {
+		t.Errorf("expected Surface discord, got %q", result.Surface)
+	}
+}
+
+// TestReadSurface_NativeThreadDefaultBehavior verifies that native-surface
+// threads are still found with the default behavior (no WithReadSurface option).
+func TestReadSurface_NativeThreadDefaultBehavior(t *testing.T) {
+	cs := &mockConversationStore{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	// Write a native thread via the normal write path.
+	writeResult, err := ResolveOrCreateThreadConversation(
+		context.Background(), cs, logger, "native-thread-001", "proj-native-1")
+	if err != nil {
+		t.Fatalf("write: unexpected error: %v", err)
+	}
+	if writeResult == nil {
+		t.Fatal("write: expected non-nil result")
+	}
+
+	// Read without WithReadSurface — should find native conversation.
+	readResult := ResolveThreadConversationForRead(
+		context.Background(), cs, logger, "native-thread-001", "proj-native-1")
+	if readResult == nil {
+		t.Fatal("read: expected non-nil result for native thread without WithReadSurface")
+	}
+	if readResult.ConversationID != writeResult.ConversationID {
+		t.Errorf("ConversationID mismatch: write=%q, read=%q",
+			writeResult.ConversationID, readResult.ConversationID)
+	}
+}
+
+// TestReadSurface_SameExtRefDifferentSurfaces verifies that when both a native
+// and discord conversation exist with the same external_ref, the correct one is
+// returned based on the surface option.
+func TestReadSurface_SameExtRefDifferentSurfaces(t *testing.T) {
+	cs := &mockConversationStore{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	projID := "proj-multi-1"
+	extRef := "thread:proj-multi-1:shared-thread"
+
+	// Seed both native and discord conversations with the same external_ref.
+	cs.conversations = append(cs.conversations, store.Conversation{
+		ID:          "conv-native-multi",
+		ProjectID:   &projID,
+		Kind:        "group",
+		Surface:     "native",
+		ExternalRef: extRef,
+	})
+	cs.conversations = append(cs.conversations, store.Conversation{
+		ID:          "conv-discord-multi",
+		ProjectID:   &projID,
+		Kind:        "group",
+		Surface:     "discord",
+		ExternalRef: extRef,
+	})
+
+	// Default (no option) → native conversation.
+	nativeResult := ResolveThreadConversationForRead(
+		context.Background(), cs, logger, "shared-thread", projID)
+	if nativeResult == nil {
+		t.Fatal("expected non-nil result for default (native) lookup")
+	}
+	if nativeResult.ConversationID != "conv-native-multi" {
+		t.Errorf("default lookup: expected conv-native-multi, got %q", nativeResult.ConversationID)
+	}
+
+	// WithReadSurface("discord") → discord conversation.
+	discordResult := ResolveThreadConversationForRead(
+		context.Background(), cs, logger, "shared-thread", projID,
+		WithReadSurface("discord"))
+	if discordResult == nil {
+		t.Fatal("expected non-nil result for discord lookup")
+	}
+	if discordResult.ConversationID != "conv-discord-multi" {
+		t.Errorf("discord lookup: expected conv-discord-multi, got %q", discordResult.ConversationID)
+	}
+}
+
+// TestReadSurface_SlackSurface verifies that Slack-surface threads resolve
+// correctly with WithReadSurface("slack").
+func TestReadSurface_SlackSurface(t *testing.T) {
+	cs := &mockConversationStore{}
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+
+	projID := "proj-slack-1"
+	extRef := "thread:proj-slack-1:slack-thread-001"
+	cs.conversations = append(cs.conversations, store.Conversation{
+		ID:          "conv-slack-1",
+		ProjectID:   &projID,
+		Kind:        "group",
+		Surface:     "slack",
+		ExternalRef: extRef,
+	})
+
+	// Without WithReadSurface → not found.
+	result := ResolveThreadConversationForRead(
+		context.Background(), cs, logger, "slack-thread-001", projID)
+	if result != nil {
+		t.Fatalf("expected nil for slack thread without WithReadSurface, got ConversationID=%q", result.ConversationID)
+	}
+
+	// With WithReadSurface("slack") → found.
+	result = ResolveThreadConversationForRead(
+		context.Background(), cs, logger, "slack-thread-001", projID,
+		WithReadSurface("slack"))
+	if result == nil {
+		t.Fatal("expected non-nil result for slack thread with WithReadSurface(\"slack\")")
+	}
+	if result.ConversationID != "conv-slack-1" {
+		t.Errorf("expected conv-slack-1, got %q", result.ConversationID)
+	}
+}

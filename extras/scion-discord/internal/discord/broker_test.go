@@ -229,6 +229,148 @@ func TestUnknownMentionRouting(t *testing.T) {
 	})
 }
 
+// TestAdditiveRoutingFlow traces the additive mention routing logic through
+// the same steps as handleIncomingMessage, verifying that primary and
+// secondary targets receive the correct message types.
+func TestAdditiveRoutingFlow(t *testing.T) {
+	knownAgents := []string{"coder", "reviewer", "tester"}
+	botUserID := "BOT123"
+
+	t.Run("start mention produces primary+secondary", func(t *testing.T) {
+		// "@reviewer check this PR" with default "coder".
+		content := "@reviewer check this PR"
+		effectiveDefault := "coder"
+
+		// Step 1: resolveTargetAgents includes default as implicit primary.
+		msg := newMockMessage(content, nil)
+		targets, isAll := resolveTargetAgents(msg, botUserID, effectiveDefault, knownAgents)
+		assert.False(t, isAll)
+		assert.Equal(t, []string{"coder", "reviewer"}, targets)
+
+		// Step 2: classifyMentions identifies @reviewer as a start mention.
+		classified := classifyMentions(content, botUserID, knownAgents, noopResolver)
+		assert.Equal(t, 1, countAgentStartMentions(classified))
+		assert.Equal(t, "reviewer", classified.StartMentions[0].Name)
+
+		// Step 3: Filtering keeps only start mentions → removes "coder".
+		agentStartMentions := countAgentStartMentions(classified)
+		if agentStartMentions > 0 {
+			startMentionSet := make(map[string]bool)
+			for _, sm := range classified.StartMentions {
+				if sm.Kind == "agent" {
+					startMentionSet[strings.ToLower(sm.Name)] = true
+				}
+			}
+			filtered := make([]string, 0)
+			for _, t2 := range targets {
+				if startMentionSet[strings.ToLower(t2)] {
+					filtered = append(filtered, t2)
+				}
+			}
+			targets = filtered
+		}
+		assert.Equal(t, []string{"reviewer"}, targets, "filter removes default agent")
+
+		// Step 4: Additive re-insertion puts the default back at position 0.
+		hasDefault := false
+		hasOther := false
+		for _, t2 := range targets {
+			if strings.EqualFold(t2, effectiveDefault) {
+				hasDefault = true
+			} else {
+				hasOther = true
+			}
+		}
+		if hasOther && !hasDefault {
+			targets = append([]string{effectiveDefault}, targets...)
+		}
+		assert.Equal(t, []string{"coder", "reviewer"}, targets)
+
+		// Step 5: Verify types — primary gets TypeInstruction, secondary gets TypeMention.
+		assert.Equal(t, "coder", targets[0], "primary (implicit default)")
+		assert.Equal(t, "reviewer", targets[1], "secondary (mentioned)")
+
+		// Primary should receive TypeInstruction.
+		primaryMsg := &messages.StructuredMessage{
+			Type:      messages.TypeInstruction,
+			Recipient: "agent:" + targets[0],
+		}
+		assert.Equal(t, messages.TypeInstruction, primaryMsg.Type)
+
+		// Secondary should receive TypeMention.
+		secondaryMsg := messages.NewMention("user:alice", "agent:"+targets[1], content, "agent:"+targets[0])
+		assert.Equal(t, messages.TypeMention, secondaryMsg.Type)
+		assert.Equal(t, "agent:coder", secondaryMsg.Metadata["mention_source"])
+	})
+
+	t.Run("no mentions routes to default only with TypeInstruction", func(t *testing.T) {
+		// Plain text with default "coder" — no mentions, no additive model.
+		content := "just a regular message"
+
+		msg := newMockMessage(content, nil)
+		targets, _ := resolveTargetAgents(msg, botUserID, "coder", knownAgents)
+		assert.Empty(t, targets, "no mentions → no targets from resolveTargetAgents")
+
+		// Default fallback sets targets to [effectiveDefault].
+		targets = []string{"coder"}
+		assert.Len(t, targets, 1)
+		assert.Equal(t, "coder", targets[0])
+
+		// Single target: TypeInstruction, no secondaries.
+		primaryMsg := &messages.StructuredMessage{
+			Type:      messages.TypeInstruction,
+			Recipient: "agent:coder",
+		}
+		assert.Equal(t, messages.TypeInstruction, primaryMsg.Type)
+	})
+
+	t.Run("body mention with default produces primary+body mention", func(t *testing.T) {
+		// "check this @reviewer" — reviewer is a body mention, not start mention.
+		content := "check this @reviewer"
+		effectiveDefault := "coder"
+
+		msg := newMockMessage(content, nil)
+		targets, _ := resolveTargetAgents(msg, botUserID, effectiveDefault, knownAgents)
+		// coder (default) + reviewer (body mention found by extractAgentMentions)
+		assert.Equal(t, []string{"coder", "reviewer"}, targets)
+
+		classified := classifyMentions(content, botUserID, knownAgents, noopResolver)
+		assert.Equal(t, 0, countAgentStartMentions(classified))
+		assert.Len(t, classified.BodyMentions, 1)
+		assert.Equal(t, "reviewer", classified.BodyMentions[0].Name)
+
+		// Body-mention filter removes body-mentioned agents from targets.
+		bodyMentionSet := make(map[string]bool)
+		for _, bm := range classified.BodyMentions {
+			if bm.Kind == "agent" {
+				bodyMentionSet[strings.ToLower(bm.Name)] = true
+			}
+		}
+		filtered := make([]string, 0)
+		for _, t2 := range targets {
+			if !bodyMentionSet[strings.ToLower(t2)] {
+				filtered = append(filtered, t2)
+			}
+		}
+		targets = filtered
+		assert.Equal(t, []string{"coder"}, targets, "coder remains as sole primary")
+
+		// Primary: coder → TypeInstruction
+		// Body mention: reviewer → TypeMention (from body mention loop)
+	})
+
+	t.Run("co-addressees metadata populated for multi-target", func(t *testing.T) {
+		targets := []string{"coder", "reviewer"}
+		slugsJSON, err := json.Marshal(targets)
+		require.NoError(t, err)
+
+		meta := map[string]string{
+			"mention_co_addressees": string(slugsJSON),
+		}
+		assert.Equal(t, `["coder","reviewer"]`, meta["mention_co_addressees"])
+	})
+}
+
 func TestParseHubError(t *testing.T) {
 	t.Run("valid error response", func(t *testing.T) {
 		body := `{"error":{"code":"agent_not_found","message":"Agent \"coder\" not found in project"}}`
@@ -308,7 +450,7 @@ func TestHubError_UserFacingMessage(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			msg := tt.err.userFacingMessage()
+			msg := tt.err.userFacingMessage("", "")
 			assert.Contains(t, msg, tt.contains)
 		})
 	}
@@ -507,6 +649,29 @@ func TestPublish_ForumChannelWithoutThreadID_ReturnsError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "forum/media channel")
 	assert.Contains(t, err.Error(), "thread ID is required")
+}
+
+// The retired assistant-reply mirror is discarded before any send, even if
+// an older hub still forwards it. A forum channel without a thread makes
+// any send attempt fail, so a nil error proves nothing was attempted; the
+// same message as an instruction is the control.
+func TestPublish_DiscardsRetiredAssistantReply(t *testing.T) {
+	session := stubSession([]*discordgo.Channel{
+		{ID: "forum123", Type: discordgo.ChannelTypeGuildForum},
+	})
+	b := testBroker(session)
+	msg := &messages.StructuredMessage{
+		Version:  messages.Version,
+		Channel:  "discord",
+		Sender:   "agent:test",
+		Msg:      "turn text",
+		Type:     messages.TypeAssistantReply,
+		Metadata: map[string]string{"discord_channel_id": "forum123"},
+	}
+	require.NoError(t, b.Publish(context.Background(), "test-topic", msg))
+
+	msg.Type = messages.TypeInstruction
+	require.Error(t, b.Publish(context.Background(), "test-topic", msg), "control: an instruction is attempted")
 }
 
 func TestPublish_MediaChannelWithoutThreadID_ReturnsError(t *testing.T) {
@@ -1149,8 +1314,8 @@ func TestPublish_ObserveFilter_ThreadResolvesParentLink(t *testing.T) {
 
 			// Unique IDs per case: resolveChannelLink memoises thread parents
 			// in a package-level cache that outlives individual tests.
-			parentID := fmt.Sprintf("parent-%d", i)
-			threadID := fmt.Sprintf("thread-%d", i)
+			parentID := fmt.Sprintf("9000000000000001%02d", i)
+			threadID := fmt.Sprintf("9100000000000001%02d", i)
 			t.Cleanup(func() {
 				threadParentsMu.Lock()
 				delete(threadParents, threadID)
@@ -1212,8 +1377,8 @@ func TestPublish_ObserveFilter_StateChangeThreadResolvesParentLink(t *testing.T)
 		t.Run(fmt.Sprintf("show_state_changes=%v", showStateChanges), func(t *testing.T) {
 			ctx := context.Background()
 
-			parentID := fmt.Sprintf("sc-parent-%d", i)
-			threadID := fmt.Sprintf("sc-thread-%d", i)
+			parentID := fmt.Sprintf("9000000000000002%02d", i)
+			threadID := fmt.Sprintf("9100000000000002%02d", i)
 			t.Cleanup(func() {
 				threadParentsMu.Lock()
 				delete(threadParents, threadID)
@@ -1441,38 +1606,6 @@ func TestResolveChannelLink_CachesConfirmedThread(t *testing.T) {
 
 // --- downloadDiscordAttachment tests ---
 
-func TestDownloadDiscordAttachment_DefaultPath(t *testing.T) {
-	// When downloadsPath is empty, the function writes to
-	// /home/scion/.scion/projects/<slug>/downloads and returns
-	// /workspace/downloads/<name> as the agent-visible path.
-	// We can't safely write to /home/scion in tests, so we verify
-	// the path computation by setting downloadsPath to a temp dir
-	// and confirming the custom-path branch differs from the default.
-
-	fileContent := []byte("default-path-test")
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(fileContent)
-	}))
-	defer srv.Close()
-
-	projectSlug := "test-project"
-
-	// Verify the default hostDir and agentPath computation.
-	defaultHostDir := filepath.Join("/home/scion/.scion/projects", projectSlug, "downloads")
-	assert.Equal(t, "/home/scion/.scion/projects/test-project/downloads", defaultHostDir)
-
-	defaultAgentPath := filepath.Join("/workspace/downloads", "discord_123_photo.png")
-	assert.Equal(t, "/workspace/downloads/discord_123_photo.png", defaultAgentPath)
-
-	// Verify that a broker with no downloadsPath set would use
-	// the default agent path prefix.
-	b := &DiscordBroker{
-		log:        discardLogger(),
-		httpClient: srv.Client(),
-	}
-	assert.Empty(t, b.downloadsPath, "downloadsPath should be empty by default")
-}
-
 func TestDownloadDiscordAttachment_CustomDownloadsPath(t *testing.T) {
 	fileContent := []byte("fake-image-data-for-test")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1682,27 +1815,30 @@ func TestDownloadDiscordAttachment_SharedDirPath(t *testing.T) {
 	assert.Contains(t, agentPath, "shared-photo.png")
 	assert.Contains(t, placeholder, "shared-photo.png")
 
-	// Verify the file was actually written to the host-side shared dir path.
-	// SharedDirHostPath returns <home>/.scion/project-configs/<slug>__<shortUUID>/shared-dirs/scratchpad
+	// The file is written below the host-side scratchpad, in a per-download
+	// directory: .attachments/_discord/discord_<ts>/<name> (projectfs).
 	expectedHostBase := filepath.Join(fakeHome, ".scion", "project-configs", "my-project__abcd1234", "shared-dirs", "scratchpad", ".attachments", "_discord")
 	entries, err := os.ReadDir(expectedHostBase)
 	require.NoError(t, err, "shared dir host path should exist")
 	require.Len(t, entries, 1)
-	assert.Contains(t, entries[0].Name(), "shared-photo.png")
+	require.True(t, entries[0].IsDir())
+	assert.True(t, strings.HasPrefix(entries[0].Name(), "discord_"), entries[0].Name())
+	assert.Equal(t, "/scion-volumes/scratchpad/.attachments/_discord/"+entries[0].Name()+"/shared-photo.png", agentPath)
+	data, err := os.ReadFile(filepath.Join(expectedHostBase, entries[0].Name(), "shared-photo.png"))
+	require.NoError(t, err)
+	assert.Equal(t, fileContent, data)
 }
 
-func TestDownloadDiscordAttachment_EmptyProjectID_LegacyPath(t *testing.T) {
-	// When projectID is empty and downloadsPath is empty, the function should
-	// fall back to the legacy /workspace/downloads/ agent path.
-	fileContent := []byte("legacy-fallback-test")
+func TestDownloadDiscordAttachment_EmptyProjectID_Refused(t *testing.T) {
+	// With no downloadsPath and no project ID there is no scratchpad to store
+	// the attachment in; the legacy ~/.scion/projects/<slug>/downloads
+	// fallback is gone (ptone/scion#5827), so the download is refused.
+	fileContent := []byte("no-project")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(fileContent)
 	}))
 	defer srv.Close()
 
-	// Point HOME to a temp dir. Even though projectID is empty, the legacy
-	// path uses /home/scion/.scion/projects/<slug>/downloads on the host, so
-	// we set HOME so the file write succeeds somewhere writable.
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
 
@@ -1718,14 +1854,12 @@ func TestDownloadDiscordAttachment_EmptyProjectID_LegacyPath(t *testing.T) {
 		Size:     len(fileContent),
 	}
 
-	ctx := context.Background()
-	agentPath, _, err := b.downloadDiscordAttachment(ctx, att, "test-slug", "")
+	_, _, err := b.downloadDiscordAttachment(context.Background(), att, "test-slug", "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no project ID")
+	entries, err := os.ReadDir(fakeHome)
 	require.NoError(t, err)
-
-	// Legacy agent path should be /workspace/downloads/<name>.
-	assert.True(t, strings.HasPrefix(agentPath, "/workspace/downloads/"),
-		"agentPath %q should start with legacy prefix", agentPath)
-	assert.Contains(t, agentPath, "legacy.txt")
+	assert.Empty(t, entries, "nothing is written anywhere")
 }
 
 func TestDownloadDiscordAttachment_DownloadsPathOverridesSharedDir(t *testing.T) {
@@ -1777,8 +1911,10 @@ func TestConfigure_SessionReplacement_ClearsSubs(t *testing.T) {
 	// Calling Configure with bot_token should close old session and clear subs.
 	err := b.Configure(map[string]string{
 		"bot_token": "Bot fake-token-for-test",
+		"db_path":   filepath.Join(t.TempDir(), "discord.db"),
 	})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = b.Close() })
 
 	// After Phase 1 reconfigure:
 	// - Old subs should be cleared (so Subscribe("*") would trigger startGateway)
@@ -1806,9 +1942,55 @@ func TestConfigure_BootstrapSkippedWhenDone(t *testing.T) {
 	err := b.Configure(map[string]string{
 		"hub_url":  "http://localhost:8080",
 		"hmac_key": "test-key",
+		"db_path":  filepath.Join(t.TempDir(), "discord.db"),
 	})
 	require.NoError(t, err)
 
 	// bootstrapDone should still be true (not reset by Phase 2 alone).
 	assert.True(t, b.bootstrapDone, "bootstrapDone should remain true when no session replacement")
+}
+
+// --- Topic parsing ---
+
+func TestParseTopicComponents(t *testing.T) {
+	tests := []struct {
+		topic     string
+		projectID string
+		agentSlug string
+	}{
+		{"scion.project.proj123.agent.myagent", "proj123", "myagent"},
+		// A grove-prefixed topic is not a project topic: the project ID
+		// falls back to the whole topic string, and the agent segment is
+		// still extracted.
+		{"scion.grove.proj123.agent.myagent", "scion.grove.proj123.agent.myagent", "myagent"},
+		{"some-topic", "some-topic", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.topic, func(t *testing.T) {
+			pid, slug := parseTopicComponents(tt.topic)
+			assert.Equal(t, tt.projectID, pid)
+			assert.Equal(t, tt.agentSlug, slug)
+		})
+	}
+}
+
+func TestGetProjectAgents_RefreshCarriesLinkedUser(t *testing.T) {
+	rec := &headerRecorder{}
+	hub := httptest.NewServer(rec)
+	defer hub.Close()
+
+	b := testBroker(nil)
+	b.store = newTestStore(t)
+	b.hubClient = NewHTTPHubClient(hub.URL, "", "", nil)
+	b.agentCacheTTL = 0
+
+	slugs, err := b.getProjectAgents(context.Background(), "p1", "user:alice@example.com")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"worker"}, slugs)
+
+	calls := rec.snapshot()
+	require.Len(t, calls, 1)
+	assert.Equal(t, "/api/v1/projects/p1/agents", calls[0].Path)
+	assert.Equal(t, "user:alice@example.com", calls[0].OnBehalfOf)
 }

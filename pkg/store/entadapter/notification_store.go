@@ -21,7 +21,9 @@ import (
 	"time"
 
 	entsql "entgo.io/ent/dialect/sql"
+	"github.com/GoogleCloudPlatform/scion/pkg/agent/state"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent"
+	"github.com/GoogleCloudPlatform/scion/pkg/ent/agent"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notification"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/notificationsubscription"
 	"github.com/GoogleCloudPlatform/scion/pkg/ent/subscriptiontemplate"
@@ -133,6 +135,16 @@ func entNotifToStore(e *ent.Notification) *store.Notification {
 		Dispatched:     e.Dispatched,
 		Acknowledged:   e.Acknowledged,
 		CreatedAt:      e.Created,
+
+		DispatchAttempts: e.DispatchAttempts,
+		DispatchOutcome:  e.DispatchOutcome,
+		DispatchReason:   e.DispatchReason,
+		NextAttemptAt:    e.NextAttemptAt,
+
+		Kind:         e.Kind,
+		ResourceType: e.ResourceType,
+		ResourceID:   e.ResourceID,
+		Excerpt:      e.Excerpt,
 	}
 }
 
@@ -407,6 +419,12 @@ func (s *NotificationStore) CreateNotification(ctx context.Context, notif *store
 		SetDispatched(notif.Dispatched).
 		SetAcknowledged(notif.Acknowledged).
 		SetCreated(notif.CreatedAt).
+		SetDispatchAttempts(notif.DispatchAttempts).
+		SetDispatchOutcome(notif.DispatchOutcome).
+		SetKind(notif.Kind).
+		SetResourceType(notif.ResourceType).
+		SetResourceID(notif.ResourceID).
+		SetExcerpt(notif.Excerpt).
 		Save(ctx)
 	if err != nil {
 		return mapError(err)
@@ -580,6 +598,355 @@ func notifsToStore(rows []*ent.Notification) []store.Notification {
 		out = append(out, *entNotifToStore(e))
 	}
 	return out
+}
+
+// ClaimNotificationForDispatch atomically claims an undispatched notification
+// for delivery by CAS-updating dispatched from false to true. Returns true if
+// this caller won the claim, false if the notification was already dispatched or
+// does not exist.
+func (s *NotificationStore) ClaimNotificationForDispatch(ctx context.Context, id string) (bool, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return false, err
+	}
+
+	affected, err := s.client.Notification.Update().
+		Where(
+			notification.IDEQ(uid),
+			notification.DispatchedEQ(false),
+		).
+		SetDispatched(true).
+		Save(ctx)
+	if err != nil {
+		return false, mapError(err)
+	}
+
+	return affected > 0, nil
+}
+
+// UnmarkNotificationDispatched reverts a notification's dispatched flag to false
+// so a future sweep can retry delivery. The empty dispatch_outcome predicate
+// keeps a row whose outcome another caller has already recorded dispatched
+// (ptone/scion#5030): reverting it would leave dispatched=false with an
+// outcome set, and the sweep would deliver it again. Returns false (no error)
+// when the row has an outcome or does not exist. notBefore sets
+// next_attempt_at (the sweep's retry backoff); a zero notBefore clears it.
+func (s *NotificationStore) UnmarkNotificationDispatched(ctx context.Context, id string, notBefore time.Time) (bool, error) {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return false, err
+	}
+
+	upd := s.client.Notification.Update().
+		Where(
+			notification.IDEQ(uid),
+			notification.DispatchOutcomeEQ(""),
+		).
+		SetDispatched(false)
+	if notBefore.IsZero() {
+		upd = upd.ClearNextAttemptAt()
+	} else {
+		upd = upd.SetNextAttemptAt(notBefore)
+	}
+	affected, err := upd.Save(ctx)
+	if err != nil {
+		return false, mapError(err)
+	}
+	return affected > 0, nil
+}
+
+// RecordNotificationDispatchAttempt atomically increments a notification's
+// dispatch_attempts by one (UPDATE ... SET dispatch_attempts =
+// dispatch_attempts + 1), so concurrent recorders never lose a count.
+func (s *NotificationStore) RecordNotificationDispatchAttempt(ctx context.Context, id string) error {
+	uid, err := parseUUID(id)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.Notification.UpdateOneID(uid).
+		AddDispatchAttempts(1).
+		Save(ctx)
+	return mapError(err)
+}
+
+// SetNotificationDispatchOutcome records a terminal dispatch outcome and sets
+// dispatched=true so the sweep stops considering the notification. The update
+// is conditional so racing writers keep the most informative outcome
+// (ptone/scion#5030): delivered is a fact (the broker accepted the message)
+// and failed is a verdict reached by a caller that did not see it, so a
+// delivered write applies unless the row is already delivered (it replaces
+// failed), and a failed write applies only while no outcome is recorded.
+// Returns false (no error) when the write is refused, and ErrNotFound when
+// the row does not exist. reason is stored with failed; delivered takes no
+// reason and clears a recorded one.
+func (s *NotificationStore) SetNotificationDispatchOutcome(ctx context.Context, id string, outcome string, reason string) (bool, error) {
+	switch outcome {
+	case store.NotificationOutcomeDelivered:
+		if reason != "" {
+			return false, store.ErrInvalidInput
+		}
+	case store.NotificationOutcomeFailed:
+		if reason != "" && !store.ValidNotificationReason(reason) {
+			return false, store.ErrInvalidInput
+		}
+	default:
+		return false, store.ErrInvalidInput
+	}
+	uid, err := parseUUID(id)
+	if err != nil {
+		return false, err
+	}
+	// failed only over no outcome; delivered over no outcome or failed, never
+	// re-applied over delivered.
+	pred := notification.DispatchOutcomeEQ("")
+	if outcome == store.NotificationOutcomeDelivered {
+		pred = notification.DispatchOutcomeNEQ(store.NotificationOutcomeDelivered)
+	}
+	affected, err := s.client.Notification.Update().
+		Where(
+			notification.IDEQ(uid),
+			pred,
+		).
+		SetDispatched(true).
+		SetDispatchOutcome(outcome).
+		SetDispatchReason(reason).
+		Save(ctx)
+	if err != nil {
+		return false, mapError(err)
+	}
+	if affected > 0 {
+		return true, nil
+	}
+	exists, err := s.client.Notification.Query().
+		Where(notification.IDEQ(uid)).
+		Exist(ctx)
+	if err != nil {
+		return false, mapError(err)
+	}
+	if !exists {
+		return false, store.ErrNotFound
+	}
+	return false, nil
+}
+
+// ExpireStaleAgentNotifications records outcome failed with reason expired
+// on every pending agent-targeted notification (dispatched=false, no
+// outcome) created before cutoff, whatever its subscriber's state, and
+// returns how many it expired. The dispatched=false and empty-outcome
+// predicates leave claimed (in-flight) rows and recorded outcomes
+// (ptone/scion#5030) untouched.
+func (s *NotificationStore) ExpireStaleAgentNotifications(ctx context.Context, cutoff time.Time) (int, error) {
+	n, err := s.client.Notification.Update().
+		Where(
+			notification.DispatchedEQ(false),
+			notification.DispatchOutcomeEQ(""),
+			notification.SubscriberTypeEQ(store.SubscriberTypeAgent),
+			notification.CreatedLT(cutoff),
+		).
+		SetDispatched(true).
+		SetDispatchOutcome(store.NotificationOutcomeFailed).
+		SetDispatchReason(store.NotificationReasonExpired).
+		Save(ctx)
+	if err != nil {
+		return n, mapError(err)
+	}
+	return n, nil
+}
+
+// orphanPurgeBatchSize caps how many rows one purge statement deletes so a
+// large backlog is removed in short statements instead of one long one.
+var orphanPurgeBatchSize = 1000
+
+// PurgeOrphanedNotifications deletes acknowledged notifications whose agent
+// and subscription rows are both gone (for example DELETED notifications
+// persisted after an agent's hard delete), and returns how many it deleted.
+// Unacknowledged notifications are kept until acknowledged. Rows are deleted
+// in batches of orphanPurgeBatchSize until a batch comes back short.
+func (s *NotificationStore) PurgeOrphanedNotifications(ctx context.Context) (int, error) {
+	total := 0
+	for {
+		ids, err := s.client.Notification.Query().
+			Where(
+				notification.AcknowledgedEQ(true),
+				func(sel *entsql.Selector) {
+					sel.Where(entsql.And(
+						noRowWithID(sel, agent.Table, agent.FieldID, notification.FieldAgentID),
+						noRowWithID(sel, notificationsubscription.Table, notificationsubscription.FieldID, notification.FieldSubscriptionID),
+					))
+				},
+			).
+			Order(ent.Asc(notification.FieldID)).
+			Limit(orphanPurgeBatchSize).
+			IDs(ctx)
+		if err != nil {
+			return total, mapError(err)
+		}
+		if len(ids) == 0 {
+			return total, nil
+		}
+		n, err := s.client.Notification.Delete().
+			Where(notification.IDIn(ids...)).
+			Exec(ctx)
+		total += n
+		if err != nil {
+			return total, mapError(err)
+		}
+		if n == 0 || len(ids) < orphanPurgeBatchSize {
+			// A short batch is the last one. A batch that removed nothing
+			// would select the same rows again, so stop there as well.
+			return total, nil
+		}
+	}
+}
+
+// noRowWithID builds "NOT EXISTS (SELECT 1 FROM table WHERE table.idCol =
+// <sel>.refCol)".
+func noRowWithID(sel *entsql.Selector, table, idCol, refCol string) *entsql.Predicate {
+	ref := sel.C(refCol)
+	return entsql.P(func(b *entsql.Builder) {
+		b.WriteString("NOT EXISTS (SELECT 1 FROM ")
+		b.Ident(table)
+		b.WriteString(" WHERE ")
+		b.Ident(table)
+		b.WriteString(".")
+		b.Ident(idCol)
+		b.WriteString(" = ")
+		b.WriteString(ref)
+		b.WriteString(")")
+	})
+}
+
+// undispatchedGracePeriod is the minimum age of an undispatched notification
+// before the sweep picks it up. This prevents racing with an in-flight primary
+// dispatch (whose 30s retry + margin is well within this window).
+const undispatchedGracePeriod = 60 * time.Second
+
+// undispatchedBatchLimit caps the number of undispatched notifications returned
+// per query to avoid loading unbounded rows into memory.
+const undispatchedBatchLimit = 100
+
+// writeNotSuspended appends a "phase is not suspended" condition to an
+// EXISTS subquery over the agents table. The phase column is nullable and a
+// NULL phase is not suspended, so it compares COALESCE(phase, empty
+// string). A suspended subscriber's notifications are parked: never claimed
+// or attempted, and selected again once the agent leaves the suspended
+// phase. ExpireStaleAgentNotifications bounds how long they can stay parked.
+func writeNotSuspended(b *entsql.Builder) {
+	b.WriteString(" AND COALESCE(")
+	b.Ident(agent.Table)
+	b.WriteString(".")
+	b.Ident(agent.FieldPhase)
+	b.WriteString(", '') != ")
+	b.Arg(string(state.PhaseSuspended))
+}
+
+// GetUndispatchedAgentNotifications returns agent-targeted notifications with
+// dispatched=false, ordered oldest-first, limited to 100 rows. A
+// notification whose subscriber agent is suspended is never returned.
+//
+// When brokerID is empty (sweep mode), a 60s grace period is applied so the
+// sweep does not race with an in-flight primary dispatch. When brokerID is
+// non-empty (broker-connect hook), no grace period is applied — the hook fires
+// precisely because the broker just came online, so even very recent
+// notifications should be drained immediately.
+func (s *NotificationStore) GetUndispatchedAgentNotifications(ctx context.Context, brokerID string) ([]store.Notification, error) {
+	query := s.client.Notification.Query().
+		Where(
+			notification.DispatchedEQ(false),
+			notification.SubscriberTypeEQ(store.SubscriberTypeAgent),
+		)
+
+	// Grace period only in sweep mode (empty brokerID) to avoid racing with
+	// the primary dispatch path's 30s retry + margin.
+	if brokerID == "" {
+		now := time.Now()
+		cutoff := now.Add(-undispatchedGracePeriod)
+		query = query.Where(notification.CreatedLT(cutoff))
+
+		// Retry backoff: a notification whose last delivery failed waits
+		// until next_attempt_at. The broker-connect drain ignores it,
+		// since the broker coming back is what the backoff waits for.
+		query = query.Where(notification.Or(
+			notification.NextAttemptAtIsNil(),
+			notification.NextAttemptAtLTE(now),
+		))
+
+		// Only return notifications whose subscriber agent currently has a
+		// RuntimeBrokerID. Without this filter the sweep would claim
+		// notifications for broker-less agents, fail to deliver them, and
+		// revert the claim — wasting cycles and starving deliverable
+		// notifications behind them (head-of-line blocking).
+		query = query.Where(func(sel *entsql.Selector) {
+			subIDCol := sel.C(notification.FieldSubscriberID)
+			projIDCol := sel.C(notification.FieldProjectID)
+			sel.Where(entsql.P(func(b *entsql.Builder) {
+				b.WriteString("EXISTS (SELECT 1 FROM ")
+				b.Ident(agent.Table)
+				b.WriteString(" WHERE ")
+				b.Ident(agent.Table)
+				b.WriteString(".")
+				b.Ident(agent.FieldSlug)
+				b.WriteString(" = ")
+				b.WriteString(subIDCol)
+				b.WriteString(" AND ")
+				b.Ident(agent.Table)
+				b.WriteString(".")
+				b.Ident(agent.FieldProjectID)
+				b.WriteString(" = ")
+				b.WriteString(projIDCol)
+				writeNotSuspended(b)
+				b.WriteString(" AND ")
+				b.Ident(agent.Table)
+				b.WriteString(".")
+				b.Ident(agent.FieldRuntimeBrokerID)
+				b.WriteString(" != '')")
+			}))
+		})
+	}
+
+	if brokerID != "" {
+		// Filter to notifications whose subscriber agent has this broker.
+		// Use a raw WHERE predicate with a correlated EXISTS subquery
+		// against the agents table. sel.C() returns the properly-qualified
+		// and quoted column reference for the outer notifications table.
+		query = query.Where(func(sel *entsql.Selector) {
+			subIDCol := sel.C(notification.FieldSubscriberID)
+			projIDCol := sel.C(notification.FieldProjectID)
+			sel.Where(entsql.P(func(b *entsql.Builder) {
+				b.WriteString("EXISTS (SELECT 1 FROM ")
+				b.Ident(agent.Table)
+				b.WriteString(" WHERE ")
+				b.Ident(agent.Table)
+				b.WriteString(".")
+				b.Ident(agent.FieldSlug)
+				b.WriteString(" = ")
+				b.WriteString(subIDCol)
+				b.WriteString(" AND ")
+				b.Ident(agent.Table)
+				b.WriteString(".")
+				b.Ident(agent.FieldProjectID)
+				b.WriteString(" = ")
+				b.WriteString(projIDCol)
+				writeNotSuspended(b)
+				b.WriteString(" AND ")
+				b.Ident(agent.Table)
+				b.WriteString(".")
+				b.Ident(agent.FieldRuntimeBrokerID)
+				b.WriteString(" = ")
+				b.Arg(brokerID)
+				b.WriteString(")")
+			}))
+		})
+	}
+
+	rows, err := query.
+		Order(notification.ByCreated()).
+		Limit(undispatchedBatchLimit).
+		All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return notifsToStore(rows), nil
 }
 
 // ----------------------------------------------------------------------------

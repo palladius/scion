@@ -21,7 +21,7 @@
  * prominent "Return to Hub" link at the top.
  */
 
-import { LitElement, html, css, nothing } from 'lit';
+import { LitElement, html, css, nothing, type TemplateResult } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { apiFetch } from '../../client/api.js';
 
@@ -37,6 +37,16 @@ interface NavSection {
   title: string;
   items: NavItem[];
 }
+
+/** Page size for the GitHub App project check (see checkGitHubApp). */
+const PROJECT_PAGE_SIZE = 100;
+
+/**
+ * Most projects the GitHub App check reads: the hub's default list limit
+ * (listProjects in pkg/hub/handlers_projects_core.go), which is what the
+ * check's former single request without a limit returned.
+ */
+const GITHUB_APP_PROJECT_SCAN = 500;
 
 const PROFILE_SECTIONS: NavSection[] = [
   {
@@ -61,6 +71,22 @@ const PROFILE_SECTIONS: NavSection[] = [
     ],
   },
 ];
+
+/**
+ * Badge text and one-line meaning for each hub role (design §5.G). These are
+ * hub roles, not project roles, hence the "Hub" prefix.
+ */
+const HUB_ROLE_BADGES = new Map<string, { label: string; description: string }>([
+  ['admin', { label: 'Hub Admin', description: 'Full administrative access to this hub.' }],
+  ['member', { label: 'Hub Member', description: 'Can create projects and agents.' }],
+  [
+    'viewer',
+    {
+      label: 'Hub Viewer',
+      description: "Can use projects you've been added to, but cannot create new projects.",
+    },
+  ],
+]);
 
 @customElement('scion-profile-nav')
 export class ScionProfileNav extends LitElement {
@@ -211,6 +237,35 @@ export class ScionProfileNav extends LitElement {
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }
+
+    /* Colours match .role-badge on Admin > Users. */
+    .role-badge {
+      display: inline-flex;
+      align-items: center;
+      align-self: flex-start;
+      margin-top: 0.25rem;
+      padding: 0.0625rem 0.5rem;
+      border-radius: 9999px;
+      font-size: 0.6875rem;
+      font-weight: 500;
+      white-space: nowrap;
+      cursor: default;
+    }
+
+    .role-badge.admin {
+      background: var(--sl-color-warning-100, #fef3c7);
+      color: var(--sl-color-warning-700, #a16207);
+    }
+
+    .role-badge.member {
+      background: var(--sl-color-primary-100, #dbeafe);
+      color: var(--sl-color-primary-700, #1d4ed8);
+    }
+
+    .role-badge.viewer {
+      background: var(--scion-bg-subtle, #f1f5f9);
+      color: var(--scion-text-muted, #64748b);
     }
 
     .nav-container {
@@ -457,28 +512,54 @@ export class ScionProfileNav extends LitElement {
 
   override connectedCallback(): void {
     super.connectedCallback();
-    this.checkGitHubApp();
+    void this.checkGitHubApp();
   }
 
+  /**
+   * Shows the GitHub App link when the app is configured and at least one of
+   * the user's projects has an installation.
+   *
+   * The project list is only read when the app is configured (the common
+   * unconfigured hub sends no projects request at all), and it is read in
+   * pages of PROJECT_PAGE_SIZE that stop at the first match (ptone/scion#5311).
+   * The walk covers at most GITHUB_APP_PROJECT_SCAN projects, the same window
+   * the old single unbounded request saw (the hub's default list limit), so
+   * the link appears in exactly the cases it did before.
+   */
   private async checkGitHubApp(): Promise<void> {
     try {
-      const [appRes, projectsRes] = await Promise.all([
-        apiFetch('/api/v1/github-app'),
-        apiFetch('/api/v1/projects?mine=true'),
-      ]);
-      if (!appRes.ok || !projectsRes.ok) return;
-
+      const appRes = await apiFetch('/api/v1/github-app');
+      if (!appRes.ok) return;
       const appData = (await appRes.json()) as { configured: boolean; installation_url?: string };
       if (!appData.configured || !appData.installation_url) return;
 
-      const projectsData = (await projectsRes.json()) as { projects: Project[] };
-      const hasInstallation = (projectsData.projects || []).some((p) => p.githubInstallationId);
-      if (hasInstallation) {
+      if (await this.hasProjectWithGitHubInstallation()) {
         this.githubAppUrl = appData.installation_url;
       }
     } catch {
       // Non-fatal
     }
+  }
+
+  private async hasProjectWithGitHubInstallation(): Promise<boolean> {
+    let cursor = '';
+    for (let seen = 0; seen < GITHUB_APP_PROJECT_SCAN; seen += PROJECT_PAGE_SIZE) {
+      const url =
+        `/api/v1/projects?mine=true&limit=${PROJECT_PAGE_SIZE}` +
+        (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
+      const res = await apiFetch(url);
+      if (!res.ok) return false;
+      const data = (await res.json()) as { projects?: Project[]; nextCursor?: string };
+      const projects = data.projects || [];
+      // An empty page ends the scan even if it carries a cursor. The hub only
+      // sets nextCursor when more rows follow, so this is a guard against a
+      // cursor that would loop, not a change in what is found.
+      if (projects.length === 0) return false;
+      if (projects.some((p) => p.githubInstallationId)) return true;
+      cursor = (typeof data.nextCursor === 'string' && data.nextCursor) || '';
+      if (!cursor) return false;
+    }
+    return false;
   }
 
   override render() {
@@ -505,6 +586,7 @@ export class ScionProfileNav extends LitElement {
               <div class="user-details">
                 <span class="user-name">${this.user.name || 'User'}</span>
                 <span class="user-email">${this.user.email}</span>
+                ${this.renderRoleBadge(this.user.role)}
               </div>
             </div>
           `
@@ -564,6 +646,23 @@ export class ScionProfileNav extends LitElement {
               <span class="collapse-toggle-text">Collapse</span>
             </button>
           `}
+    `;
+  }
+
+  /**
+   * The user's own hub role as a badge, with its meaning in a tooltip.
+   * Display only: no authorization decision reads the role string. Unknown or
+   * missing roles render nothing. Hidden while the sidebar is collapsed, like
+   * the rest of the user details, so the badge cannot take keyboard focus.
+   */
+  private renderRoleBadge(role: string | undefined): TemplateResult | typeof nothing {
+    if (this.collapsed) return nothing;
+    const info = role ? HUB_ROLE_BADGES.get(role) : undefined;
+    if (!info) return nothing;
+    return html`
+      <sl-tooltip content=${info.description} placement="bottom-start" hoist>
+        <span class="role-badge ${role}" tabindex="0">${info.label}</span>
+      </sl-tooltip>
     `;
   }
 

@@ -148,26 +148,6 @@ func (_u *ProjectUpdate) SetUpdated(v time.Time) *ProjectUpdate {
 	return _u
 }
 
-// SetCreatedBy sets the "created_by" field.
-func (_u *ProjectUpdate) SetCreatedBy(v string) *ProjectUpdate {
-	_u.mutation.SetCreatedBy(v)
-	return _u
-}
-
-// SetNillableCreatedBy sets the "created_by" field if the given value is not nil.
-func (_u *ProjectUpdate) SetNillableCreatedBy(v *string) *ProjectUpdate {
-	if v != nil {
-		_u.SetCreatedBy(*v)
-	}
-	return _u
-}
-
-// ClearCreatedBy clears the value of the "created_by" field.
-func (_u *ProjectUpdate) ClearCreatedBy() *ProjectUpdate {
-	_u.mutation.ClearCreatedBy()
-	return _u
-}
-
 // SetOwnerID sets the "owner_id" field.
 func (_u *ProjectUpdate) SetOwnerID(v string) *ProjectUpdate {
 	_u.mutation.SetOwnerID(v)
@@ -185,20 +165,6 @@ func (_u *ProjectUpdate) SetNillableOwnerID(v *string) *ProjectUpdate {
 // ClearOwnerID clears the value of the "owner_id" field.
 func (_u *ProjectUpdate) ClearOwnerID() *ProjectUpdate {
 	_u.mutation.ClearOwnerID()
-	return _u
-}
-
-// SetVisibility sets the "visibility" field.
-func (_u *ProjectUpdate) SetVisibility(v string) *ProjectUpdate {
-	_u.mutation.SetVisibility(v)
-	return _u
-}
-
-// SetNillableVisibility sets the "visibility" field if the given value is not nil.
-func (_u *ProjectUpdate) SetNillableVisibility(v *string) *ProjectUpdate {
-	if v != nil {
-		_u.SetVisibility(*v)
-	}
 	return _u
 }
 
@@ -286,6 +252,41 @@ func (_u *ProjectUpdate) SetNillableGitIdentity(v *string) *ProjectUpdate {
 // ClearGitIdentity clears the value of the "git_identity" field.
 func (_u *ProjectUpdate) ClearGitIdentity() *ProjectUpdate {
 	_u.mutation.ClearGitIdentity()
+	return _u
+}
+
+// SetCrossProjectInbound sets the "cross_project_inbound" field.
+func (_u *ProjectUpdate) SetCrossProjectInbound(v project.CrossProjectInbound) *ProjectUpdate {
+	_u.mutation.SetCrossProjectInbound(v)
+	return _u
+}
+
+// SetNillableCrossProjectInbound sets the "cross_project_inbound" field if the given value is not nil.
+func (_u *ProjectUpdate) SetNillableCrossProjectInbound(v *project.CrossProjectInbound) *ProjectUpdate {
+	if v != nil {
+		_u.SetCrossProjectInbound(*v)
+	}
+	return _u
+}
+
+// SetCrossProjectInboundRevision sets the "cross_project_inbound_revision" field.
+func (_u *ProjectUpdate) SetCrossProjectInboundRevision(v int64) *ProjectUpdate {
+	_u.mutation.ResetCrossProjectInboundRevision()
+	_u.mutation.SetCrossProjectInboundRevision(v)
+	return _u
+}
+
+// SetNillableCrossProjectInboundRevision sets the "cross_project_inbound_revision" field if the given value is not nil.
+func (_u *ProjectUpdate) SetNillableCrossProjectInboundRevision(v *int64) *ProjectUpdate {
+	if v != nil {
+		_u.SetCrossProjectInboundRevision(*v)
+	}
+	return _u
+}
+
+// AddCrossProjectInboundRevision adds value to the "cross_project_inbound_revision" field.
+func (_u *ProjectUpdate) AddCrossProjectInboundRevision(v int64) *ProjectUpdate {
+	_u.mutation.AddCrossProjectInboundRevision(v)
 	return _u
 }
 
@@ -378,6 +379,11 @@ func (_u *ProjectUpdate) check() error {
 			return &ValidationError{Name: "slug", err: fmt.Errorf(`ent: validator failed for field "Project.slug": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.CrossProjectInbound(); ok {
+		if err := project.CrossProjectInboundValidator(v); err != nil {
+			return &ValidationError{Name: "cross_project_inbound", err: fmt.Errorf(`ent: validator failed for field "Project.cross_project_inbound": %w`, err)}
+		}
+	}
 	return nil
 }
 
@@ -392,6 +398,12 @@ func (_u *ProjectUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 				ps[i](selector)
 			}
 		}
+	}
+	if _u.mutation.FixtureRootIDCleared() {
+		_spec.ClearField(project.FieldFixtureRootID, field.TypeUUID)
+	}
+	if _u.mutation.FixtureIssuerIDCleared() {
+		_spec.ClearField(project.FieldFixtureIssuerID, field.TypeUUID)
 	}
 	if value, ok := _u.mutation.Name(); ok {
 		_spec.SetField(project.FieldName, field.TypeString, value)
@@ -432,9 +444,6 @@ func (_u *ProjectUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	if value, ok := _u.mutation.Updated(); ok {
 		_spec.SetField(project.FieldUpdated, field.TypeTime, value)
 	}
-	if value, ok := _u.mutation.CreatedBy(); ok {
-		_spec.SetField(project.FieldCreatedBy, field.TypeString, value)
-	}
 	if _u.mutation.CreatedByCleared() {
 		_spec.ClearField(project.FieldCreatedBy, field.TypeString)
 	}
@@ -443,9 +452,6 @@ func (_u *ProjectUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if _u.mutation.OwnerIDCleared() {
 		_spec.ClearField(project.FieldOwnerID, field.TypeString)
-	}
-	if value, ok := _u.mutation.Visibility(); ok {
-		_spec.SetField(project.FieldVisibility, field.TypeString, value)
 	}
 	if value, ok := _u.mutation.GithubInstallationID(); ok {
 		_spec.SetField(project.FieldGithubInstallationID, field.TypeInt64, value)
@@ -473,6 +479,15 @@ func (_u *ProjectUpdate) sqlSave(ctx context.Context) (_node int, err error) {
 	}
 	if _u.mutation.GitIdentityCleared() {
 		_spec.ClearField(project.FieldGitIdentity, field.TypeString)
+	}
+	if value, ok := _u.mutation.CrossProjectInbound(); ok {
+		_spec.SetField(project.FieldCrossProjectInbound, field.TypeEnum, value)
+	}
+	if value, ok := _u.mutation.CrossProjectInboundRevision(); ok {
+		_spec.SetField(project.FieldCrossProjectInboundRevision, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedCrossProjectInboundRevision(); ok {
+		_spec.AddField(project.FieldCrossProjectInboundRevision, field.TypeInt64, value)
 	}
 	if _u.mutation.AgentsCleared() {
 		edge := &sqlgraph.EdgeSpec{
@@ -657,26 +672,6 @@ func (_u *ProjectUpdateOne) SetUpdated(v time.Time) *ProjectUpdateOne {
 	return _u
 }
 
-// SetCreatedBy sets the "created_by" field.
-func (_u *ProjectUpdateOne) SetCreatedBy(v string) *ProjectUpdateOne {
-	_u.mutation.SetCreatedBy(v)
-	return _u
-}
-
-// SetNillableCreatedBy sets the "created_by" field if the given value is not nil.
-func (_u *ProjectUpdateOne) SetNillableCreatedBy(v *string) *ProjectUpdateOne {
-	if v != nil {
-		_u.SetCreatedBy(*v)
-	}
-	return _u
-}
-
-// ClearCreatedBy clears the value of the "created_by" field.
-func (_u *ProjectUpdateOne) ClearCreatedBy() *ProjectUpdateOne {
-	_u.mutation.ClearCreatedBy()
-	return _u
-}
-
 // SetOwnerID sets the "owner_id" field.
 func (_u *ProjectUpdateOne) SetOwnerID(v string) *ProjectUpdateOne {
 	_u.mutation.SetOwnerID(v)
@@ -694,20 +689,6 @@ func (_u *ProjectUpdateOne) SetNillableOwnerID(v *string) *ProjectUpdateOne {
 // ClearOwnerID clears the value of the "owner_id" field.
 func (_u *ProjectUpdateOne) ClearOwnerID() *ProjectUpdateOne {
 	_u.mutation.ClearOwnerID()
-	return _u
-}
-
-// SetVisibility sets the "visibility" field.
-func (_u *ProjectUpdateOne) SetVisibility(v string) *ProjectUpdateOne {
-	_u.mutation.SetVisibility(v)
-	return _u
-}
-
-// SetNillableVisibility sets the "visibility" field if the given value is not nil.
-func (_u *ProjectUpdateOne) SetNillableVisibility(v *string) *ProjectUpdateOne {
-	if v != nil {
-		_u.SetVisibility(*v)
-	}
 	return _u
 }
 
@@ -795,6 +776,41 @@ func (_u *ProjectUpdateOne) SetNillableGitIdentity(v *string) *ProjectUpdateOne 
 // ClearGitIdentity clears the value of the "git_identity" field.
 func (_u *ProjectUpdateOne) ClearGitIdentity() *ProjectUpdateOne {
 	_u.mutation.ClearGitIdentity()
+	return _u
+}
+
+// SetCrossProjectInbound sets the "cross_project_inbound" field.
+func (_u *ProjectUpdateOne) SetCrossProjectInbound(v project.CrossProjectInbound) *ProjectUpdateOne {
+	_u.mutation.SetCrossProjectInbound(v)
+	return _u
+}
+
+// SetNillableCrossProjectInbound sets the "cross_project_inbound" field if the given value is not nil.
+func (_u *ProjectUpdateOne) SetNillableCrossProjectInbound(v *project.CrossProjectInbound) *ProjectUpdateOne {
+	if v != nil {
+		_u.SetCrossProjectInbound(*v)
+	}
+	return _u
+}
+
+// SetCrossProjectInboundRevision sets the "cross_project_inbound_revision" field.
+func (_u *ProjectUpdateOne) SetCrossProjectInboundRevision(v int64) *ProjectUpdateOne {
+	_u.mutation.ResetCrossProjectInboundRevision()
+	_u.mutation.SetCrossProjectInboundRevision(v)
+	return _u
+}
+
+// SetNillableCrossProjectInboundRevision sets the "cross_project_inbound_revision" field if the given value is not nil.
+func (_u *ProjectUpdateOne) SetNillableCrossProjectInboundRevision(v *int64) *ProjectUpdateOne {
+	if v != nil {
+		_u.SetCrossProjectInboundRevision(*v)
+	}
+	return _u
+}
+
+// AddCrossProjectInboundRevision adds value to the "cross_project_inbound_revision" field.
+func (_u *ProjectUpdateOne) AddCrossProjectInboundRevision(v int64) *ProjectUpdateOne {
+	_u.mutation.AddCrossProjectInboundRevision(v)
 	return _u
 }
 
@@ -900,6 +916,11 @@ func (_u *ProjectUpdateOne) check() error {
 			return &ValidationError{Name: "slug", err: fmt.Errorf(`ent: validator failed for field "Project.slug": %w`, err)}
 		}
 	}
+	if v, ok := _u.mutation.CrossProjectInbound(); ok {
+		if err := project.CrossProjectInboundValidator(v); err != nil {
+			return &ValidationError{Name: "cross_project_inbound", err: fmt.Errorf(`ent: validator failed for field "Project.cross_project_inbound": %w`, err)}
+		}
+	}
 	return nil
 }
 
@@ -931,6 +952,12 @@ func (_u *ProjectUpdateOne) sqlSave(ctx context.Context) (_node *Project, err er
 				ps[i](selector)
 			}
 		}
+	}
+	if _u.mutation.FixtureRootIDCleared() {
+		_spec.ClearField(project.FieldFixtureRootID, field.TypeUUID)
+	}
+	if _u.mutation.FixtureIssuerIDCleared() {
+		_spec.ClearField(project.FieldFixtureIssuerID, field.TypeUUID)
 	}
 	if value, ok := _u.mutation.Name(); ok {
 		_spec.SetField(project.FieldName, field.TypeString, value)
@@ -971,9 +998,6 @@ func (_u *ProjectUpdateOne) sqlSave(ctx context.Context) (_node *Project, err er
 	if value, ok := _u.mutation.Updated(); ok {
 		_spec.SetField(project.FieldUpdated, field.TypeTime, value)
 	}
-	if value, ok := _u.mutation.CreatedBy(); ok {
-		_spec.SetField(project.FieldCreatedBy, field.TypeString, value)
-	}
 	if _u.mutation.CreatedByCleared() {
 		_spec.ClearField(project.FieldCreatedBy, field.TypeString)
 	}
@@ -982,9 +1006,6 @@ func (_u *ProjectUpdateOne) sqlSave(ctx context.Context) (_node *Project, err er
 	}
 	if _u.mutation.OwnerIDCleared() {
 		_spec.ClearField(project.FieldOwnerID, field.TypeString)
-	}
-	if value, ok := _u.mutation.Visibility(); ok {
-		_spec.SetField(project.FieldVisibility, field.TypeString, value)
 	}
 	if value, ok := _u.mutation.GithubInstallationID(); ok {
 		_spec.SetField(project.FieldGithubInstallationID, field.TypeInt64, value)
@@ -1012,6 +1033,15 @@ func (_u *ProjectUpdateOne) sqlSave(ctx context.Context) (_node *Project, err er
 	}
 	if _u.mutation.GitIdentityCleared() {
 		_spec.ClearField(project.FieldGitIdentity, field.TypeString)
+	}
+	if value, ok := _u.mutation.CrossProjectInbound(); ok {
+		_spec.SetField(project.FieldCrossProjectInbound, field.TypeEnum, value)
+	}
+	if value, ok := _u.mutation.CrossProjectInboundRevision(); ok {
+		_spec.SetField(project.FieldCrossProjectInboundRevision, field.TypeInt64, value)
+	}
+	if value, ok := _u.mutation.AddedCrossProjectInboundRevision(); ok {
+		_spec.AddField(project.FieldCrossProjectInboundRevision, field.TypeInt64, value)
 	}
 	if _u.mutation.AgentsCleared() {
 		edge := &sqlgraph.EdgeSpec{

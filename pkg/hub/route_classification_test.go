@@ -25,158 +25,272 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/authzop"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 )
 
 var routePermissionClassifications = map[string]string{
-	"/healthz":                                  "public:health",
-	"/readyz":                                   "public:health",
-	"/metrics":                                  "public:metrics",
-	"/api/v1/auth/login":                        "public:auth",
-	"/api/v1/auth/token":                        "public:auth",
-	"/api/v1/auth/refresh":                      "public:auth",
-	"/api/v1/auth/validate":                     "public:auth",
-	"/api/v1/auth/logout":                       "authenticated:user",
-	"/api/v1/auth/me":                           "authenticated:user",
-	"/api/v1/auth/tokens":                       "authenticated:user-token",
-	"/api/v1/auth/tokens/":                      "authenticated:user-token",
-	"/api/v1/auth/providers":                    "public:auth",
-	"/api/v1/auth/invite/redeem":                "public:invite",
-	"/api/v1/auth/cli/authorize":                "public:cli-oauth",
-	"/api/v1/auth/cli/token":                    "public:cli-oauth",
-	"/api/v1/auth/cli/device":                   "public:cli-oauth",
-	"/api/v1/auth/cli/device/token":             "public:cli-oauth",
-	"/api/v1/agents":                            "policy:agent",
-	"/api/v1/agents/":                           "policy:agent",
-	"/api/v1/projects":                          "policy:project",
-	"/api/v1/projects/register":                 "policy:project-register",
-	"/api/v1/projects/":                         "policy:project-subroute",
-	"/api/v1/groves":                            "policy:legacy-project",
-	"/api/v1/groves/register":                   "policy:legacy-project-register",
-	"/api/v1/groves/":                           "policy:legacy-project-subroute",
-	"/api/v1/runtime-brokers":                   "policy:broker",
-	"/api/v1/runtime-brokers/":                  "policy:broker",
-	"/api/v1/templates":                         "policy:template",
-	"/api/v1/templates/":                        "policy:template",
-	"/api/v1/gcp-service-accounts":              "policy:gcp-service-account",
-	"/api/v1/gcp-service-accounts/":             "policy:gcp-service-account",
-	"/api/v1/skills":                            "policy:skill",
-	"/api/v1/skills/":                           "policy:skill",
-	"/api/v1/skill-registries":                  "policy:skill-registry",
-	"/api/v1/skill-registries/":                 "policy:skill-registry",
-	"/api/v1/harness-configs":                   "policy:harness-config",
-	"/api/v1/harness-configs/":                  "policy:harness-config",
-	"/api/v1/pre-start-hooks":                   "policy:pre-start-hook",
-	"/api/v1/pre-start-hooks/":                  "policy:pre-start-hook",
-	"/api/v1/users":                             "policy:user",
-	"/api/v1/users/":                            "policy:user",
-	"/api/v1/env":                               "policy:env",
-	"/api/v1/env/":                              "policy:env",
-	"/api/v1/secrets":                           "policy:secret",
-	"/api/v1/secrets/":                          "policy:secret",
-	"/api/v1/metrics/session/":                  "authenticated:session-metrics",
-	"/api/v1/groups":                            "policy:group",
-	"/api/v1/groups/":                           "policy:group",
-	"/api/v1/policies":                          "hub-admin:policy",
-	"/api/v1/policies/":                         "hub-admin:policy",
-	"/api/v1/users/me/groups":                   "authenticated:principal",
-	"/api/v1/principals/":                       "authenticated:principal",
-	"/api/v1/users/me/injected-skills":          "authenticated:injected-skills",
-	"/api/v1/users/me/injected-skills/":         "authenticated:injected-skills",
-	"/api/v1/users/me/templates":                "authenticated:user-templates",
-	"/api/v1/users/me/templates/":               "authenticated:user-templates",
-	"/api/v1/hub/settings/injected-skills":      "hub-admin:injected-skills",
-	"/api/v1/brokers":                           "broker-hmac:registration",
-	"/api/v1/brokers/join":                      "broker-hmac:registration",
-	"/api/v1/brokers/":                          "broker-hmac:broker",
-	"/api/v1/broker/inbound":                    "broker-hmac:inbound",
-	"/api/v1/broker/projects":                   "broker-hmac:projects",
-	"/api/v1/admin/maintenance":                 "hub-admin:maintenance",
-	"/api/v1/admin/maintenance/operations":      "hub-admin:maintenance",
-	"/api/v1/admin/maintenance/operations/":     "hub-admin:maintenance",
-	"/api/v1/admin/maintenance/migrations/":     "hub-admin:maintenance",
-	"/api/v1/admin/maintenance/check-updates":   "hub-admin:maintenance",
-	"/api/v1/admin/maintenance/restart":         "hub-admin:maintenance",
-	"/api/v1/admin/scheduler":                   "hub-admin:scheduler",
-	"/api/v1/admin/allow-list":                  "hub-admin:allow-list",
-	"/api/v1/admin/allow-list/":                 "hub-admin:allow-list",
-	"/api/v1/admin/users/invite/bulk":           "hub-admin:invite",
-	"/api/v1/admin/users/invite":                "hub-admin:invite",
-	"/api/v1/admin/invites":                     "hub-admin:invite",
-	"/api/v1/admin/invites/":                    "hub-admin:invite",
-	"/api/v1/admin/server-config/schema":        "hub-admin:server-config",
-	"/api/v1/admin/server-config/sections/":     "hub-admin:server-config",
-	"/api/v1/admin/server-config":               "hub-admin:server-config",
-	"/api/v1/admin/project-defaults":            "hub-admin:project-defaults",
-	"/api/v1/admin/agents/reset-auth-all":       "hub-admin:agent-reset",
-	"/api/v1/admin/gcp-quota":                   "hub-admin:gcp-quota",
-	"/api/v1/admin/lifecycle-hooks":             "hub-admin:lifecycle-hook",
-	"/api/v1/admin/lifecycle-hooks/":            "hub-admin:lifecycle-hook",
-	"/api/v1/admin/validate-resources":          "hub-admin:resource-validation",
-	"/api/v1/admin/integrations":                "hub-admin:integration",
-	"/api/v1/admin/integrations/teams/manifest": "hub-admin:integration",
-	"/api/v1/admin/integrations/":               "hub-admin:integration",
-	"/api/v1/admin/diagnostics/logs/stream":     "hub-admin:diagnostics",
-	"/api/v1/admin/diagnostics/logs":            "hub-admin:diagnostics",
-	"/api/v1/admin/health/summary":              "hub-admin:health",
-	"/api/v1/metrics/":                          "hub-admin:metrics-dashboard",
-	"/api/v1/admin/metrics-dashboard":           "hub-admin:metrics-dashboard",
-	"/api/v1/notifications":                     "authenticated:notifications",
-	"/api/v1/notifications/":                    "authenticated:notifications",
-	"/api/v1/messages":                          "authenticated:messages",
-	"/api/v1/messages/":                         "authenticated:messages",
-	"/api/v1/message-channels":                  "authenticated:messages",
-	"/api/v1/chat/prefs":                        "policy:chat",
-	"/api/v1/chat/threads":                      "policy:chat",
-	"/api/v1/chat/threads/":                     "policy:chat",
-	"/api/v1/chat/spaces":                       "policy:chat",
-	"/api/v1/chat/spaces/":                      "policy:chat",
-	"/api/v1/chat/conversations/":               "policy:chat",
-	"/api/v1/chat/topics/":                      "policy:chat",
-	"/api/v1/chat/dms":                          "policy:chat",
-	"/api/v1/chat/user-prefs":                   "authenticated:chat-prefs",
-	"/api/v1/chat/presence":                     "authenticated:chat-presence",
-	"/api/v1/chat/search":                       "policy:chat",
-	"/api/v1/chat/attachments":                  "policy:chat-attachment",
-	"/api/v1/chat/attachments/":                 "policy:chat-attachment",
-	"/api/v1/runtime-brokers/connect":           "broker-hmac:control-channel",
-	"/api/v1/agent/gcp-token":                   "agent-token:gcp-token",
-	"/api/v1/agent/gcp-identity-token":          "agent-token:gcp-token",
-	"/api/v1/settings/public":                   "public:settings",
-	"/api/v1/github-app":                        "hub-admin:github-app",
-	"/api/v1/github-app/installations":          "hub-admin:github-app",
-	"/api/v1/github-app/installations/":         "hub-admin:github-app",
-	"/api/v1/github-app/installations/discover": "hub-admin:github-app",
-	"/api/v1/github-app/sync-permissions":       "hub-admin:github-app",
-	"/api/v1/telegram/link":                     "authenticated:account-link",
-	"/api/v1/telegram/link/verify":              "authenticated:account-link",
-	"/api/v1/telegram/link/status":              "authenticated:account-link",
-	"/api/v1/discord/link":                      "authenticated:account-link",
-	"/api/v1/discord/link/verify":               "authenticated:account-link",
-	"/api/v1/discord/link/status":               "authenticated:account-link",
-	"/api/v1/teams/link":                        "authenticated:account-link",
-	"/api/v1/teams/link/verify":                 "authenticated:account-link",
-	"/api/v1/teams/link/status":                 "authenticated:account-link",
-	"/api/v1/resources/import":                  "policy:resource-import",
-	"/api/v1/resources/discover":                "policy:resource-import",
-	"/api/v1/skills/discover-directory":         "policy:skill",
-	"/api/v1/webhooks/github":                   "webhook-signature:github",
-	"/github-app/setup":                         "public:github-app",
-	"/api/v1/system/identity":                   "workstation:system",
-	"/api/v1/system/status":                     "workstation:system",
-	"/api/v1/system/check":                      "workstation:system",
-	"/api/v1/system/runtime":                    "workstation:system",
-	"/api/v1/system/init":                       "workstation:system",
-	"/api/v1/system/images/pull":                "workstation:system",
-	"/api/v1/system/images/build":               "workstation:system",
-	"/api/v1/system/apple-dns":                  "workstation:system",
-	"/api/v1/system/registry":                   "workstation:system",
-	"/api/v1/system/workstation-settings":       "workstation:system",
-	"GET /.well-known/openid-configuration":     "public:oidc",
-	"GET /.well-known/jwks.json":                "public:oidc",
-	"POST /api/v1/agent/identity-token":         "agent-token:identity-token",
-	"/api/v1/system/fs/list":                    "workstation:filesystem",
-	"/api/v1/system/fs/mkdir":                   "workstation:filesystem",
-	"/api/v1/system/fs/validate-path":           "workstation:filesystem",
+	"/healthz":                                       "public:health",
+	"/readyz":                                        "public:health",
+	"/metrics":                                       "public:metrics",
+	"/api/v1/auth/login":                             "public:auth",
+	"/api/v1/auth/token":                             "public:auth",
+	"/api/v1/auth/refresh":                           "public:auth",
+	"/api/v1/auth/validate":                          "public:auth",
+	"/api/v1/experiments":                            "authenticated:experiments",
+	"/api/v1/profiling":                              "authenticated:profiling",
+	"/api/v1/auth/admin-status":                      "authenticated:user",
+	"/api/v1/auth/logout":                            "authenticated:user",
+	"/api/v1/auth/me":                                "authenticated:user",
+	"/api/v1/auth/tokens":                            "authenticated:user-token",
+	"/api/v1/auth/tokens/":                           "authenticated:user-token",
+	"/api/v1/auth/scopes":                            "authenticated:user-token",
+	"POST /api/v1/auth/federation-token":             "authenticated:federation-token",
+	"/api/v1/auth/providers":                         "public:auth",
+	"/api/v1/auth/invite/redeem":                     "public:invite",
+	"/api/v1/auth/cli/authorize":                     "public:cli-oauth",
+	"/api/v1/auth/cli/token":                         "public:cli-oauth",
+	"/api/v1/auth/cli/device":                        "public:cli-oauth",
+	"/api/v1/auth/cli/device/token":                  "public:cli-oauth",
+	"/api/v1/auth/integrations/google/exchange":      "public:ge-auth",
+	"/api/v1/conversations":                          "authenticated:conversation",
+	"/api/v1/conversations/":                         "authenticated:conversation",
+	"/api/v1/conversations/resolve":                  "authenticated:conversation",
+	"/api/v1/thread-groups":                          "authenticated:thread-group",
+	"/api/v1/thread-groups/":                         "authenticated:thread-group",
+	"/api/v1/agents":                                 "policy:agent",
+	"/api/v1/agents/":                                "policy:agent",
+	"/api/v1/projects":                               "policy:project",
+	"/api/v1/projects/register":                      "policy:project-register",
+	"/api/v1/projects/":                              "policy:project-subroute",
+	"/api/v1/runtime-brokers":                        "policy:broker",
+	"/api/v1/runtime-brokers/":                       "policy:broker",
+	"/api/v1/templates":                              "policy:template",
+	"/api/v1/templates/":                             "policy:template",
+	"/api/v1/gcp-service-accounts":                   "policy:gcp-service-account",
+	"/api/v1/gcp-service-accounts/":                  "policy:gcp-service-account",
+	"/api/v1/gcp-service-accounts/mint":              "policy:gcp-service-account",
+	"/api/v1/gcs/object":                             "authenticated:gcs",
+	"/api/v1/conduit/grant-keys":                     "authenticated:conduit",
+	"/api/v1/artifacts":                              "policy:artifact",
+	"/api/v1/artifacts/":                             "policy:artifact",
+	"/api/v1/artifacts/shared/":                      "public:artifact-share-link",
+	"/api/v1/artifacts/view/":                        "public:artifact-view-capability",
+	"/api/v1/portview/":                              "public:port-view-capability",
+	"/api/v1/messaging/capabilities":                 "authenticated:messaging",
+	"/api/v1/messaging/targets/resolve":              "authenticated:messaging",
+	"/api/v1/skills":                                 "policy:skill",
+	"/api/v1/skills/":                                "policy:skill",
+	"/api/v1/skill-registries":                       "hub-admin:skill-registry",
+	"/api/v1/skill-registries/":                      "hub-admin:skill-registry",
+	"/api/v1/harness-configs":                        "policy:harness-config",
+	"/api/v1/harness-configs/":                       "policy:harness-config",
+	"/api/v1/pre-start-hooks":                        "policy:pre-start-hook",
+	"/api/v1/pre-start-hooks/":                       "policy:pre-start-hook",
+	"/api/v1/users":                                  "policy:user",
+	"/api/v1/users/":                                 "policy:user",
+	"/api/v1/env":                                    "policy:env",
+	"/api/v1/env/":                                   "policy:env",
+	"/api/v1/secrets":                                "policy:secret",
+	"/api/v1/secrets/":                               "policy:secret",
+	"/api/v1/metrics/session/":                       "authenticated:session-metrics",
+	"/api/v1/groups":                                 "policy:group",
+	"/api/v1/groups/":                                "policy:group",
+	"/api/v1/policies":                               "authenticated:policy-gone",
+	"/api/v1/policies/":                              "authenticated:policy-gone",
+	"/api/v1/users/me/groups":                        "authenticated:principal",
+	"/api/v1/users/me/visitor-grants":                "authenticated:visitor-grants",
+	"/api/v1/users/me/visitor-dms":                   "authenticated:visitor-dms",
+	"/api/v1/principals/":                            "authenticated:principal",
+	"/api/v1/users/me/injected-skills":               "authenticated:injected-skills",
+	"/api/v1/users/me/injected-skills/":              "authenticated:injected-skills",
+	"/api/v1/users/me/templates":                     "authenticated:user-templates",
+	"/api/v1/users/me/templates/":                    "authenticated:user-templates",
+	"/api/v1/users/me/terminal-workspace":            "authenticated:user-terminal-workspace",
+	"/api/v1/users/me/delegations":                   "authenticated:agent-delegations",
+	"/api/v1/users/me/delegations/revoke-all":        "authenticated:agent-delegations",
+	"/api/v1/hub/settings/injected-skills":           "authenticated:injected-skills",
+	"/api/v1/brokers":                                "broker-hmac:registration",
+	"/api/v1/brokers/join":                           "broker-hmac:registration",
+	"/api/v1/brokers/":                               "broker-hmac:broker",
+	"/api/v1/broker/callback":                        "broker-hmac:callback",
+	"/api/v1/broker/inbound":                         "broker-hmac:inbound",
+	"/api/v1/broker/inbound/routed":                  "broker-hmac:inbound-routed",
+	"/api/v1/broker/projects":                        "broker-hmac:projects",
+	"/api/v1/admin/maintenance":                      "hub-admin:maintenance",
+	"/api/v1/admin/maintenance/operations":           "hub-admin:maintenance",
+	"/api/v1/admin/maintenance/operations/":          "hub-admin:maintenance",
+	"/api/v1/admin/maintenance/migrations/":          "hub-admin:maintenance",
+	"/api/v1/admin/maintenance/check-updates":        "hub-admin:maintenance",
+	"/api/v1/admin/maintenance/restart":              "hub-admin:maintenance",
+	"/api/v1/admin/maintenance/update-available":     "hub-admin:maintenance",
+	"/api/v1/admin/maintenance/update-status":        "hub-admin:maintenance",
+	"/api/v1/admin/maintenance/releases":             "hub-admin:maintenance",
+	"/api/v1/admin/scheduler":                        "hub-admin:scheduler",
+	"/api/v1/admin/allow-list":                       "hub-admin:allow-list",
+	"/api/v1/admin/allow-list/":                      "hub-admin:allow-list",
+	"/api/v1/admin/users/invite/bulk":                "hub-admin:invite",
+	"/api/v1/admin/users/invite":                     "hub-admin:invite",
+	"/api/v1/admin/invites":                          "hub-admin:invite",
+	"/api/v1/admin/invites/":                         "hub-admin:invite",
+	"/api/v1/admin/server-config/schema":             "hub-admin:server-config",
+	"/api/v1/admin/server-config/sections/":          "hub-admin:server-config",
+	"/api/v1/admin/server-config":                    "hub-admin:server-config",
+	"/api/v1/admin/project-defaults":                 "hub-admin:project-defaults",
+	"/api/v1/admin/agents/reset-auth-all":            "hub-admin:agent-reset",
+	"/api/v1/admin/conduit/grant-keys/rotate":        "hub-admin:conduit-grant-keys",
+	"/api/v1/admin/conduit/grant-keys/revoke":        "hub-admin:conduit-grant-keys",
+	"/api/v1/admin/gcp-quota":                        "hub-admin:gcp-quota",
+	"/api/v1/admin/delegation-adoption":              "hub-admin:delegation-adoption",
+	"/api/v1/admin/delegation-adoption/previews":     "hub-admin:delegation-adoption",
+	"/api/v1/admin/delegation-adoption/commits":      "hub-admin:delegation-adoption",
+	"/api/v1/admin/keys/status":                      "hub-admin:key-status",
+	"/api/v1/admin/lifecycle-hooks":                  "hub-admin:lifecycle-hook",
+	"/api/v1/admin/lifecycle-hooks/":                 "hub-admin:lifecycle-hook",
+	"/api/v1/admin/validate-resources":               "hub-admin:resource-validation",
+	"/api/v1/admin/integrations":                     "hub-admin:integration",
+	"/api/v1/admin/integrations/teams/manifest":      "hub-admin:integration",
+	"/api/v1/admin/integrations/":                    "hub-admin:integration",
+	"/api/v1/admin/diagnostics/logs/stream":          "hub-admin:diagnostics",
+	"/api/v1/admin/diagnostics/logs":                 "hub-admin:diagnostics",
+	"/api/v1/admin/health/summary":                   "hub-admin:health",
+	"/api/v1/admin/messaging":                        "hub-admin:messaging",
+	"/api/v1/admin/experiments":                      "hub-admin:experiments",
+	"/api/v1/admin/profiling":                        "hub-admin:profiling",
+	"/api/v1/admin/chat-retention":                   "hub-admin:chat-retention",
+	"/api/v1/admin/messaging/divergence":             "hub-admin:diagnostics",
+	"/api/v1/metrics/":                               "hub-admin:metrics-dashboard",
+	"/api/v1/admin/metrics-dashboard":                "hub-admin:metrics-dashboard",
+	"/api/v1/notifications":                          "authenticated:notifications",
+	"/api/v1/notifications/":                         "authenticated:notifications",
+	"/api/v1/messages":                               "authenticated:messages",
+	"/api/v1/messages/":                              "authenticated:messages",
+	"/api/v1/message-channels":                       "authenticated:messages",
+	"/api/v1/chat/prefs":                             "policy:chat",
+	"/api/v1/chat/spaces":                            "policy:chat",
+	"/api/v1/chat/spaces/":                           "policy:chat",
+	"/api/v1/chat/conversations/":                    "policy:chat",
+	"/api/v1/chat/topics/":                           "policy:chat",
+	"/api/v1/chat/dms":                               "policy:chat",
+	"/api/v1/chat/unread-count":                      "policy:chat",
+	"/api/v1/chat/user-prefs":                        "authenticated:chat-prefs",
+	"/api/v1/chat/presence":                          "authenticated:chat-presence",
+	"/api/v1/chat/search":                            "policy:chat",
+	"/api/v1/chat/stars":                             "policy:chat",
+	"/api/v1/chat/stars/":                            "policy:chat",
+	"/api/v1/chat/starred-conversations":             "policy:chat",
+	"/api/v1/chat/attachments":                       "policy:chat-attachment",
+	"/api/v1/chat/attachments/":                      "policy:chat-attachment",
+	"/api/v1/runtime-brokers/connect":                "broker-hmac:control-channel",
+	"/api/v1/attachment-deliveries/":                 "broker-hmac:attachment-delivery",
+	"/api/v1/agent/gcp-token":                        "agent-token:gcp-token",
+	"/api/v1/agent/gcp-identity-token":               "agent-token:gcp-token",
+	"/api/v1/settings/public":                        "public:settings",
+	"GET /api/v1/test-infra/status":                  "public:test-infra",
+	"POST /api/v1/csp-reports":                       "public:csp-reports",
+	"GET /api/v1/github-app":                         "hub-admin:github-app",
+	"PUT /api/v1/github-app":                         "hub-admin:github-app",
+	"GET /api/v1/github-app/installations":           "hub-admin:github-app",
+	"POST /api/v1/github-app/installations":          "hub-admin:github-app",
+	"GET /api/v1/github-app/installations/":          "hub-admin:github-app",
+	"PUT /api/v1/github-app/installations/":          "hub-admin:github-app",
+	"DELETE /api/v1/github-app/installations/":       "hub-admin:github-app",
+	"POST /api/v1/github-app/installations/discover": "hub-admin:github-app",
+	"POST /api/v1/github-app/sync-permissions":       "hub-admin:github-app",
+	"POST /api/v1/test-identities":                   "hub-admin:test-identity",
+	"GET /api/v1/test-identities":                    "hub-admin:test-identity",
+	"POST /api/v1/test-identities/{id}/token":        "hub-admin:test-identity",
+	"DELETE /api/v1/test-identities/{id}":            "hub-admin:test-identity",
+	"POST /api/v1/test-identities/cleanup":           "hub-admin:test-identity",
+	"GET /api/v1/test-identities/provenance":         "hub-admin:test-identity",
+	"POST /api/v1/test-identities/admin":             "hub-admin:test-identity",
+	"POST /api/v1/test-identities/admin/revoke-all":  "hub-admin:test-identity",
+	"GET /api/v1/test-identities/admin/{id}/residue": "hub-admin:test-identity",
+	"POST /api/v1/test-identity-delegations":         "hub-admin:test-identity",
+	"GET /api/v1/test-identity-delegations":          "hub-admin:test-identity",
+	"DELETE /api/v1/test-identity-delegations/{id}":  "hub-admin:test-identity",
+	"/api/v1/telegram/link":                          "authenticated:account-link",
+	"/api/v1/telegram/link/verify":                   "authenticated:account-link",
+	"/api/v1/telegram/link/status":                   "authenticated:account-link",
+	"/api/v1/discord/link":                           "authenticated:account-link",
+	"/api/v1/discord/link/verify":                    "authenticated:account-link",
+	"/api/v1/discord/link/status":                    "authenticated:account-link",
+	"/api/v1/teams/link":                             "authenticated:account-link",
+	"/api/v1/teams/link/verify":                      "authenticated:account-link",
+	"/api/v1/teams/link/status":                      "authenticated:account-link",
+	"/api/v1/resources/import":                       "policy:resource-import",
+	"/api/v1/resources/discover":                     "policy:resource-import",
+	"/api/v1/skills/discover-directory":              "policy:skill",
+	"/api/v1/webhooks/github":                        "webhook-signature:github",
+	"/github-app/setup":                              "public:github-app",
+	"/api/v1/system/identity":                        "workstation:system",
+	"/api/v1/system/status":                          "workstation:system",
+	"/api/v1/system/check":                           "workstation:system",
+	"/api/v1/system/runtime":                         "workstation:system",
+	"/api/v1/system/init":                            "workstation:system",
+	"/api/v1/system/images/pull":                     "workstation:system",
+	"/api/v1/system/images/build":                    "workstation:system",
+	"/api/v1/system/apple-dns":                       "workstation:system",
+	"/api/v1/system/registry":                        "workstation:system",
+	"/api/v1/system/workstation-settings":            "workstation:system",
+	"GET /.well-known/openid-configuration":          "public:oidc",
+	"GET /.well-known/jwks.json":                     "public:oidc",
+	"POST /api/v1/agent/identity-token":              "agent-token:identity-token",
+	"POST /api/v1/agent/secrets":                     "agent-token:agent-secrets",
+	"/api/v1/conduit":                                "agent-token:conduit",
+	"/api/v1/system/fs/list":                         "workstation:filesystem",
+	"/api/v1/system/fs/mkdir":                        "workstation:filesystem",
+	"/api/v1/system/fs/validate-path":                "workstation:filesystem",
+	"/api/v1/authz/explain":                          "authenticated:authz-explain",
+	"/api/v1/admin/limits":                           "hub-admin:quota",
+	"/api/v1/admin/limits/":                          "hub-admin:quota",
+	"/api/v1/admin/entitlements/":                    "hub-admin:quota",
+	"/api/v1/admin/usage":                            "hub-admin:quota",
+	"/api/v1/admin/usage/":                           "hub-admin:quota",
+	"/api/v1/usage/me":                               "authenticated:quota-usage",
+	// Role management (PR-C1)
+	"/api/v1/admin/roles":          "hub-admin:role",
+	"/api/v1/admin/roles/":         "hub-admin:role",
+	"/api/v1/admin/role-bindings":  "hub-admin:role_binding",
+	"/api/v1/admin/role-bindings/": "authenticated:role_binding",
+	"/api/v1/admin/permissions":    "hub-admin:role",
+
+	// Access Constraints (AC1)
+	"/api/v1/admin/access-constraints":                "hub-admin:access_constraint",
+	"/api/v1/admin/access-constraints/":               "hub-admin:access_constraint",
+	"GET /api/v1/admin/access-constraints/{id}/audit": "policy:audit",
+
+	// Access Constraint Previews (B7)
+	"/api/v1/admin/access-constraint-previews":  "hub-admin:access_constraint",
+	"/api/v1/admin/access-constraint-previews/": "hub-admin:access_constraint",
+
+	// Effective Access composition (user-admin-role-sync)
+	"/api/v1/admin/effective-access": "hub-admin:audit",
+
+	// Role import/export
+	"/api/v1/admin/roles/export": "hub-admin:role",
+	"/api/v1/admin/roles/import": "hub-admin:role",
+
+	// Test identity web-login codes (ptone/scion#4240, WS1)
+	"POST /api/v1/test-identities/{id}/web-login-code": "hub-admin:test-identity",
+}
+
+func TestConstraintAuditRoutePermissionClassification(t *testing.T) {
+	const pattern = "GET /api/v1/admin/access-constraints/{id}/audit"
+
+	if got := routePermissionClassifications[pattern]; got != "policy:audit" {
+		t.Fatalf("permission classification for %s = %q, want %q", pattern, got, "policy:audit")
+	}
+
+	meta, ok := routeMetadataTable[pattern]
+	if !ok {
+		t.Fatalf("route metadata missing for %s", pattern)
+	}
+	if meta.Classification != RoutePolicy || meta.Permission != "hub.audit.read" {
+		t.Fatalf("route metadata for %s = classification %q, permission %q; want %q and %q",
+			pattern, meta.Classification, meta.Permission, RoutePolicy, "hub.audit.read")
+	}
 }
 
 func TestRegisteredRoutesHavePermissionClassification(t *testing.T) {
@@ -219,13 +333,166 @@ func TestRegisteredRoutesHavePermissionClassification(t *testing.T) {
 	}
 }
 
-func TestHubAdminRoutesRejectScopedAdminUAT(t *testing.T) {
+func TestRegisteredRoutesHaveRouteMetadata(t *testing.T) {
+	source, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatalf("read server.go: %v", err)
+	}
+
+	re := regexp.MustCompile(`s\.mux\.Handle(?:Func)?\("([^"]+)"`)
+	matches := re.FindAllStringSubmatch(string(source), -1)
+	if len(matches) == 0 {
+		t.Fatal("no registered routes found in server.go")
+	}
+
+	registered := make(map[string]bool, len(matches))
+	for _, match := range matches {
+		registered[match[1]] = true
+	}
+
+	var missing []string
+	for route := range registered {
+		meta, ok := routeMetadataTable[route]
+		if !ok {
+			missing = append(missing, route)
+			continue
+		}
+		if meta.Classification == "" {
+			missing = append(missing, route+" (empty classification)")
+		}
+		if meta.RouteID == "" {
+			missing = append(missing, route+" (empty routeID)")
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Fatalf("registered routes missing route metadata: %v", missing)
+	}
+
+	var stale []string
+	for route := range routeMetadataTable {
+		if !registered[route] {
+			stale = append(stale, route)
+		}
+	}
+	sort.Strings(stale)
+	if len(stale) > 0 {
+		t.Fatalf("route metadata for unregistered routes: %v", stale)
+	}
+}
+
+func TestRouteMetadataPermissionsAreValid(t *testing.T) {
+	// Build set of valid permission IDs from the registry.
+	validPermissions := make(map[string]bool)
+	for _, perm := range permissions.Registry {
+		validPermissions[perm.ID] = true
+	}
+
+	var invalid []string
+	for pattern, meta := range routeMetadataTable {
+		if meta.Classification != RoutePolicy {
+			continue
+		}
+		if meta.Permission == "" {
+			invalid = append(invalid, pattern+": empty permission")
+			continue
+		}
+		if !validPermissions[meta.Permission] {
+			invalid = append(invalid, pattern+": unknown permission "+meta.Permission)
+		}
+		if meta.Resource == "" {
+			invalid = append(invalid, pattern+": empty resource")
+		}
+		if meta.Action == "" {
+			invalid = append(invalid, pattern+": empty action")
+		}
+	}
+	sort.Strings(invalid)
+	if len(invalid) > 0 {
+		t.Fatalf("invalid route metadata permissions:\n%s", strings.Join(invalid, "\n"))
+	}
+}
+
+func TestRouteGuardsDenyUnauthorized(t *testing.T) {
 	srv := &Server{config: DefaultServerConfig(), mux: http.NewServeMux()}
 	srv.registerRoutes()
 
-	admin := NewAuthenticatedUser("admin-uat", "admin-uat@example.com", "Admin UAT", "admin", "api")
-	scopedAdmin := NewScopedUserIdentity(admin, "project-1", []string{"agent:create", "project:read", "policy:manage"})
+	// Test representative routes from each classification.
+	tests := []struct {
+		name           string
+		route          string
+		classification RouteClassification
+		identity       Identity
+		wantStatus     int
+	}{
+		// RouteAuthenticated: no identity → 401
+		{
+			name:           "authenticated route denies unauthenticated",
+			route:          "/api/v1/auth/logout",
+			classification: RouteAuthenticated,
+			identity:       nil,
+			wantStatus:     http.StatusUnauthorized,
+		},
+		// RouteHubAdmin: every hub-admin route declares a Permission, and this
+		// server has no authorization service, so the guard refuses with 500
+		// for every caller. Non-admin (403) and unauthenticated (401) denials
+		// through Decide are tested with a full server in
+		// TestRouteGuardPermissionBasedPath and TestRouteGuardOpsPermissions.
+		{
+			name:           "hub-admin route refuses non-admin without authz service",
+			route:          "/api/v1/admin/allow-list",
+			classification: RouteHubAdmin,
+			identity:       NewAuthenticatedUser("user-1", "user@example.com", "User", "member", "api"),
+			wantStatus:     http.StatusInternalServerError,
+		},
+		{
+			name:           "hub-admin route refuses admin without authz service",
+			route:          "/api/v1/admin/allow-list",
+			classification: RouteHubAdmin,
+			identity:       NewAuthenticatedUser("admin-1", "admin@example.com", "Admin", "admin", "api"),
+			wantStatus:     http.StatusInternalServerError,
+		},
+		{
+			name:           "hub-admin route refuses unauthenticated without authz service",
+			route:          "/api/v1/admin/allow-list",
+			classification: RouteHubAdmin,
+			identity:       nil,
+			wantStatus:     http.StatusInternalServerError,
+		},
+		// RouteAgentToken: no identity → 401
+		{
+			name:           "agent-token route denies unauthenticated",
+			route:          "/api/v1/agent/gcp-token",
+			classification: RouteAgentToken,
+			identity:       nil,
+			wantStatus:     http.StatusUnauthorized,
+		},
+	}
 
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tt.identity != nil {
+				ctx = contextWithIdentity(ctx, tt.identity)
+			}
+			ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+			defer cancel()
+
+			req := httptest.NewRequest(http.MethodGet, tt.route, nil)
+			req = req.WithContext(ctx)
+			rr := httptest.NewRecorder()
+
+			srv.mux.ServeHTTP(rr, req)
+
+			if rr.Code != tt.wantStatus {
+				t.Fatalf("route %s returned %d, want %d: %s", tt.route, rr.Code, tt.wantStatus, rr.Body.String())
+			}
+		})
+	}
+}
+
+// allHubAdminRoutes returns all routes classified as hub-admin, sorted.
+func allHubAdminRoutes() []string {
 	routes := make([]string, 0)
 	for route, classification := range routePermissionClassifications {
 		if strings.HasPrefix(classification, "hub-admin:") {
@@ -233,9 +500,41 @@ func TestHubAdminRoutesRejectScopedAdminUAT(t *testing.T) {
 		}
 	}
 	sort.Strings(routes)
+	return routes
+}
+
+func TestHubAdminRoutesRejectScopedAdminUAT(t *testing.T) {
+	srv := &Server{config: DefaultServerConfig(), mux: http.NewServeMux(), authzService: NewAuthzService(nil, nil)}
+	// The test identity routes answer 404 before their guard while the
+	// feature is off; turn it on so this checks the guard itself.
+	srv.testIdentities.enabled = true
+	// Likewise the admin-kind test identity routes and the test admin gate.
+	srv.testAdminGate = testAdminGate{hubAdmin: true}
+	srv.registerRoutes()
+
+	admin := NewAuthenticatedUser("admin-uat", "admin-uat@example.com", "Admin UAT", "admin", "api")
+	scopedAdmin := NewScopedUserIdentity(admin, "project-1", []string{"agent:create", "project:read", "policy:manage"})
+
+	routes := allHubAdminRoutes()
 
 	for _, route := range routes {
 		t.Run(route, func(t *testing.T) {
+			// A permission route admits a token only through its catalog
+			// disposition: an operation on a hub resource route admits the
+			// hub boundary only, so this project token is outside it.
+			if meta, ok := routeMetadataTable[route]; ok && meta.Permission != "" && meta.Resource == permissions.ResourceHub {
+				for _, spec := range hubAdminRouteCatalogOperations(route) {
+					if !spec.Bearer.Kind.AdmitsToken() {
+						continue
+					}
+					for _, b := range spec.Bearer.Boundaries {
+						if b == authzop.BearerBoundaryProject {
+							t.Errorf("%s admits a project token on hub resource route %s", spec.ID, route)
+						}
+					}
+				}
+			}
+
 			method, path, body := scopedAdminUATRouteRequest(route)
 			ctx, cancel := context.WithTimeout(contextWithIdentity(context.Background(), scopedAdmin), 200*time.Millisecond)
 			defer cancel()
@@ -253,18 +552,46 @@ func TestHubAdminRoutesRejectScopedAdminUAT(t *testing.T) {
 	}
 }
 
+// hubAdminRouteCatalogOperations returns the catalog operations with an
+// HTTP, SSE or WebSocket entry point on route; a route ending in "/" also
+// matches every entry point below it.
+func hubAdminRouteCatalogOperations(route string) []authzop.OperationSpec {
+	var out []authzop.OperationSpec
+	for _, spec := range authzop.Catalog {
+		for _, ep := range spec.EntryPoints {
+			switch ep.Kind {
+			case authzop.EntryPointHTTPRoute, authzop.EntryPointSSE, authzop.EntryPointWebSocket:
+			default:
+				continue
+			}
+			if ep.Pattern == route || (strings.HasSuffix(route, "/") && strings.HasPrefix(ep.Pattern, route)) {
+				out = append(out, spec)
+				break
+			}
+		}
+	}
+	return out
+}
+
 func scopedAdminUATRouteRequest(route string) (string, string, *bytes.Reader) {
 	method := http.MethodGet
 	path := route
 	body := ""
+	// A key registered with a method prefix ("DELETE /api/v1/...") names
+	// its method.
+	if i := strings.Index(route, " /"); i >= 0 {
+		method, path = route[:i], route[i+1:]
+	}
 
 	switch route {
 	case "/api/v1/admin/users/invite", "/api/v1/admin/users/invite/bulk",
 		"/api/v1/admin/agents/reset-auth-all", "/api/v1/admin/maintenance/check-updates",
-		"/api/v1/admin/maintenance/restart", "/api/v1/github-app/installations/discover",
-		"/api/v1/github-app/sync-permissions":
+		"/api/v1/admin/maintenance/restart", "/api/v1/admin/delegation-adoption/previews",
+		"/api/v1/admin/delegation-adoption/commits", "/api/v1/admin/conduit/grant-keys/rotate",
+		"/api/v1/admin/conduit/grant-keys/revoke":
 		method = http.MethodPost
-	case "/api/v1/admin/server-config", "/api/v1/admin/project-defaults":
+	case "/api/v1/admin/server-config", "/api/v1/admin/project-defaults",
+		"/api/v1/admin/messaging":
 		method = http.MethodPut
 		body = "{}"
 	case "/api/v1/hub/settings/injected-skills":

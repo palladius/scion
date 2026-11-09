@@ -52,8 +52,16 @@ type Message struct {
 	Channel string `json:"channel,omitempty"`
 	// ThreadID holds the value of the "thread_id" field.
 	ThreadID string `json:"thread_id,omitempty"`
-	// Visibility holds the value of the "visibility" field.
-	Visibility string `json:"visibility,omitempty"`
+	// ConversationID holds the value of the "conversation_id" field.
+	ConversationID *uuid.UUID `json:"conversation_id,omitempty"`
+	// SenderProjectID holds the value of the "sender_project_id" field.
+	SenderProjectID *uuid.UUID `json:"sender_project_id,omitempty"`
+	// RecipientProjectID holds the value of the "recipient_project_id" field.
+	RecipientProjectID *uuid.UUID `json:"recipient_project_id,omitempty"`
+	// AuthorizingUserID holds the value of the "authorizing_user_id" field.
+	AuthorizingUserID *string `json:"authorizing_user_id,omitempty"`
+	// DelegationGrantID holds the value of the "delegation_grant_id" field.
+	DelegationGrantID *string `json:"delegation_grant_id,omitempty"`
 	// Created holds the value of the "created" field.
 	Created      time.Time `json:"created,omitempty"`
 	selectValues sql.SelectValues
@@ -64,9 +72,11 @@ func (*Message) scanValues(columns []string) ([]any, error) {
 	values := make([]any, len(columns))
 	for i := range columns {
 		switch columns[i] {
+		case message.FieldConversationID, message.FieldSenderProjectID, message.FieldRecipientProjectID:
+			values[i] = &sql.NullScanner{S: new(uuid.UUID)}
 		case message.FieldUrgent, message.FieldBroadcasted, message.FieldRead:
 			values[i] = new(sql.NullBool)
-		case message.FieldSender, message.FieldSenderID, message.FieldRecipient, message.FieldRecipientID, message.FieldMsg, message.FieldType, message.FieldAgentID, message.FieldGroupID, message.FieldDispatchState, message.FieldDispatchFailureReason, message.FieldChannel, message.FieldThreadID, message.FieldVisibility:
+		case message.FieldSender, message.FieldSenderID, message.FieldRecipient, message.FieldRecipientID, message.FieldMsg, message.FieldType, message.FieldAgentID, message.FieldGroupID, message.FieldDispatchState, message.FieldDispatchFailureReason, message.FieldChannel, message.FieldThreadID, message.FieldAuthorizingUserID, message.FieldDelegationGrantID:
 			values[i] = new(sql.NullString)
 		case message.FieldDispatchedAt, message.FieldCreated:
 			values[i] = new(sql.NullTime)
@@ -197,11 +207,40 @@ func (_m *Message) assignValues(columns []string, values []any) error {
 			} else if value.Valid {
 				_m.ThreadID = value.String
 			}
-		case message.FieldVisibility:
-			if value, ok := values[i].(*sql.NullString); !ok {
-				return fmt.Errorf("unexpected type %T for field visibility", values[i])
+		case message.FieldConversationID:
+			if value, ok := values[i].(*sql.NullScanner); !ok {
+				return fmt.Errorf("unexpected type %T for field conversation_id", values[i])
 			} else if value.Valid {
-				_m.Visibility = value.String
+				_m.ConversationID = new(uuid.UUID)
+				*_m.ConversationID = *value.S.(*uuid.UUID)
+			}
+		case message.FieldSenderProjectID:
+			if value, ok := values[i].(*sql.NullScanner); !ok {
+				return fmt.Errorf("unexpected type %T for field sender_project_id", values[i])
+			} else if value.Valid {
+				_m.SenderProjectID = new(uuid.UUID)
+				*_m.SenderProjectID = *value.S.(*uuid.UUID)
+			}
+		case message.FieldRecipientProjectID:
+			if value, ok := values[i].(*sql.NullScanner); !ok {
+				return fmt.Errorf("unexpected type %T for field recipient_project_id", values[i])
+			} else if value.Valid {
+				_m.RecipientProjectID = new(uuid.UUID)
+				*_m.RecipientProjectID = *value.S.(*uuid.UUID)
+			}
+		case message.FieldAuthorizingUserID:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field authorizing_user_id", values[i])
+			} else if value.Valid {
+				_m.AuthorizingUserID = new(string)
+				*_m.AuthorizingUserID = value.String
+			}
+		case message.FieldDelegationGrantID:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field delegation_grant_id", values[i])
+			} else if value.Valid {
+				_m.DelegationGrantID = new(string)
+				*_m.DelegationGrantID = value.String
 			}
 		case message.FieldCreated:
 			if value, ok := values[i].(*sql.NullTime); !ok {
@@ -300,8 +339,30 @@ func (_m *Message) String() string {
 	builder.WriteString("thread_id=")
 	builder.WriteString(_m.ThreadID)
 	builder.WriteString(", ")
-	builder.WriteString("visibility=")
-	builder.WriteString(_m.Visibility)
+	if v := _m.ConversationID; v != nil {
+		builder.WriteString("conversation_id=")
+		builder.WriteString(fmt.Sprintf("%v", *v))
+	}
+	builder.WriteString(", ")
+	if v := _m.SenderProjectID; v != nil {
+		builder.WriteString("sender_project_id=")
+		builder.WriteString(fmt.Sprintf("%v", *v))
+	}
+	builder.WriteString(", ")
+	if v := _m.RecipientProjectID; v != nil {
+		builder.WriteString("recipient_project_id=")
+		builder.WriteString(fmt.Sprintf("%v", *v))
+	}
+	builder.WriteString(", ")
+	if v := _m.AuthorizingUserID; v != nil {
+		builder.WriteString("authorizing_user_id=")
+		builder.WriteString(*v)
+	}
+	builder.WriteString(", ")
+	if v := _m.DelegationGrantID; v != nil {
+		builder.WriteString("delegation_grant_id=")
+		builder.WriteString(*v)
+	}
 	builder.WriteString(", ")
 	builder.WriteString("created=")
 	builder.WriteString(_m.Created.Format(time.ANSIC))

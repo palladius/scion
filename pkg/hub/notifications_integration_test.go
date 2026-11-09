@@ -67,10 +67,9 @@ func setupIntegrationTest(t *testing.T) *integrationTestEnv {
 	srv.SetDispatcher(recorder)
 
 	project := &store.Project{
-		ID:         tid("project-integ"),
-		Name:       "Integration Project",
-		Slug:       "integration-project",
-		Visibility: store.VisibilityPrivate,
+		ID:   tid("project-integ"),
+		Name: "Integration Project",
+		Slug: "integration-project",
 	}
 	require.NoError(t, s.CreateProject(ctx, project))
 
@@ -85,6 +84,7 @@ func setupIntegrationTest(t *testing.T) *integrationTestEnv {
 		ProjectID:  project.ID,
 		BrokerID:   broker.ID,
 		BrokerName: broker.Name,
+		LocalPath:  fixtureProviderCheckout(t),
 		Status:     store.BrokerStatusOnline,
 	}))
 	project.DefaultRuntimeBrokerID = broker.ID
@@ -196,7 +196,6 @@ func TestIntegration_AgentCreatesAgentWithNotify_FullFlow(t *testing.T) {
 		ProjectID:       env.project.ID,
 		Phase:           string(state.PhaseRunning),
 		RuntimeBrokerID: env.broker.ID,
-		Visibility:      store.VisibilityPrivate,
 	}
 	require.NoError(t, env.store.CreateAgent(ctx, parent))
 
@@ -252,7 +251,6 @@ func TestIntegration_AgentCreatesAgentWithNotify_WaitingForInput(t *testing.T) {
 		ProjectID:       env.project.ID,
 		Phase:           string(state.PhaseRunning),
 		RuntimeBrokerID: env.broker.ID,
-		Visibility:      store.VisibilityPrivate,
 	}
 	require.NoError(t, env.store.CreateAgent(ctx, parent))
 
@@ -300,7 +298,6 @@ func TestIntegration_AgentCreatesAgentWithNotify_MultipleStatusChanges(t *testin
 		ProjectID:       env.project.ID,
 		Phase:           string(state.PhaseRunning),
 		RuntimeBrokerID: env.broker.ID,
-		Visibility:      store.VisibilityPrivate,
 	}
 	require.NoError(t, env.store.CreateAgent(ctx, parent))
 
@@ -358,7 +355,6 @@ func TestIntegration_StatusNormalization_LowercaseEventMatchesUppercaseTrigger(t
 		ProjectID:       env.project.ID,
 		Phase:           string(state.PhaseRunning),
 		RuntimeBrokerID: env.broker.ID,
-		Visibility:      store.VisibilityPrivate,
 	}
 	require.NoError(t, env.store.CreateAgent(ctx, parent))
 
@@ -395,7 +391,6 @@ func TestIntegration_StatusNormalization_DedupAcrossCaseBoundaries(t *testing.T)
 		ProjectID:       env.project.ID,
 		Phase:           string(state.PhaseRunning),
 		RuntimeBrokerID: env.broker.ID,
-		Visibility:      store.VisibilityPrivate,
 	}
 	require.NoError(t, env.store.CreateAgent(ctx, parent))
 
@@ -436,7 +431,6 @@ func TestIntegration_StatusNormalization_NonTriggerStatusNoNotification(t *testi
 		ProjectID:       env.project.ID,
 		Phase:           string(state.PhaseRunning),
 		RuntimeBrokerID: env.broker.ID,
-		Visibility:      store.VisibilityPrivate,
 	}
 	require.NoError(t, env.store.CreateAgent(ctx, parent))
 
@@ -486,7 +480,6 @@ func TestIntegration_SubscriptionCleanup_HardDeleteCascades(t *testing.T) {
 		ProjectID:       env.project.ID,
 		Phase:           string(state.PhaseRunning),
 		RuntimeBrokerID: env.broker.ID,
-		Visibility:      store.VisibilityPrivate,
 	}
 	require.NoError(t, env.store.CreateAgent(ctx, parent))
 
@@ -538,7 +531,6 @@ func TestIntegration_SubscriptionCleanup_SoftDeleteRetainsSubscriptions(t *testi
 		ProjectID:       env.project.ID,
 		Phase:           string(state.PhaseRunning),
 		RuntimeBrokerID: env.broker.ID,
-		Visibility:      store.VisibilityPrivate,
 	}
 	require.NoError(t, env.store.CreateAgent(ctx, parent))
 
@@ -751,7 +743,6 @@ func TestIntegration_MultipleSubscribers_AgentAndUser(t *testing.T) {
 		ProjectID:       env.project.ID,
 		Phase:           string(state.PhaseRunning),
 		RuntimeBrokerID: env.broker.ID,
-		Visibility:      store.VisibilityPrivate,
 	}
 	require.NoError(t, env.store.CreateAgent(ctx, parent))
 
@@ -790,10 +781,19 @@ func TestIntegration_MultipleSubscribers_AgentAndUser(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, agentNotifs, 1)
 
-	// Verify user notification (stored, not dispatched)
-	userNotifs, err := env.store.GetNotifications(ctx, store.SubscriberTypeUser, DevUserID, false)
-	require.NoError(t, err)
-	assert.Len(t, userNotifs, 1)
+	// Verify user notification (stored, not dispatched). Storing it is a
+	// separate write from the agent-side dispatch polled above, so it may
+	// still be in flight; poll for it too.
+	var userNotifs []store.Notification
+	require.Eventually(t, func() bool {
+		notifs, err := env.store.GetNotifications(ctx, store.SubscriberTypeUser, DevUserID, false)
+		if err != nil {
+			return false
+		}
+		userNotifs = notifs
+		return len(userNotifs) >= 1
+	}, 2*time.Second, 50*time.Millisecond, "user notification for %s was never stored", DevUserID)
+	require.Len(t, userNotifs, 1)
 	assert.Equal(t, "COMPLETED", userNotifs[0].Status)
 }
 
@@ -812,7 +812,6 @@ func TestIntegration_NoNotifyFlag_NoSubscription(t *testing.T) {
 		ProjectID:       env.project.ID,
 		Phase:           string(state.PhaseRunning),
 		RuntimeBrokerID: env.broker.ID,
-		Visibility:      store.VisibilityPrivate,
 	}
 	require.NoError(t, env.store.CreateAgent(ctx, parent))
 

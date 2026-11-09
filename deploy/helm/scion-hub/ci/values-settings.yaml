@@ -1,0 +1,94 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The hosted shape: Postgres, GCS, proxy authentication. This is the case the
+# hub's HA preflight applies to, so every gate that preflight reads from
+# settings.yaml has to be present in the render: the Block-1 keys (hub ID,
+# driver, database URL, gcs storage and bucket) and, because auth.mode is proxy,
+# the IAP and transport keys below. The remaining gate, the durable session
+# secret, arrives by environment variable. hack/ha-gates.txt walks the real
+# preflight over this file's golden and records that it stops at the session
+# secret and nothing else.
+#
+# Paired with values-settings-oauth.yaml. The two renders are diffed against
+# each other to prove that switching authentication mode leaves the Block-1
+# keys untouched.
+
+hub:
+  hubId: ci-settings
+  name: CI Settings Hub
+  baseUrl: https://ci-settings.example.com
+  # Rendered as server.hub.admin_emails. hack/verify.sh's delivery table reads
+  # this permutation for the admin-emails channel.
+  adminEmails:
+    - ci-admin@example.com
+
+image:
+  repository: us-docker.pkg.dev/scion-ci/scion/scion-hub
+  tag: ci
+
+database:
+  driver: postgres
+  # THE CLOUD SQL PHASE MADE THESE REQUIRED. driver: postgres alone no longer
+  # renders: auth has no default by design, name has no safe one, and this
+  # chart reaches Postgres only through the Auth Proxy. user is stated
+  # explicitly rather than derived from serviceAccount.gcpServiceAccount so
+  # that a bug in the derivation surfaces in ci/values-cloudsql.yaml, which
+  # exists to exercise it, and not here in a fixture about something else.
+  auth: iam
+  name: scion
+  user: scion-hub@my-project.iam
+
+cloudsql:
+  enabled: true
+  instanceConnectionName: my-project:us-central1:scion-hub
+
+storage:
+  provider: gcs
+  bucket: ci-settings-hub-blobs
+
+auth:
+  mode: proxy
+  sessionSecret: ci-settings-session-secret-not-real
+  # PROBE VALUES, not real resources. Postgres makes this an HA shape, and under
+  # auth.mode proxy the hub's preflight requires all of these. The global
+  # backendServices form, which is the GKE-behind-a-load-balancer shape.
+  proxy:
+    provider: iap
+    iap:
+      audience: /projects/123456789012/global/backendServices/3333333333333333333
+  transport:
+    mode: iap
+    oidcAudience: probe-ci-settings-oauth-client.apps.googleusercontent.com
+    platformAuthSa: probe-ci-settings@probe-project.iam.gserviceaccount.com
+
+# The GKE shape: Secret Manager, IAM granted outside the chart.
+secrets:
+  backend: gcpsm
+  gcpsm:
+    projectId: probe-project
+
+agents:
+  imageRegistry: us-docker.pkg.dev/scion-ci/scion
+
+config:
+  # A deep merge over the rendered document, exercised here so the golden files
+  # cover it. These are keys the chart has no value for; an override that
+  # contradicts something the chart asserts fails the render instead, and
+  # hack/verify.sh checks that separately.
+  extra:
+    server:
+      log_level: debug
+      scheduler:
+        interval_seconds: 30

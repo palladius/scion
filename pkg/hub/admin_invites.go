@@ -47,10 +47,6 @@ type InviteListResponse struct {
 // handleAdminInvites handles GET/POST /api/v1/admin/invites.
 func (s *Server) handleAdminInvites(w http.ResponseWriter, r *http.Request) {
 	user := GetUserIdentityFromContext(r.Context())
-	if user == nil || user.Role() != "admin" {
-		Forbidden(w)
-		return
-	}
 
 	switch r.Method {
 	case http.MethodGet:
@@ -58,17 +54,13 @@ func (s *Server) handleAdminInvites(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		s.handleAdminInvitesCreate(w, r, user)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet, http.MethodPost)
 	}
 }
 
 // handleAdminInviteByID handles GET/DELETE /api/v1/admin/invites/{id} and POST .../revoke.
 func (s *Server) handleAdminInviteByID(w http.ResponseWriter, r *http.Request) {
 	user := GetUserIdentityFromContext(r.Context())
-	if user == nil || user.Role() != "admin" {
-		Forbidden(w)
-		return
-	}
 
 	// Parse path: /api/v1/admin/invites/{id} or /api/v1/admin/invites/{id}/revoke or stats
 	path := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/invites/")
@@ -87,7 +79,7 @@ func (s *Server) handleAdminInviteByID(w http.ResponseWriter, r *http.Request) {
 
 	if len(parts) == 2 && parts[1] == "revoke" {
 		if r.Method != http.MethodPost {
-			MethodNotAllowed(w)
+			MethodNotAllowed(w, http.MethodPost)
 			return
 		}
 		s.handleAdminInviteRevoke(w, r, id, user)
@@ -100,7 +92,7 @@ func (s *Server) handleAdminInviteByID(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		s.handleAdminInviteDelete(w, r, id, user)
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet, http.MethodDelete)
 	}
 }
 
@@ -114,7 +106,9 @@ func (s *Server) handleAdminInvitesList(w http.ResponseWriter, r *http.Request) 
 
 	result, err := s.store.ListInviteCodes(r.Context(), opts)
 	if err != nil {
-		InternalError(w)
+		// writeErrorFromErr maps a malformed or unknown ?cursor
+		// (store.ErrInvalidInput) to 400; anything else stays a 500.
+		writeErrorFromErr(w, err, "")
 		return
 	}
 
@@ -171,7 +165,7 @@ func (s *Server) handleAdminInvitesCreate(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	inviteURL := s.config.HubEndpoint + "/invite?code=" + code
+	inviteURL := s.HubEndpointFor(HubEndpointForInviteLinks) + "/invite?code=" + code
 
 	slog.Info("invite code created",
 		"invite_id", invite.ID,
@@ -182,11 +176,11 @@ func (s *Server) handleAdminInvitesCreate(w http.ResponseWriter, r *http.Request
 	)
 	LogInviteAudit(r.Context(), s.auditLogger, InviteAuditInviteCreated, "", invite.ID, user.ID(), user.Email(), map[string]string{
 		"prefix":     invite.CodePrefix,
-		"expires_at": invite.ExpiresAt.Format(time.RFC3339),
+		"expires_at": invite.ExpiresAt.UTC().Format(time.RFC3339),
 		"max_uses":   fmt.Sprintf("%d", invite.MaxUses),
 	})
 
-	s.events.PublishInviteChanged(r.Context(), "created", invite.ID, invite.CodePrefix)
+	s.events.PublishInviteChanged(r.Context(), "created", invite.ID)
 
 	writeJSON(w, http.StatusCreated, InviteCreateResponse{
 		Code:      code,
@@ -224,7 +218,7 @@ func (s *Server) handleAdminInviteRevoke(w http.ResponseWriter, r *http.Request,
 		"revoked_by", user.Email(),
 	)
 	LogInviteAudit(r.Context(), s.auditLogger, InviteAuditInviteRevoked, "", id, user.ID(), user.Email(), nil)
-	s.events.PublishInviteChanged(r.Context(), "revoked", id, "")
+	s.events.PublishInviteChanged(r.Context(), "revoked", id)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }
@@ -244,7 +238,7 @@ func (s *Server) handleAdminInviteDelete(w http.ResponseWriter, r *http.Request,
 		"deleted_by", user.Email(),
 	)
 	LogInviteAudit(r.Context(), s.auditLogger, InviteAuditInviteDeleted, "", id, user.ID(), user.Email(), nil)
-	s.events.PublishInviteChanged(r.Context(), "deleted", id, "")
+	s.events.PublishInviteChanged(r.Context(), "deleted", id)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }

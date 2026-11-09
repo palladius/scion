@@ -62,6 +62,14 @@ func (ms *MaintenanceState) Message() string {
 	return ms.message
 }
 
+// State returns the enabled flag and the raw message (no default fallback)
+// under one lock, so a caller sees a consistent pair.
+func (ms *MaintenanceState) State() (enabled bool, message string) {
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	return ms.enabled, ms.message
+}
+
 // SetEnabled enables or disables maintenance mode.
 func (ms *MaintenanceState) SetEnabled(v bool) {
 	ms.mu.Lock()
@@ -110,7 +118,7 @@ func adminModeMiddleware(state *MaintenanceState) func(http.Handler) http.Handle
 			}
 
 			// Allow admin users through.
-			if user := GetUserIdentityFromContext(r.Context()); user != nil && user.Role() == "admin" {
+			if user := GetUserIdentityFromContext(r.Context()); IsUnscopedLocalPlatformAdmin(user) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -152,7 +160,7 @@ func (ws *WebServer) adminModeWebMiddleware(next http.Handler) http.Handler {
 		}
 
 		// Allow static assets (required for login page).
-		if strings.HasPrefix(path, "/assets/") || strings.HasPrefix(path, "/shoelace/") || path == "/favicon.ico" {
+		if strings.HasPrefix(path, "/assets/") || strings.HasPrefix(path, "/shoelace/") || isAppIconPath(path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -178,29 +186,48 @@ func (ws *WebServer) adminModeWebMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// appIconPaths are the root-level app icon and web app manifest files
+// from web/public/. Browsers fetch them without credentials (the
+// manifest is a CORS request with no cookies), so they must load on the
+// maintenance-mode login page too. Keep this list exact rather than
+// allowing every root-level file.
+var appIconPaths = map[string]bool{
+	"/favicon.ico":           true,
+	"/favicon.svg":           true,
+	"/apple-touch-icon.png":  true,
+	"/icon-192.png":          true,
+	"/icon-512.png":          true,
+	"/icon-maskable-512.png": true,
+	"/manifest.webmanifest":  true,
+}
+
+// isAppIconPath reports whether path is one of appIconPaths.
+func isAppIconPath(path string) bool {
+	return appIconPaths[path]
+}
+
 // handleAdminMaintenance handles GET and PUT /api/v1/admin/maintenance.
 // GET returns the current maintenance state; PUT updates it.
-// Both require admin role.
+// Authorization: routeGuard checks hub.admin_mode.read; PUT also needs
+// hub.admin_mode.update, checked here.
 func (s *Server) handleAdminMaintenance(w http.ResponseWriter, r *http.Request) {
-	// Require admin user.
-	user := GetUserIdentityFromContext(r.Context())
-	if user == nil || user.Role() != "admin" {
-		Forbidden(w)
+	if r.Method == http.MethodPut && !s.requireUpdateOnReadGuardedRoute(w, r, "hub.admin_mode.update") {
 		return
 	}
-
-	// In postgres mode, delegate to DB-backed handlers: maintenance becomes
-	// durable (persisted in hub_settings) and cluster-wide (propagated via
-	// LISTEN/NOTIFY). File/SQLite mode keeps the exact current behavior
-	// (in-memory state only).
-	if ops := s.GetOperationalSettings(); ops != nil && s.IsPostgres() {
+	// Whenever OperationalSettings is wired (any DB driver, SQLite included),
+	// delegate to DB-backed handlers: maintenance is durable (persisted in
+	// hub_settings) and, on postgres, cluster-wide (LISTEN/NOTIFY). An
+	// in-memory-only write on a DB-backed hub would be reverted by the next
+	// ops.Update re-applying the maintenance row (ptone/scion#1091). Only a hub with no
+	// OperationalSettings keeps the in-memory state.
+	if ops := s.GetOperationalSettings(); ops != nil {
 		switch r.Method {
 		case http.MethodGet:
 			s.handleGetMaintenanceDB(w, ops)
 		case http.MethodPut:
 			s.handlePutMaintenanceDB(w, r, ops)
 		default:
-			MethodNotAllowed(w)
+			MethodNotAllowed(w, http.MethodGet, http.MethodPut)
 		}
 		return
 	}
@@ -233,22 +260,17 @@ func (s *Server) handleAdminMaintenance(w http.ResponseWriter, r *http.Request) 
 		})
 
 	default:
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet, http.MethodPut)
 	}
 }
 
 // handleAdminScheduler handles GET /api/v1/admin/scheduler.
 // Returns the scheduler's current status including recurring handlers,
-// event handlers, and active one-shot timer count. Requires admin role.
+// event handlers, and active one-shot timer count.
+// Authorization: enforced by routeGuard via hub.scheduler.read permission.
 func (s *Server) handleAdminScheduler(w http.ResponseWriter, r *http.Request) {
-	user := GetUserIdentityFromContext(r.Context())
-	if user == nil || user.Role() != "admin" {
-		Forbidden(w)
-		return
-	}
-
 	if r.Method != http.MethodGet {
-		MethodNotAllowed(w)
+		MethodNotAllowed(w, http.MethodGet)
 		return
 	}
 

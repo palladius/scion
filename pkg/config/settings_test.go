@@ -195,14 +195,10 @@ func TestEnvMerging(t *testing.T) {
 		},
 		Profiles: map[string]ProfileConfig{
 			"dev": {
-				Env: map[string]string{
-					"H2": "P2", // Overrides harness
-					"P1": "PV1",
-				},
 				HarnessOverrides: map[string]HarnessOverride{
 					"gemini": {
 						Env: map[string]string{
-							"P1": "PH1", // Overrides profile
+							"H2": "PH2", // Overrides harness base
 							"O1": "OV1",
 						},
 					},
@@ -216,27 +212,11 @@ func TestEnvMerging(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// G3-full removed the profile-root env rank from this resolver. The fixture is
-	// deliberately left intact — profiles.dev.env still SETS H2 and P1 — so that
-	// this test keeps measuring that those values no longer arrive. Do not delete
-	// the profile env from the fixture above: it is the injected value whose
-	// absence is the assertion.
+	// profiles.<p>.env was removed (G3-full). Only harness base env and
+	// harness_overrides env remain as injection points.
 	expected := map[string]string{
-		"H1": "V1", // From harness base
-		// H2 was "P2" before G3-full: profile root outranked the harness base.
-		// That rank is deleted, so the harness base value now survives. This is a
-		// breaking change, not a correction — the profile no longer participates.
-		"H2": "V2",
-		// P1 is still "PH1", but note WHY: it now comes from the harness override
-		// alone rather than from the override outranking the profile root. The
-		// observed value is unchanged and the mechanism behind it is not, which is
-		// why H2 rather than P1 is the key that can see this deletion.
-		// P1 and O1 both come from the harness_overrides env merge, which SURVIVES
-		// G3-full. P1's value is unchanged, but note the mechanism changed: it used
-		// to be the override outranking the profile root, and is now the override
-		// over the base alone. The observed value hides that, which is why H2 rather
-		// than P1 is the key that can see this deletion.
-		"P1": "PH1",
+		"H1": "V1",  // From harness base
+		"H2": "PH2", // From harness override, overriding base
 		"O1": "OV1", // From harness override
 	}
 
@@ -248,60 +228,6 @@ func TestEnvMerging(t *testing.T) {
 		if h.Env[k] != v {
 			t.Errorf("expected %s=%s, got %s", k, v, h.Env[k])
 		}
-	}
-}
-
-func TestMergeSettingsEnv(t *testing.T) {
-	base := &Settings{
-		Harnesses: map[string]HarnessConfig{
-			"gemini": {
-				Env: map[string]string{"A": "1", "B": "2"},
-			},
-		},
-	}
-	overrideJSON := `{
-		"harnesses": {
-			"gemini": {
-				"env": {"B": "3", "C": "4"}
-			}
-		}
-	}`
-
-	err := MergeSettings(base, []byte(overrideJSON))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	env := base.Harnesses["gemini"].Env
-	if env["A"] != "1" || env["B"] != "3" || env["C"] != "4" {
-		t.Errorf("unexpected env after merge: %v", env)
-	}
-}
-
-func TestMergeSettingsAuthSelectedType(t *testing.T) {
-	base := &Settings{
-		Harnesses: map[string]HarnessConfig{
-			"gemini": {
-				AuthSelectedType: "api-key",
-			},
-		},
-	}
-
-	overrideJSON := `{
-		"harnesses": {
-			"gemini": {
-				"auth_selectedType": "vertex-ai"
-			}
-		}
-	}`
-
-	err := MergeSettings(base, []byte(overrideJSON))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if base.Harnesses["gemini"].AuthSelectedType != "vertex-ai" {
-		t.Errorf("expected AuthSelectedType to be vertex-ai, got %s", base.Harnesses["gemini"].AuthSelectedType)
 	}
 }
 
@@ -318,10 +244,6 @@ func TestRuntimeEnvMerging(t *testing.T) {
 		Profiles: map[string]ProfileConfig{
 			"dev": {
 				Runtime: "docker",
-				Env: map[string]string{
-					"R2": "P2", // Overrides runtime
-					"P1": "PV1",
-				},
 			},
 		},
 	}
@@ -331,10 +253,10 @@ func TestRuntimeEnvMerging(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// profiles.<p>.env was removed (G3-full), so only runtime env remains.
 	expected := map[string]string{
 		"R1": "V1",
-		"R2": "P2",
-		"P1": "PV1",
+		"R2": "V2",
 	}
 
 	if len(r.Env) != len(expected) {
@@ -493,87 +415,6 @@ func TestHubMethods(t *testing.T) {
 	}
 }
 
-func TestExpansion(t *testing.T) {
-	_ = os.Setenv("TEST_EXP_VAR", "expanded_value")
-	_ = os.Setenv("TEST_EXP_KEY", "EXP_KEY")
-	defer func() { _ = os.Unsetenv("TEST_EXP_VAR") }()
-	defer func() { _ = os.Unsetenv("TEST_EXP_KEY") }()
-
-	base := &Settings{}
-	overrideJSON := `{
-		"harnesses": {
-			"gemini": {
-				"env": {"${TEST_EXP_KEY}": "${TEST_EXP_VAR}", "NORMAL": "VAL"},
-				"volumes": [
-					{ "source": "${TEST_EXP_VAR}/src", "target": "/dest" }
-				]
-			}
-		}
-	}`
-
-	err := MergeSettings(base, []byte(overrideJSON))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	h := base.Harnesses["gemini"]
-	if h.Env["EXP_KEY"] != "expanded_value" {
-		t.Errorf("expected Env[EXP_KEY]=expanded_value, got %s", h.Env["EXP_KEY"])
-	}
-	if h.Env["NORMAL"] != "VAL" {
-		t.Errorf("expected Env[NORMAL]=VAL, got %s", h.Env["NORMAL"])
-	}
-
-	if len(h.Volumes) != 1 {
-		t.Fatalf("expected 1 volume, got %d", len(h.Volumes))
-	}
-	if h.Volumes[0].Source != "expanded_value/src" {
-		t.Errorf("expected volume source 'expanded_value/src', got %s", h.Volumes[0].Source)
-	}
-}
-
-func TestExpandVolumeMountsPreservesAllFields(t *testing.T) {
-	vols := []api.VolumeMount{
-		{
-			Source:   "/host/path",
-			Target:   "/container/path",
-			ReadOnly: true,
-			Type:     "gcs",
-			Bucket:   "my-bucket",
-			Prefix:   "some/prefix",
-			Mode:     "ro",
-		},
-	}
-
-	expanded := expandVolumeMounts(vols)
-	if len(expanded) != 1 {
-		t.Fatalf("expected 1 volume, got %d", len(expanded))
-	}
-
-	v := expanded[0]
-	if v.Source != "/host/path" {
-		t.Errorf("Source = %q, want /host/path", v.Source)
-	}
-	if v.Target != "/container/path" {
-		t.Errorf("Target = %q, want /container/path", v.Target)
-	}
-	if !v.ReadOnly {
-		t.Error("ReadOnly = false, want true")
-	}
-	if v.Type != "gcs" {
-		t.Errorf("Type = %q, want gcs", v.Type)
-	}
-	if v.Bucket != "my-bucket" {
-		t.Errorf("Bucket = %q, want my-bucket", v.Bucket)
-	}
-	if v.Prefix != "some/prefix" {
-		t.Errorf("Prefix = %q, want some/prefix", v.Prefix)
-	}
-	if v.Mode != "ro" {
-		t.Errorf("Mode = %q, want ro", v.Mode)
-	}
-}
-
 // TestUpdateHubSettingsGlobal tests that hub settings can be saved to global settings.
 // This relates to Fix 5 from progress-report.md: Save hub endpoint to global settings during registration.
 func TestUpdateHubSettingsGlobal(t *testing.T) {
@@ -697,59 +538,6 @@ func TestHubSettingsLoadFromGlobal(t *testing.T) {
 	}
 }
 
-func TestMergeSettingsHubConnections(t *testing.T) {
-	base := &Settings{
-		HubConnections: map[string]HubConnectionConfig{
-			"hub-prod": {Endpoint: "https://hub.prod.example.com"},
-		},
-	}
-	overrideJSON := `{
-		"hub_connections": {
-			"hub-prod": {"endpoint": "https://hub.prod.v2.example.com"},
-			"hub-staging": {"endpoint": "https://hub.staging.example.com"}
-		}
-	}`
-
-	err := MergeSettings(base, []byte(overrideJSON))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(base.HubConnections) != 2 {
-		t.Fatalf("expected 2 hub connections, got %d", len(base.HubConnections))
-	}
-
-	if base.HubConnections["hub-prod"].Endpoint != "https://hub.prod.v2.example.com" {
-		t.Errorf("expected hub-prod endpoint to be overridden, got %q", base.HubConnections["hub-prod"].Endpoint)
-	}
-
-	if base.HubConnections["hub-staging"].Endpoint != "https://hub.staging.example.com" {
-		t.Errorf("expected hub-staging endpoint, got %q", base.HubConnections["hub-staging"].Endpoint)
-	}
-}
-
-func TestMergeSettingsHubConnectionsNilBase(t *testing.T) {
-	base := &Settings{}
-	overrideJSON := `{
-		"hub_connections": {
-			"hub-dev": {"endpoint": "https://hub.dev.example.com"}
-		}
-	}`
-
-	err := MergeSettings(base, []byte(overrideJSON))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if base.HubConnections == nil {
-		t.Fatal("expected HubConnections to be initialized")
-	}
-
-	if base.HubConnections["hub-dev"].Endpoint != "https://hub.dev.example.com" {
-		t.Errorf("expected hub-dev endpoint, got %q", base.HubConnections["hub-dev"].Endpoint)
-	}
-}
-
 func TestUpdateSettingHubConnections(t *testing.T) {
 	tmpDir := t.TempDir()
 	originalHome := os.Getenv("HOME")
@@ -789,48 +577,6 @@ func TestUpdateSettingHubConnectionsInvalidKey(t *testing.T) {
 	err = UpdateSetting(projectScionDir, "hub_connections.hub-prod.unknown_field", "value", false)
 	if err != nil {
 		t.Errorf("hub_connections keys should be silently skipped in v1: %v", err)
-	}
-}
-
-func TestGetSettingValueHubConnections(t *testing.T) {
-	s := &Settings{
-		HubConnections: map[string]HubConnectionConfig{
-			"hub-prod": {Endpoint: "https://hub.prod.example.com"},
-		},
-	}
-
-	val, err := GetSettingValue(s, "hub_connections.hub-prod.endpoint")
-	if err != nil {
-		t.Fatalf("GetSettingValue failed: %v", err)
-	}
-	if val != "https://hub.prod.example.com" {
-		t.Errorf("expected hub.prod.example.com, got %q", val)
-	}
-
-	// Non-existent connection
-	val, err = GetSettingValue(s, "hub_connections.nonexistent.endpoint")
-	if err != nil {
-		t.Fatalf("GetSettingValue for nonexistent should not error: %v", err)
-	}
-	if val != "" {
-		t.Errorf("expected empty string for nonexistent, got %q", val)
-	}
-}
-
-func TestGetSettingsMapHubConnections(t *testing.T) {
-	s := &Settings{
-		HubConnections: map[string]HubConnectionConfig{
-			"hub-prod":    {Endpoint: "https://hub.prod.example.com"},
-			"hub-staging": {Endpoint: "https://hub.staging.example.com"},
-		},
-	}
-
-	m := GetSettingsMap(s)
-	if m["hub_connections.hub-prod.endpoint"] != "https://hub.prod.example.com" {
-		t.Errorf("expected hub-prod endpoint in map, got %q", m["hub_connections.hub-prod.endpoint"])
-	}
-	if m["hub_connections.hub-staging.endpoint"] != "https://hub.staging.example.com" {
-		t.Errorf("expected hub-staging endpoint in map, got %q", m["hub_connections.hub-staging.endpoint"])
 	}
 }
 
@@ -886,15 +632,15 @@ func TestDeleteHubConnection(t *testing.T) {
 }
 
 func TestUpdateSetting_SplitStorageWritesToExternalDir(t *testing.T) {
-	// When a project has split storage (grove-id file), UpdateSetting should
+	// When a project has split storage (project-id file), UpdateSetting should
 	// write to the external config dir (~/.scion/project-configs/…), not the
-	// local .scion/ directory, so that LoadSettingsKoanf reads the same values.
+	// local .scion/ directory, so that LoadSettings reads the same values.
 	tmpHome := t.TempDir()
 	origHome := os.Getenv("HOME")
 	_ = os.Setenv("HOME", tmpHome)
 	defer func() { _ = os.Setenv("HOME", origHome) }()
 
-	// Create a project with .scion and a grove-id file (split storage marker)
+	// Create a project with .scion and a project-id file (split storage marker)
 	projectDir := filepath.Join(tmpHome, "my-project")
 	scionDir := filepath.Join(projectDir, ".scion")
 	if err := os.MkdirAll(scionDir, 0755); err != nil {
@@ -935,10 +681,10 @@ func TestUpdateSetting_SplitStorageWritesToExternalDir(t *testing.T) {
 		t.Errorf("expected no settings.yaml in local .scion/ dir, but file exists")
 	}
 
-	// Verify LoadSettingsKoanf reads the value correctly
-	settings, err := LoadSettingsKoanf(scionDir)
+	// Verify LoadSettings reads the value correctly
+	settings, err := LoadSettings(scionDir)
 	if err != nil {
-		t.Fatalf("LoadSettingsKoanf failed: %v", err)
+		t.Fatalf("LoadSettings failed: %v", err)
 	}
 	if !settings.IsHubEnabled() {
 		t.Errorf("expected hub.enabled=true from effective settings, got false")

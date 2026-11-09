@@ -1,0 +1,489 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package messaging
+
+import (
+	"bytes"
+	"context"
+	"log/slog"
+	"strings"
+	"testing"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/google/uuid"
+)
+
+// mockQueryStore implements MessageQueryStore for divergence tests.
+// It returns preconfigured messages matching any filter.
+type mockQueryStore struct {
+	messages []store.Message
+}
+
+func (m *mockQueryStore) ListMessages(_ context.Context, filter store.MessageFilter, _ store.ListOptions) (*store.ListResult[store.Message], error) {
+	var matched []store.Message
+	for _, msg := range m.messages {
+		if filter.ThreadID != "" && msg.ThreadID == filter.ThreadID {
+			matched = append(matched, msg)
+		} else if filter.SenderID != "" && filter.RecipientID != "" &&
+			msg.SenderID == filter.SenderID && msg.RecipientID == filter.RecipientID {
+			matched = append(matched, msg)
+		}
+	}
+	return &store.ListResult[store.Message]{Items: matched}, nil
+}
+
+func TestOldRoutingFromMessage_WithThreadID(t *testing.T) {
+	routing := OldRoutingFromMessage("sender1", "recip1", "dm:abc123")
+	if routing != "thread:dm:abc123" {
+		t.Errorf("expected thread:dm:abc123, got %q", routing)
+	}
+}
+
+func TestOldRoutingFromMessage_WithoutThreadID(t *testing.T) {
+	routing := OldRoutingFromMessage("sender1", "recip1", "")
+	// sender-recipient with sorted IDs
+	expected := "sender-recipient:recip1:sender1"
+	if routing != expected {
+		t.Errorf("expected %q, got %q", expected, routing)
+	}
+
+	// Order-independent
+	routing2 := OldRoutingFromMessage("recip1", "sender1", "")
+	if routing != routing2 {
+		t.Errorf("routing should be order-independent: %q vs %q", routing, routing2)
+	}
+}
+
+func TestLogDivergence_Match(t *testing.T) {
+	// Reset global counter for this test.
+	DivergenceMetrics = &DivergenceCounter{}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	entry := DivergenceEntry{
+		MessageID:  "msg-1",
+		OldRouting: "thread:dm:abc",
+		NewRouting: "conv:uuid-123",
+		Match:      true,
+		Reason:     "both resolve to same pair",
+	}
+	LogDivergence(logger, entry)
+
+	if DivergenceMetrics.Matches() != 1 {
+		t.Errorf("expected 1 match, got %d", DivergenceMetrics.Matches())
+	}
+	if DivergenceMetrics.Mismatches() != 0 {
+		t.Errorf("expected 0 mismatches, got %d", DivergenceMetrics.Mismatches())
+	}
+	if DivergenceMetrics.Total() != 1 {
+		t.Errorf("expected 1 total, got %d", DivergenceMetrics.Total())
+	}
+
+	output := buf.String()
+	if !contains(output, "match") {
+		t.Errorf("expected 'match' in log output, got: %s", output)
+	}
+}
+
+func TestLogDivergence_Mismatch(t *testing.T) {
+	DivergenceMetrics = &DivergenceCounter{}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	entry := DivergenceEntry{
+		MessageID:  "msg-2",
+		OldRouting: "thread:dm:abc",
+		NewRouting: "conv:uuid-456",
+		Match:      false,
+		Reason:     "thread_id maps to different conversation",
+	}
+	LogDivergence(logger, entry)
+
+	if DivergenceMetrics.Mismatches() != 1 {
+		t.Errorf("expected 1 mismatch, got %d", DivergenceMetrics.Mismatches())
+	}
+
+	output := buf.String()
+	if !contains(output, "DIVERGENCE") {
+		t.Errorf("expected 'DIVERGENCE' in log output, got: %s", output)
+	}
+}
+
+func TestDivergenceCounter_Concurrent(t *testing.T) {
+	DivergenceMetrics = &DivergenceCounter{}
+
+	done := make(chan struct{})
+	for i := 0; i < 100; i++ {
+		go func(match bool) {
+			DivergenceMetrics.Inc(match)
+			done <- struct{}{}
+		}(i%2 == 0)
+	}
+	for i := 0; i < 100; i++ {
+		<-done
+	}
+
+	if DivergenceMetrics.Total() != 100 {
+		t.Errorf("expected 100 total, got %d", DivergenceMetrics.Total())
+	}
+	if DivergenceMetrics.Matches() != 50 {
+		t.Errorf("expected 50 matches, got %d", DivergenceMetrics.Matches())
+	}
+	if DivergenceMetrics.Mismatches() != 50 {
+		t.Errorf("expected 50 mismatches, got %d", DivergenceMetrics.Mismatches())
+	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) > 0 && len(substr) > 0 && bytes.Contains([]byte(s), []byte(substr))
+}
+
+// ---------------------------------------------------------------------------
+// ComputeDivergenceMatch tests
+// ---------------------------------------------------------------------------
+
+func TestComputeDivergenceMatch_EmptyConvID(t *testing.T) {
+	match, reason := ComputeDivergenceMatch("sender-recipient:a:b", "dm:a:b", "")
+	if match {
+		t.Error("expected match=false when convID is empty")
+	}
+	if reason != "no-new-routing" {
+		t.Errorf("expected reason 'no-new-routing', got %q", reason)
+	}
+}
+
+func TestComputeDivergenceMatch_NoOldRouting(t *testing.T) {
+	match, reason := ComputeDivergenceMatch("", "dm:a:b", "conv-abc")
+	if match {
+		t.Error("expected match=false when oldRouting is empty")
+	}
+	if reason != "unknown/no-old-routing" {
+		t.Errorf("expected reason 'unknown/no-old-routing', got %q", reason)
+	}
+}
+
+func TestComputeDivergenceMatch_DMAgreement(t *testing.T) {
+	// Use realistic UUIDs and kind-safe DMConversationKey, matching what
+	// production actually stores. The old model routes by raw sorted IDs;
+	// the new model stores kind-prefixed canonical keys.
+	agentID := uuid.New().String()
+	userID := uuid.New().String()
+
+	oldRouting := OldRoutingFromMessage(agentID, userID, "")
+	actualExternalRef, err := messages.DMConversationKey("agent", agentID, "user", userID)
+	if err != nil {
+		t.Fatalf("DMConversationKey: %v", err)
+	}
+	match, reason := ComputeDivergenceMatch(oldRouting, actualExternalRef, "conv-abc")
+	if !match {
+		t.Errorf("expected match=true for DM agreement, got reason=%q (old=%s new=%s)",
+			reason, oldRouting, actualExternalRef)
+	}
+	if match && reason != "dm-routing-agreement" {
+		t.Errorf("expected reason 'dm-routing-agreement', got %q", reason)
+	}
+}
+
+func TestComputeDivergenceMatch_ThreadAgreement(t *testing.T) {
+	oldRouting := OldRoutingFromMessage("", "", "thread-ABC")
+	actualExternalRef := "thread:proj1:thread-ABC"
+	match, reason := ComputeDivergenceMatch(oldRouting, actualExternalRef, "conv-xyz")
+	if !match {
+		t.Error("expected match=true for thread agreement")
+	}
+	if reason != "thread-routing-agreement" {
+		t.Errorf("expected reason 'thread-routing-agreement', got %q", reason)
+	}
+}
+
+func TestComputeDivergenceMatch_RoutingTypeMismatch(t *testing.T) {
+	// Old says DM, new says thread
+	oldRouting := OldRoutingFromMessage("sender", "recip", "")
+	actualExternalRef := "thread:proj1:thread-ABC"
+	match, reason := ComputeDivergenceMatch(oldRouting, actualExternalRef, "conv-xyz")
+	if match {
+		t.Error("expected match=false when routing types differ")
+	}
+	if !strings.Contains(reason, "routing-type-mismatch") {
+		t.Errorf("expected reason to contain 'routing-type-mismatch', got %q", reason)
+	}
+
+	// Old says thread, new says DM
+	senderID := uuid.New().String()
+	recipID := uuid.New().String()
+	oldRouting = OldRoutingFromMessage("", "", "thread-ABC")
+	dmRef, err := messages.DMConversationKey("agent", senderID, "user", recipID)
+	if err != nil {
+		t.Fatalf("DMConversationKey: %v", err)
+	}
+	match, reason = ComputeDivergenceMatch(oldRouting, dmRef, "conv-xyz")
+	if match {
+		t.Error("expected match=false when routing types differ (thread vs DM)")
+	}
+	if !strings.Contains(reason, "routing-type-mismatch") {
+		t.Errorf("expected reason to contain 'routing-type-mismatch', got %q", reason)
+	}
+}
+
+func TestComputeDivergenceMatch_ThreadFormatUnexpected(t *testing.T) {
+	// Thread without projectID separator
+	oldRouting := "thread:thread-ABC"
+	actualExternalRef := "thread:noProjectSep"
+	match, reason := ComputeDivergenceMatch(oldRouting, actualExternalRef, "conv-xyz")
+	if match {
+		t.Error("expected match=false for unexpected thread format")
+	}
+	if !strings.Contains(reason, "thread-format-unexpected") {
+		t.Errorf("expected reason to contain 'thread-format-unexpected', got %q", reason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MANDATORY: Genuine disagreement tests (architect-required)
+// ---------------------------------------------------------------------------
+
+func TestComputeDivergenceMatch_GenuineDisagreement(t *testing.T) {
+	// Construct a case where old-model and new-model genuinely disagree:
+	// message has sender=A, recipient=B (old routing = sender-recipient:A:B)
+	// but the conversation it was stamped with belongs to a different pair (dm:X:Y)
+	agentA := uuid.New().String()
+	userB := uuid.New().String()
+	agentX := uuid.New().String()
+	userY := uuid.New().String()
+
+	oldRouting := OldRoutingFromMessage(agentA, userB, "")
+	actualExternalRef, err := messages.DMConversationKey("agent", agentX, "user", userY) // DIFFERENT pair
+	if err != nil {
+		t.Fatalf("DMConversationKey: %v", err)
+	}
+
+	match, reason := ComputeDivergenceMatch(oldRouting, actualExternalRef, "some-conv-id")
+	if match {
+		t.Fatal("expected match=false when conversation belongs to a different pair than the message's sender/recipient")
+	}
+	if !strings.Contains(reason, "mismatch") {
+		t.Errorf("expected reason to contain 'mismatch', got %q", reason)
+	}
+
+	// Also verify Mismatches counter increments
+	DivergenceMetrics = &DivergenceCounter{}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	LogDivergence(logger, DivergenceEntry{
+		MessageID:  "test-msg",
+		OldRouting: oldRouting,
+		NewRouting: "conv:some-conv-id",
+		Match:      match,
+		Reason:     reason,
+	})
+	if DivergenceMetrics.Mismatches() != 1 {
+		t.Fatalf("expected Mismatches()=1, got %d", DivergenceMetrics.Mismatches())
+	}
+}
+
+func TestComputeDivergenceMatch_ThreadDisagreement(t *testing.T) {
+	oldRouting := OldRoutingFromMessage("", "", "thread-ABC")
+	actualExternalRef := "thread:proj1:thread-XYZ" // DIFFERENT thread
+
+	match, reason := ComputeDivergenceMatch(oldRouting, actualExternalRef, "some-conv-id")
+	if match {
+		t.Fatal("expected match=false when thread IDs differ")
+	}
+	if !strings.Contains(reason, "mismatch") {
+		t.Errorf("expected reason to contain 'mismatch', got %q", reason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// NewRoutingStr tests
+// ---------------------------------------------------------------------------
+
+func TestNewRoutingStr(t *testing.T) {
+	if got := NewRoutingStr(""); got != "none" {
+		t.Errorf("expected 'none' for empty convID, got %q", got)
+	}
+	if got := NewRoutingStr("conv-abc"); got != "conv:conv-abc" {
+		t.Errorf("expected 'conv:conv-abc', got %q", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AC-7 mutation test (DEF-139): the divergence detector must report a
+// mismatch when the resolved conversation differs from the one used by
+// prior messages. This test MUST FAIL against unfixed code because the
+// ConsistencyMismatches counter did not exist.
+// ---------------------------------------------------------------------------
+
+func TestDivergenceDetector_ReportsConsistencyMismatch_DEF139(t *testing.T) {
+	// Scenario: two principals (agent A, user B) have an existing DM
+	// conversation "conv-original". A prior message was persisted with
+	// ConversationID = "conv-original". Now a new message between the same
+	// principals erroneously resolves to "conv-wrong".
+	//
+	// The routing-key comparison (ComputeDivergenceMatch) cannot detect
+	// this because both old and new routing keys are derived from the same
+	// sender/recipient fields — this IS the tautology.
+	//
+	// The consistency check (CheckConversationConsistency) MUST detect it
+	// by querying the prior message and finding a different ConversationID.
+
+	agentID := uuid.New().String()
+	userID := uuid.New().String()
+
+	// --- Part 1: Demonstrate the tautology. ---
+	// Build old routing from the message fields.
+	oldRouting := OldRoutingFromMessage(agentID, userID, "")
+	// Build the external ref the way the resolver would — from the SAME fields.
+	actualRef, err := messages.DMConversationKey("agent", agentID, "user", userID)
+	if err != nil {
+		t.Fatalf("DMConversationKey: %v", err)
+	}
+
+	// ComputeDivergenceMatch says "match" even though the conversation is wrong,
+	// because both sides are derived from the same inputs.
+	match, reason := ComputeDivergenceMatch(oldRouting, actualRef, "conv-wrong")
+	if !match {
+		t.Fatalf("expected tautological match, got mismatch with reason=%q", reason)
+	}
+
+	// --- Part 2: The independent consistency check catches the mismatch. ---
+	DivergenceMetrics = &DivergenceCounter{}
+
+	// Mock store with a prior message that has a DIFFERENT ConversationID.
+	mockStore := &mockQueryStore{
+		messages: []store.Message{
+			{
+				ID:             "prior-msg-1",
+				SenderID:       agentID,
+				RecipientID:    userID,
+				ConversationID: "conv-original", // the CORRECT conversation
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	consistent := CheckConversationConsistency(
+		context.Background(), mockStore, "new-msg-1",
+		"conv-wrong", // resolver returned a different conversation
+		"",           // no thread (DM)
+		agentID, userID, logger,
+	)
+
+	if consistent {
+		t.Fatal("expected consistency check to detect the mismatch, but it reported consistent")
+	}
+
+	// The consistency mismatch counter must have incremented.
+	// Against unfixed code this counter does not exist, so this assertion
+	// causes a compile error — the test cannot pass.
+	if got := DivergenceMetrics.ConsistencyMismatches(); got != 1 {
+		t.Fatalf("expected ConsistencyMismatches()=1, got %d", got)
+	}
+
+	// The log must contain the MISMATCH warning.
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "MISMATCH") {
+		t.Errorf("expected log to contain 'MISMATCH', got: %s", logOutput)
+	}
+
+	// --- Part 3: Verify that a consistent case increments checks, not mismatches. ---
+	DivergenceMetrics = &DivergenceCounter{}
+	mockStoreConsistent := &mockQueryStore{
+		messages: []store.Message{
+			{
+				ID:             "prior-msg-2",
+				SenderID:       agentID,
+				RecipientID:    userID,
+				ConversationID: "conv-correct",
+			},
+		},
+	}
+	consistent = CheckConversationConsistency(
+		context.Background(), mockStoreConsistent, "new-msg-2",
+		"conv-correct",
+		"", agentID, userID, logger,
+	)
+	if !consistent {
+		t.Fatal("expected consistent result for matching ConversationID")
+	}
+	if got := DivergenceMetrics.ConsistencyChecks(); got != 1 {
+		t.Fatalf("expected ConsistencyChecks()=1, got %d", got)
+	}
+	if got := DivergenceMetrics.ConsistencyMismatches(); got != 0 {
+		t.Fatalf("expected ConsistencyMismatches()=0, got %d", got)
+	}
+}
+
+// countingQueryStore records whether each ListMessages call asked the store
+// for a total count.
+type countingQueryStore struct {
+	mockQueryStore
+	calls        int
+	countedCalls int
+}
+
+func (c *countingQueryStore) ListMessages(ctx context.Context, filter store.MessageFilter, opts store.ListOptions) (*store.ListResult[store.Message], error) {
+	c.calls++
+	if !opts.SkipTotalCount {
+		c.countedCalls++
+	}
+	return c.mockQueryStore.ListMessages(ctx, filter, opts)
+}
+
+// TestCheckConversationConsistency_NoTotalCount checks that the consistency
+// check's lookups (by thread, and both directions of a DM pair) do not ask
+// the store for a total count. They read only Items, and the store runs a
+// COUNT of the matching messages for each counted call.
+func TestCheckConversationConsistency_NoTotalCount(t *testing.T) {
+	// The check bumps the package-level counters; keep this test's calls out of them.
+	saved := DivergenceMetrics
+	DivergenceMetrics = &DivergenceCounter{}
+	t.Cleanup(func() { DivergenceMetrics = saved })
+
+	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	userID, agentID := uuid.NewString(), uuid.NewString()
+	ctx := context.Background()
+
+	thread := &countingQueryStore{mockQueryStore: mockQueryStore{messages: []store.Message{
+		{ID: "prior-thread", ThreadID: "t1", ConversationID: "conv-1"},
+	}}}
+	if !CheckConversationConsistency(ctx, thread, "new-1", "conv-1", "t1", userID, agentID, logger) {
+		t.Fatal("thread lookup: expected consistent")
+	}
+	if thread.calls != 1 {
+		t.Fatalf("thread lookup: %d ListMessages calls, want 1", thread.calls)
+	}
+	if thread.countedCalls != 0 {
+		t.Errorf("thread lookup: %d calls requested a total count, want 0", thread.countedCalls)
+	}
+
+	dm := &countingQueryStore{mockQueryStore: mockQueryStore{messages: []store.Message{
+		{ID: "prior-dm", SenderID: userID, RecipientID: agentID, ConversationID: "conv-2"},
+	}}}
+	if !CheckConversationConsistency(ctx, dm, "new-2", "conv-2", "", userID, agentID, logger) {
+		t.Fatal("DM lookup: expected consistent")
+	}
+	if dm.calls != 2 {
+		t.Fatalf("DM lookup: %d ListMessages calls, want 2 (both directions)", dm.calls)
+	}
+	if dm.countedCalls != 0 {
+		t.Errorf("DM lookup: %d calls requested a total count, want 0", dm.countedCalls)
+	}
+}

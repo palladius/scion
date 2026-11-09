@@ -1,0 +1,879 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package hub
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"math/rand"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/GoogleCloudPlatform/scion/pkg/util/logging"
+)
+
+// =============================================================================
+// Decision Audit Emitter
+// =============================================================================
+
+// auditWriteTimeout is the maximum time an async mutation audit INSERT may
+// take before the goroutine abandons the attempt and releases its store
+// reference.
+const auditWriteTimeout = 1 * time.Second
+
+// emitDecisionAudit builds and emits a decision audit record from a Decide call.
+func (a *AuthzService) emitDecisionAudit(ctx context.Context, request AuthzRequest, decision Decision) {
+	// Sampling: always audit deny decisions; sample allow decisions, unless
+	// either always-audit marker is set. AuthzRequest.AlwaysAudit is set by
+	// the caller before evaluation; Decision.AlwaysAudit is set from inside
+	// decide's body by a branch that only learns partway through evaluation
+	// that this decision must not be sampled away (e.g. G's delegated-agent
+	// branch, routed on identity kind after principal/credential
+	// derivation). Either one forces an allow decision to be audited too.
+	alwaysAudit := request.AlwaysAudit || decision.AlwaysAudit
+	if decision.Allowed && !alwaysAudit && a.DecisionAuditSampleRate < 1.0 {
+		if rand.Float64() >= a.DecisionAuditSampleRate {
+			return
+		}
+	}
+
+	record := BuildDecisionAuditRecord(ctx, request, decision)
+	record.Sampled = a.DecisionAuditSampleRate < 1.0
+
+	a.decisionAuditEmitter.EmitDecisionAudit(ctx, record)
+}
+
+// BuildDecisionAuditRecord builds a *store.DecisionAuditRecord from an
+// AuthzRequest/Decision pair, without emitting it or applying sampling. It is
+// exported so non-Decide decision-audit paths (e.g. G's aggregated
+// list-filter record) can produce schema-consistent records through the same
+// field mapping Decide uses, instead of hand-assembling
+// store.DecisionAuditRecord themselves. Sampled defaults to false; callers
+// that go through Decide's sampling policy should set it explicitly, as
+// emitDecisionAudit does.
+func BuildDecisionAuditRecord(ctx context.Context, request AuthzRequest, decision Decision) *store.DecisionAuditRecord {
+	result := "deny"
+	if decision.Allowed {
+		result = "allow"
+	}
+
+	// On a decorated Decision, PrincipalID is the principal ID Decide
+	// evaluated, including an empty ID for an identity that derived none.
+	// request.Principal.ID, the caller-supplied AuthzRequest field, is used
+	// only for an undecorated Decision (e.g. a non-Decide caller of this
+	// function that built a Decision by hand).
+	principalID := decision.PrincipalID
+	if !decision.principalDecorated {
+		principalID = request.Principal.ID
+	}
+
+	record := &store.DecisionAuditRecord{
+		Timestamp:      time.Now(),
+		PrincipalKind:  string(decision.PrincipalKind),
+		PrincipalID:    principalID,
+		CredentialID:   decision.CredentialID,
+		CredentialType: decision.CredentialKind,
+		ResourceType:   request.Resource.Type,
+		ResourceID:     request.Resource.ID,
+		Permission:     string(request.Action),
+		PermissionID:   decision.PermissionID,
+		Result:         result,
+		Reason:         decision.Reason,
+		MatchedPolicy:  decision.MatchedPolicy,
+		MatchedGrant:   decision.MatchedGrant,
+		PolicyID:       decision.BindingID,
+		CorrelationID:  logging.RequestIDFromContext(ctx),
+		DeniedBy:       string(decision.DeniedBy),
+
+		ResourceParentType:     request.Resource.ParentType,
+		ResourceParentID:       request.Resource.ParentID,
+		ResourceAncestryLen:    len(request.Resource.Ancestry),
+		ResourceScopeKind:      request.Resource.ScopeKind,
+		ResourceScopeUserIDSet: request.Resource.ScopeUserID != "",
+	}
+
+	if route := routeFromContext(ctx); route != "" {
+		record.Route = route
+	}
+
+	if decoration, ok := CredentialDecorationFromContext(ctx); ok {
+		record.CredentialName = sanitizeForLog(decoration.TokenName, uatMaxNameBytes)
+		record.CredentialBoundaryKind = decoration.Boundary.Kind
+		record.CredentialBoundaryProjectID = decoration.Boundary.ProjectID
+		record.CredentialLabels = boundedLabelsJSON(decoration.Labels)
+	}
+
+	if ec, ok := ExecutorContextFromContext(ctx); ok {
+		record.ExecutorKind = ec.Kind
+		record.ExecutorID = ec.ID
+	}
+
+	return record
+}
+
+// routeContextKey is the context key for the current HTTP route.
+type routeContextKey struct{}
+
+// ContextWithRoute adds the HTTP route to the context.
+func ContextWithRoute(ctx context.Context, route string) context.Context {
+	return context.WithValue(ctx, routeContextKey{}, route)
+}
+
+// routeFromContext retrieves the HTTP route from the context.
+func routeFromContext(ctx context.Context) string {
+	if route, ok := ctx.Value(routeContextKey{}).(string); ok {
+		return route
+	}
+	return ""
+}
+
+// =============================================================================
+// Mutation Audit Helper
+// =============================================================================
+
+// emitMutationAudit creates a mutation audit record from a handler context.
+// It extracts actor identity from the context and stores the record.
+// Errors are logged but do not fail the request (best-effort).
+func (s *Server) emitMutationAudit(ctx context.Context, record *store.MutationAuditRecord) {
+	// E.2a: consolidated actor/credential-snapshot/correlation helper (plan
+	// §3.3), replacing this function's own copy of the extraction logic.
+	// ApplyActor only fills fields the caller has not already set explicitly.
+	auditActorFromContext(ctx).ApplyActor(record)
+
+	if record.Timestamp.IsZero() {
+		record.Timestamp = time.Now()
+	}
+
+	// Fire-and-forget: do not block the handler.
+	// Uses a short timeout context to prevent goroutine/memory leaks on shutdown.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Warn("recovered panic in mutation audit emit", "panic", r)
+			}
+		}()
+		writeCtx, cancel := context.WithTimeout(context.Background(), auditWriteTimeout)
+		defer cancel()
+		if err := s.store.CreateMutationAudit(writeCtx, record); err != nil {
+			slog.Warn("failed to emit mutation audit record",
+				"mutation_type", record.MutationType,
+				"error", err)
+		}
+	}()
+}
+
+// =============================================================================
+// Explain API Handler
+// =============================================================================
+
+// explainRequest is the JSON body for the explain endpoint.
+type explainRequest struct {
+	Resource struct {
+		Type      string `json:"type"`
+		ID        string `json:"id"`
+		ProjectID string `json:"projectId"`
+	} `json:"resource"`
+	Action     string `json:"action"`
+	Permission string `json:"permission,omitempty"` // Canonical permission ID (e.g. "user.read"); when set, bypasses resource.type + action derivation.
+
+	PrincipalID   string `json:"principalId,omitempty"`
+	PrincipalKind string `json:"principalKind,omitempty"`
+
+	// Mode controls what the explain endpoint returns:
+	//   - "" or "decision": explain a single permission decision (default)
+	//   - "effective_permissions": return the full effective permission set
+	//     with per-permission provenance
+	Mode string `json:"mode,omitempty"`
+
+	// ComparePrincipalID, when set with mode="effective_permissions",
+	// returns a comparison of two principals' effective permission sets.
+	ComparePrincipalID   string `json:"comparePrincipalId,omitempty"`
+	ComparePrincipalKind string `json:"comparePrincipalKind,omitempty"`
+}
+
+// explainResponse is the JSON response for the explain endpoint.
+type explainResponse struct {
+	Allowed       bool                `json:"allowed"`
+	Reason        string              `json:"reason"`
+	MatchedPolicy string              `json:"matchedPolicy,omitempty"`
+	MatchedGrant  string              `json:"matchedGrant,omitempty"`
+	PolicyID      string              `json:"policyId,omitempty"`
+	Trace         []DecisionStep      `json:"trace,omitempty"`
+	Provenance    *DecisionProvenance `json:"provenance,omitempty"`
+
+	// EffectivePermissions is populated in "effective_permissions" mode.
+	// Each entry describes a permission in the effective set with its
+	// source grant and any boundary that capped it.
+	EffectivePermissions []PermissionProvenance `json:"effectivePermissions,omitempty"`
+
+	// CompareResult is populated when ComparePrincipalID is set.
+	CompareResult *PermissionCompareResult `json:"compareResult,omitempty"`
+}
+
+// PermissionProvenance describes which grant sourced a permission and which
+// boundary (if any) capped it.
+type PermissionProvenance struct {
+	// PermissionID is the canonical permission identifier.
+	PermissionID string `json:"permissionId"`
+
+	// Granted is true if this permission is in the effective set.
+	Granted bool `json:"granted"`
+
+	// SourceGrant identifies the binding and role that sourced this permission.
+	SourceGrant *GrantDetail `json:"sourceGrant,omitempty"`
+
+	// CappedBy lists the restrictions that would remove this permission.
+	// Empty when Granted is true.
+	CappedBy []RestrictionProvenance `json:"cappedBy,omitempty"`
+}
+
+// PermissionCompareResult compares two principals' effective permission sets.
+type PermissionCompareResult struct {
+	// PrincipalAID is the first principal.
+	PrincipalAID string `json:"principalAId"`
+
+	// PrincipalBID is the second principal.
+	PrincipalBID string `json:"principalBId"`
+
+	// OnlyA lists permissions held only by principal A.
+	OnlyA []string `json:"onlyA"`
+
+	// OnlyB lists permissions held only by principal B.
+	OnlyB []string `json:"onlyB"`
+
+	// Both lists permissions held by both principals.
+	Both []string `json:"both"`
+}
+
+// isKnownPermission returns true if the given ID matches a canonical
+// permission in the permissions registry.
+func isKnownPermission(id string) bool {
+	for _, p := range permissions.Registry {
+		if p.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// canonicalizeExplainPermission resolves a canonical permission ID from
+// the (resourceType, action) pair supplied by an explain API caller.
+//
+// Production enforcement uses resolveResourcePermission
+// (authz_permission_resolver.go), which resolves only pairs that name exactly
+// one permission and denies every other pair. The explain API accepts
+// arbitrary client input that may use non-canonical patterns:
+//
+//   - resource.type="hub", action="user.read" → canonical "user.read"
+//   - resource.type="hub.user", action="read" → canonical "user.read"
+//   - resource.type="hub", action="settings.read" → canonical "hub.settings.read"
+//
+// This helper applies three canonicalization passes (constructed-ID lookup,
+// action-as-ID lookup, prefix-strip lookup) before returning the fallback.
+// It is only called from the explain handler.
+func canonicalizeExplainPermission(resourceType string, action string) string {
+	// Primary lookup: exact match by Resource + Action.
+	for _, p := range permissions.Registry {
+		if p.Resource == resourceType && p.Action == action {
+			return p.ID
+		}
+	}
+	// Construct the concatenated ID for secondary lookups.
+	constructedID := resourceType + "." + action
+	// Secondary: check if the constructed ID is itself a canonical ID
+	// (e.g. "hub" + "settings.read" → "hub.settings.read").
+	if isKnownPermission(constructedID) {
+		return constructedID
+	}
+	// Check if the action alone is a canonical permission ID
+	// (e.g. "hub" + "user.read" → "user.read").
+	if isKnownPermission(action) {
+		return action
+	}
+	// Prefix-strip: if the constructed ID has 3+ segments, strip the first
+	// and check the remainder (e.g. "hub.user" + "read" → strip "hub." →
+	// "user.read").
+	if idx := strings.Index(constructedID, "."); idx >= 0 {
+		tail := constructedID[idx+1:]
+		if strings.Contains(tail, ".") && isKnownPermission(tail) {
+			return tail
+		}
+	}
+	// Fallback: return the constructed ID (will not match any granted
+	// permission, producing a truthful "denied" result).
+	return constructedID
+}
+
+// handleAuthzExplain handles POST /api/v1/authz/explain.
+func (s *Server) handleAuthzExplain(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		MethodNotAllowed(w, http.MethodPost)
+		return
+	}
+
+	ctx := r.Context()
+	identity := GetIdentityFromContext(ctx)
+	if identity == nil {
+		Unauthorized(w)
+		return
+	}
+
+	// Only the credentials the user.self.explain catalog operation
+	// declares are admitted here; an explain for another principal, or a
+	// comparison with another principal (comparePrincipalId), is checked
+	// again against hub.audit.explain below. A user access token explains
+	// through its own ceiling and boundary.
+	token, credentialOK := selfReadCredential(ctx, identity, "user.self.explain")
+	if !credentialOK {
+		refuseSelfReadCredential(w, r, identity, "hub")
+		return
+	}
+
+	var req explainRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "Invalid request body", nil)
+		return
+	}
+
+	if req.Resource.Type == "" || req.Action == "" {
+		writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "resource.type and action are required", nil)
+		return
+	}
+
+	// Determine the principal for the explain request.
+	explainIdentity := identity
+	isCrossPrincipal := req.PrincipalID != "" && req.PrincipalID != identity.ID()
+
+	// Explaining for a different principal reveals authorization internals and
+	// is restricted to users with hub.audit.read (super-admin only). The Decide
+	// check evaluates via the AK1 kernel, so the super-admin role binding
+	// grants this automatically.
+	isSuperAdmin := false
+	if user, ok := identity.(UserIdentity); ok {
+		decision := s.authzService.Decide(ctx, AuthzRequest{
+			Principal:  principalContextForIdentity(user),
+			Credential: credentialContextForIdentity(user),
+			Resource:   Resource{Type: "hub", ID: "hub"},
+			Action:     ActionRead,
+			Permission: "hub.audit.read",
+		})
+		isSuperAdmin = decision.Allowed
+	}
+
+	// An explain for another principal, or a comparison with another
+	// principal, admits only the credentials the hub.audit.explain catalog
+	// operation declares.
+	if isCrossPrincipal || req.ComparePrincipalID != "" {
+		if _, ok := selfReadCredential(ctx, identity, "hub.audit.explain"); !ok {
+			refuseSelfReadCredential(w, r, identity, "hub")
+			return
+		}
+	}
+
+	// Non-admin cannot explain for a different principal.
+	if isCrossPrincipal {
+		if !isSuperAdmin {
+			writeForbidden(w, "cannot explain for another principal without hub.audit.read")
+			return
+		}
+		// Super-admin: resolve the target principal.
+		if req.PrincipalKind == "agent" || req.PrincipalKind == string(PrincipalKindAgent) {
+			agent, err := s.store.GetAgent(ctx, req.PrincipalID)
+			if err != nil {
+				writeError(w, http.StatusNotFound, ErrCodeNotFound, "Principal not found", nil)
+				return
+			}
+			explainIdentity = newAgentIdentityFromStore(agent)
+		} else {
+			user, err := s.store.GetUser(ctx, req.PrincipalID)
+			if err != nil {
+				writeError(w, http.StatusNotFound, ErrCodeNotFound, "Principal not found", nil)
+				return
+			}
+			explainIdentity = NewAuthenticatedUser(user.ID, user.Email, user.DisplayName, user.Role, "api")
+		}
+	}
+
+	// Build the resource.
+	resource := Resource{
+		Type: req.Resource.Type,
+		ID:   req.Resource.ID,
+	}
+	if req.Resource.ProjectID != "" {
+		resource.ParentType = "project"
+		resource.ParentID = req.Resource.ProjectID
+	}
+	// A skill's authorization depends on its own scope (ScopeKind and, for
+	// user-scoped skills, the owning user), which the request does not
+	// carry. Build it from the stored record the way the read handlers do,
+	// so explain matches real decisions. An unknown ID keeps the bare
+	// resource, which every skill check denies.
+	if resource.Type == "skill" && resource.ID != "" {
+		if sk, err := s.store.GetSkill(ctx, resource.ID); err == nil {
+			resource = skillResource(sk)
+		}
+	}
+
+	// A project-boundary token explains its holder's own access only inside
+	// its boundary project, and only while the holder is a current member
+	// of that project.
+	if !isCrossPrincipal && token != nil && token.Boundary().Kind == BoundaryKindProject {
+		if explainResourceProject(resource) != token.Boundary().ProjectID || !s.tokenBoundaryProjectMember(ctx, token) {
+			writeForbidden(w, "a project token can explain access only inside its boundary project")
+			return
+		}
+	}
+
+	// Handle effective_permissions mode: return full effective permission set
+	// with per-permission provenance. A token explaining its holder's own
+	// access lists only the permissions the token may use.
+	if req.Mode == "effective_permissions" {
+		var ceilingToken *ScopedUserIdentity
+		if !isCrossPrincipal {
+			ceilingToken = token
+		}
+		s.handleExplainEffectivePermissions(w, ctx, req, explainIdentity, resource, isCrossPrincipal, isSuperAdmin, ceilingToken)
+		return
+	}
+
+	// Resolve the permission ID for the explain request.
+	// When the client provides an explicit permission, validate it against
+	// the registry. When omitted, canonicalize from resource.type + action
+	// using the explain-specific helper (not resolveResourcePermission, which
+	// is reserved for production enforcement).
+	permissionID := req.Permission
+	if permissionID != "" {
+		// Explicit permission: validate against the canonical registry.
+		if !isKnownPermission(permissionID) {
+			writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest,
+				fmt.Sprintf("unknown permission %q: must be a canonical permission ID from the registry", permissionID), nil)
+			return
+		}
+	} else {
+		// No explicit permission: canonicalize from resource.type + action.
+		permissionID = canonicalizeExplainPermission(req.Resource.Type, req.Action)
+	}
+
+	// Build the authz request with Explain enabled.
+	authzReq := AuthzRequest{
+		Principal:  principalContextForIdentity(explainIdentity),
+		Credential: credentialContextForIdentity(explainIdentity),
+		Resource:   resource,
+		Action:     Action(req.Action),
+		Permission: permissionID,
+		Explain:    true,
+	}
+
+	decision := s.authzService.Decide(ctx, authzReq)
+
+	// Apply field-level redaction for cross-principal explain.
+	// When the requesting user is explaining another principal's access,
+	// redact sensitive fields but preserve causal structure.
+	provenance := decision.Provenance
+	if isCrossPrincipal && provenance != nil {
+		provenance = redactCrossPrincipalProvenance(provenance)
+	}
+
+	resp := explainResponse{
+		Allowed:       decision.Allowed,
+		Reason:        decision.Reason,
+		MatchedPolicy: decision.MatchedPolicy,
+		MatchedGrant:  decision.MatchedGrant,
+		PolicyID:      decision.BindingID,
+		Trace:         decision.ExplainTrace,
+		Provenance:    provenance,
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// explainResourceProject returns the project an explain target belongs to:
+// its project parent, or its own ID for a project. A target with no
+// project returns "".
+func explainResourceProject(resource Resource) string {
+	if resource.ParentType == "project" && resource.ParentID != "" {
+		return resource.ParentID
+	}
+	if resource.Type == "project" {
+		return resource.ID
+	}
+	return ""
+}
+
+// handleExplainEffectivePermissions handles the effective_permissions mode
+// of the explain endpoint. It returns the full effective permission set
+// with per-permission provenance showing which grant sourced each permission
+// and which boundary (if any) capped it.
+//
+// NOTE: Performance — this runs a full Decide() call for each permission in
+// the effective set. For principals with many permissions (e.g., super-admin
+// with 50+ permissions), this results in N full authz pipeline evaluations.
+// The shared work (principal closure, bindings, roles, restrictions) is
+// identical across all N calls and could be cached. This is acceptable for
+// the explain API (low-volume diagnostic endpoint) but should be optimized
+// if usage patterns change. TODO: cache shared authz context across the
+// per-permission Decide loop.
+func (s *Server) handleExplainEffectivePermissions(
+	w http.ResponseWriter,
+	ctx context.Context,
+	req explainRequest,
+	explainIdentity Identity,
+	resource Resource,
+	isCrossPrincipal bool,
+	isSuperAdmin bool,
+	ceilingToken *ScopedUserIdentity,
+) {
+	// C1 fix: ComparePrincipalID reveals another principal's effective
+	// permissions. Require the same hub.audit.read gate used for PrincipalID.
+	if req.ComparePrincipalID != "" {
+		if !isSuperAdmin {
+			writeForbidden(w, "comparison requires hub.audit.read")
+			return
+		}
+	}
+	scopeType := ""
+	scopeID := ""
+	if resource.ParentType == "project" && resource.ParentID != "" {
+		scopeType = ScopeTypeProject
+		scopeID = resource.ParentID
+	} else if resource.Type == "project" && resource.ID != "" {
+		scopeType = ScopeTypeProject
+		scopeID = resource.ID
+	} else {
+		scopeType = ScopeTypeSystem
+	}
+
+	// Normalize the principal type for effective permission lookup.
+	// Identity types like "dev", "federated_user" need to map to the
+	// store principal type ("user") for binding queries.
+	principalType := normalizePrincipalType(explainIdentity.Type())
+
+	// Get effective permissions for the principal.
+	effectivePerms, err := s.authzService.getEffectivePermissions(
+		ctx,
+		principalType,
+		explainIdentity.ID(),
+		scopeType, scopeID,
+	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+			"failed to compute effective permissions", nil)
+		return
+	}
+	if ceilingToken != nil {
+		effectivePerms = filterPermissionsForToken(ceilingToken, effectivePerms)
+	}
+
+	// Build per-permission provenance by running a Decide for each
+	// permission in the effective set.
+	var permProvenance []PermissionProvenance
+	effectiveSet := make(map[string]bool, len(effectivePerms))
+	for _, permID := range effectivePerms {
+		effectiveSet[permID] = true
+
+		authzReq := AuthzRequest{
+			Principal:  principalContextForIdentity(explainIdentity),
+			Credential: credentialContextForIdentity(explainIdentity),
+			Resource:   resource,
+			Permission: permID,
+			Action:     Action(req.Action),
+			Explain:    true,
+		}
+		decision := s.authzService.Decide(ctx, authzReq)
+
+		pp := PermissionProvenance{
+			PermissionID: permID,
+			Granted:      decision.Allowed,
+		}
+
+		// Extract source grant from provenance.
+		if decision.Provenance != nil && len(decision.Provenance.Grants) > 0 {
+			g := decision.Provenance.Grants[0]
+			// Prefer a grant that contains the requested permission.
+			for _, candidate := range decision.Provenance.Grants {
+				if candidate.ContainsRequested {
+					g = candidate
+					break
+				}
+			}
+			pp.SourceGrant = &g
+		}
+
+		// Extract capping restrictions.
+		if decision.Provenance != nil {
+			for _, r := range decision.Provenance.Restrictions {
+				if r.Applied {
+					pp.CappedBy = append(pp.CappedBy, r)
+				}
+			}
+		}
+
+		if isCrossPrincipal && pp.SourceGrant != nil {
+			redacted := redactGrantDetail(*pp.SourceGrant)
+			pp.SourceGrant = &redacted
+		}
+
+		permProvenance = append(permProvenance, pp)
+	}
+
+	resp := explainResponse{
+		Allowed:              len(effectivePerms) > 0,
+		Reason:               fmt.Sprintf("%d effective permissions", len(effectivePerms)),
+		EffectivePermissions: permProvenance,
+	}
+
+	// Handle comparison with another principal.
+	if req.ComparePrincipalID != "" {
+		compareIdentity, err := s.resolveExplainPrincipal(ctx, req.ComparePrincipalID, req.ComparePrincipalKind)
+		if err != nil {
+			writeError(w, http.StatusNotFound, ErrCodeNotFound, "Compare principal not found", nil)
+			return
+		}
+
+		comparePerms, err := s.authzService.getEffectivePermissions(
+			ctx,
+			normalizePrincipalType(compareIdentity.Type()),
+			compareIdentity.ID(),
+			scopeType, scopeID,
+		)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, ErrCodeInternalError,
+				"failed to compute compare principal's effective permissions", nil)
+			return
+		}
+
+		compareSet := make(map[string]bool, len(comparePerms))
+		for _, p := range comparePerms {
+			compareSet[p] = true
+		}
+
+		principalBID := req.ComparePrincipalID
+		if isCrossPrincipal {
+			// N3 fix: redact the comparison principal ID in cross-principal
+			// requests for defense in depth.
+			principalBID = "[redacted]"
+		}
+		result := &PermissionCompareResult{
+			PrincipalAID: explainIdentity.ID(),
+			PrincipalBID: principalBID,
+		}
+
+		for _, p := range effectivePerms {
+			if compareSet[p] {
+				result.Both = append(result.Both, p)
+			} else {
+				result.OnlyA = append(result.OnlyA, p)
+			}
+		}
+		for _, p := range comparePerms {
+			if !effectiveSet[p] {
+				result.OnlyB = append(result.OnlyB, p)
+			}
+		}
+
+		resp.CompareResult = result
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// resolveExplainPrincipal resolves a principal ID and kind to an Identity.
+func (s *Server) resolveExplainPrincipal(ctx context.Context, principalID, principalKind string) (Identity, error) {
+	if principalKind == "agent" || principalKind == string(PrincipalKindAgent) {
+		agent, err := s.store.GetAgent(ctx, principalID)
+		if err != nil {
+			return nil, err
+		}
+		return newAgentIdentityFromStore(agent), nil
+	}
+	user, err := s.store.GetUser(ctx, principalID)
+	if err != nil {
+		return nil, err
+	}
+	return NewAuthenticatedUser(user.ID, user.Email, user.DisplayName, user.Role, "api"), nil
+}
+
+// normalizePrincipalType maps identity types to store principal types for
+// binding queries. Identity types "dev" and "federated_user" are treated
+// as "user" by the authorization system.
+func normalizePrincipalType(identityType string) string {
+	switch identityType {
+	case "user", "dev", "federated_user":
+		return "user"
+	case "agent", "federated_agent":
+		return "agent"
+	default:
+		return identityType
+	}
+}
+
+// redactCrossPrincipalProvenance redacts sensitive fields from provenance
+// for cross-principal explain requests. It preserves causal structure
+// (the reader learns THAT something is hidden and WHY) but removes
+// sensitive names and display names.
+func redactCrossPrincipalProvenance(dp *DecisionProvenance) *DecisionProvenance {
+	if dp == nil {
+		return nil
+	}
+
+	redacted := &DecisionProvenance{
+		Permission:           dp.Permission,
+		EffectivePermissions: dp.EffectivePermissions,
+		DenyReasons:          dp.DenyReasons,
+		Errors:               dp.Errors,
+	}
+
+	// Redact grant details: preserve binding/role IDs, redact principal names.
+	for _, g := range dp.Grants {
+		redacted.Grants = append(redacted.Grants, redactGrantDetail(g))
+	}
+	for _, g := range dp.InactiveGrants {
+		redacted.InactiveGrants = append(redacted.InactiveGrants, redactGrantDetail(g))
+	}
+
+	// Copy restrictions: boundary IDs are stable identifiers the reader
+	// can follow, but names may be sensitive.
+	for _, r := range dp.Restrictions {
+		rr := r
+		rr.BoundaryName = "[redacted]"
+		redacted.Restrictions = append(redacted.Restrictions, rr)
+	}
+
+	// Copy status restrictions.
+	redacted.StatusRestrictions = dp.StatusRestrictions
+
+	// Redact membership paths: preserve structure (path length) and typed
+	// target IDs but redact group names within paths.
+	for _, mp := range dp.MembershipPaths {
+		rmp := MembershipPathDetail{
+			TargetID: mp.TargetID,
+			Kind:     mp.Kind,
+		}
+		for _, p := range mp.Path {
+			rmp.Path = append(rmp.Path, redactPathElement(p))
+		}
+		redacted.MembershipPaths = append(redacted.MembershipPaths, rmp)
+	}
+
+	// Ensure non-nil slices.
+	if redacted.Grants == nil {
+		redacted.Grants = []GrantDetail{}
+	}
+	if redacted.InactiveGrants == nil {
+		redacted.InactiveGrants = []GrantDetail{}
+	}
+	if redacted.Restrictions == nil {
+		redacted.Restrictions = []RestrictionProvenance{}
+	}
+	if redacted.MembershipPaths == nil {
+		redacted.MembershipPaths = []MembershipPathDetail{}
+	}
+
+	return redacted
+}
+
+// redactGrantDetail redacts sensitive fields from a GrantDetail while
+// preserving the causal structure (binding IDs, role IDs, scope info).
+func redactGrantDetail(g GrantDetail) GrantDetail {
+	return GrantDetail{
+		BindingID:         g.BindingID,
+		RoleID:            g.RoleID,
+		RoleName:          g.RoleName, // Role names are not sensitive (they are system-defined).
+		ScopeType:         g.ScopeType,
+		ScopeID:           g.ScopeID,
+		PrincipalType:     g.PrincipalType,
+		PrincipalID:       "[redacted]",
+		ContainsRequested: g.ContainsRequested,
+		MembershipPath:    nil, // Redact path details in cross-principal.
+		Permissions:       g.Permissions,
+		InactiveReason:    g.InactiveReason,
+		RejectReasons:     g.RejectReasons,
+	}
+}
+
+// redactPathElement redacts the ID part of a typed path element (e.g.,
+// "group:engineers" → "group:[redacted]") while preserving the type prefix.
+func redactPathElement(element string) string {
+	for _, prefix := range []string{"user:", "agent:", "group:", "dev:", "federated_user:", "federated_agent:"} {
+		if len(element) > len(prefix) && element[:len(prefix)] == prefix {
+			return prefix + "[redacted]"
+		}
+	}
+	return "[redacted]"
+}
+
+// explainAgentIdentity is a minimal AgentIdentity for the explain endpoint.
+type explainAgentIdentity struct {
+	id        string
+	projectID string
+	ancestry  []string
+}
+
+func (a *explainAgentIdentity) ID() string                    { return a.id }
+func (a *explainAgentIdentity) Type() string                  { return "agent" }
+func (a *explainAgentIdentity) ProjectID() string             { return a.projectID }
+func (a *explainAgentIdentity) Scopes() []AgentTokenScope     { return nil }
+func (a *explainAgentIdentity) HasScope(AgentTokenScope) bool { return false }
+func (a *explainAgentIdentity) Ancestry() []string            { return a.ancestry }
+func (a *explainAgentIdentity) TokenID() string               { return "" }
+
+// localAncestryProvenance reports that this ancestry chain was read back
+// from a hub-persisted store.Agent record, not from a JWT.
+func (a *explainAgentIdentity) localAncestryProvenance() ancestryProvenance {
+	return ancestryProvenanceStoreAgent
+}
+
+func (a *explainAgentIdentity) OriginUserID() string {
+	if len(a.ancestry) > 0 {
+		return a.ancestry[0]
+	}
+	return ""
+}
+
+// newAgentIdentityFromStore creates an AgentIdentity from a store Agent record.
+// Used by the explain endpoint to resolve agent principals.
+func newAgentIdentityFromStore(agent *store.Agent) AgentIdentity {
+	return &explainAgentIdentity{
+		id:        agent.ID,
+		projectID: agent.ProjectID,
+		ancestry:  agent.Ancestry,
+	}
+}
+
+// =============================================================================
+// Audit Retention Controls
+// =============================================================================
+
+// CleanupAuditRecords removes audit records older than the specified retention period.
+func (s *Server) CleanupAuditRecords(ctx context.Context, retentionDays int) error {
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+
+	mutationCount, err := s.store.DeleteMutationAuditsBefore(ctx, cutoff)
+	if err != nil {
+		return fmt.Errorf("failed to cleanup mutation audit records: %w", err)
+	}
+
+	slog.Info("audit records cleaned up",
+		"mutation_records_deleted", mutationCount,
+		"retention_days", retentionDays,
+		"cutoff", cutoff)
+
+	return nil
+}

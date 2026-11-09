@@ -19,10 +19,11 @@ import (
 // It maps harness-specific event names to normalized Scion event names and
 // optionally extracts fields from the event payload using dotted paths.
 type MappingDialectSpec struct {
-	Dialect         string                      `yaml:"dialect"`
-	EventNameField  string                      `yaml:"event_name_field"`
-	EventNameFields []string                    `yaml:"event_name_fields"`
-	Mappings        map[string]MappingEntrySpec `yaml:"mappings"`
+	Dialect         string                            `yaml:"dialect"`
+	EventNameField  string                            `yaml:"event_name_field"`
+	EventNameFields []string                          `yaml:"event_name_fields"`
+	Mappings        map[string]MappingEntrySpec       `yaml:"mappings"`
+	Responses       map[string]map[string]interface{} `yaml:"responses,omitempty"`
 }
 
 // MappingEntrySpec defines how a single harness event maps to a normalized event.
@@ -44,6 +45,20 @@ func NewMappingDialect(spec MappingDialectSpec) *MappingDialect {
 // Name returns the dialect name as declared in the spec.
 func (d *MappingDialect) Name() string {
 	return d.spec.Dialect
+}
+
+// Response returns the response object declared for the given raw event name,
+// or nil if no response is declared for that event.
+func (d *MappingDialect) Response(rawEventName string) map[string]interface{} {
+	if d.spec.Responses == nil {
+		return nil
+	}
+	return d.spec.Responses[rawEventName]
+}
+
+// EventName extracts the raw event name from the incoming data map.
+func (d *MappingDialect) EventName(data map[string]interface{}) string {
+	return d.eventName(data)
 }
 
 // Parse converts a harness event payload into a normalized Event using the
@@ -94,6 +109,7 @@ func (d *MappingDialect) Parse(data map[string]interface{}) (*hooks.Event, error
 	if val, ok := data["success"]; ok {
 		if b, ok := val.(bool); ok {
 			event.Data.Success = b
+			event.Data.Failed = !b
 		}
 	}
 	if val, ok := data["error"]; ok {
@@ -176,13 +192,13 @@ func applyFieldPath(data map[string]interface{}, field, path string, ed *hooks.E
 		if v := resolveFieldPath(data, path); v != "" {
 			ed.Error = v
 		}
+	case "model":
+		if v := resolveFieldPath(data, path); v != "" {
+			ed.Model = v
+		}
 	case "file_path":
 		if v := resolveFieldPath(data, path); v != "" {
 			ed.FilePath = v
-		}
-	case "assistant_text":
-		if v := resolveFieldPath(data, path); v != "" {
-			ed.AssistantText = v
 		}
 	case "input_tokens":
 		if v := resolveFieldPathInt64(data, path); v > 0 {
@@ -196,9 +212,18 @@ func applyFieldPath(data map[string]interface{}, field, path string, ed *hooks.E
 		if v := resolveFieldPathInt64(data, path); v > 0 {
 			ed.CachedTokens = v
 		}
+	case "cache_write_tokens":
+		if v := resolveFieldPathInt64(data, path); v > 0 {
+			ed.CacheWriteTokens = v
+		}
+	case "reasoning_tokens":
+		if v := resolveFieldPathInt64(data, path); v > 0 {
+			ed.ReasoningTokens = v
+		}
 	case "success":
 		if val, found := resolveFieldPathBool(data, path); found {
 			ed.Success = val
+			ed.Failed = !val
 		}
 	}
 }
@@ -235,14 +260,21 @@ func resolveFieldPathRaw(data map[string]interface{}, path string) string {
 	return string(b)
 }
 
-// resolveFieldPathBool walks a dotted path and returns a boolean value.
+// resolveFieldPathBool walks a dotted path and returns a boolean value. A
+// bool is returned as is. A string counts as a status word: only "success"
+// (any case) is true, every other string is false. This covers harnesses
+// that report a tool result's outcome as a string (Copilot's
+// toolResult.resultType). Any other type, or a missing value, is not found.
 func resolveFieldPathBool(data map[string]interface{}, path string) (bool, bool) {
 	val := walkPath(data, path)
 	if val == nil {
 		return false, false
 	}
-	if b, ok := val.(bool); ok {
-		return b, true
+	switch v := val.(type) {
+	case bool:
+		return v, true
+	case string:
+		return strings.EqualFold(v, "success"), true
 	}
 	return false, false
 }

@@ -1,0 +1,154 @@
+/**
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * Shared Role Binding Utilities
+ *
+ * Constants and helper functions shared across role-binding-related
+ * components (admin-role-bindings, effective-role-provenance,
+ * project-members-editor).
+ */
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/**
+ * System-scope roles that may only be assigned to individual users (not groups).
+ * Used in the admin role-bindings page.
+ */
+export const SYSTEM_DIRECT_USER_ONLY_ROLES = ['super-admin', 'project-owner'];
+
+/**
+ * Project-scope roles that may only be assigned to individual users (not groups).
+ * Used in the project membership editor.
+ */
+export const PROJECT_DIRECT_USER_ONLY_ROLES = ['project-owner'];
+
+/**
+ * Role names that represent project ownership. A project must retain at least
+ * one direct user with one of these roles.
+ */
+export const PROJECT_OWNER_ROLE_NAMES = ['project-owner', 'owner'];
+
+/**
+ * Role names that represent project administrator status.
+ */
+export const PROJECT_ADMIN_ROLE_NAMES = ['project-admin', 'admin'];
+
+/**
+ * Built-in project membership role names. A principal holds at most one of
+ * these per project; the project members editor offers them as a radio
+ * group and lists every other project-scoped role as a custom role.
+ *
+ * SYNC: This list must match BuiltInProjectMembershipRoles in
+ * pkg/store/models.go. If a role is added or removed here, update the Go
+ * counterpart (and vice versa).
+ */
+export const BUILT_IN_PROJECT_MEMBERSHIP_ROLES = [
+  'project-owner',
+  'project-admin',
+  'project-member',
+  'project-viewer',
+];
+
+/** The built-in membership role that reads the project and its chat and cannot post messages. */
+export const PROJECT_VIEWER_ROLE_NAME = 'project-viewer';
+
+/**
+ * Label of a built-in membership role in the role picker: its tier, except
+ * the viewer role, which shares the member tier (managed with
+ * canManageMembers) but is its own choice.
+ */
+export function builtInRoleLabel(roleName: string): string {
+  if (roleName === PROJECT_VIEWER_ROLE_NAME) return 'Viewer';
+  switch (getRoleTier(roleName)) {
+    case 'owner':
+      return 'Owner';
+    case 'admin':
+      return 'Admin';
+    default:
+      return 'Member';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Role tier classification
+// ---------------------------------------------------------------------------
+
+/** The management tier a role belongs to. */
+export type RoleTier = 'owner' | 'admin' | 'member';
+
+/**
+ * Classify a role name into its management tier. Owner-tier roles require
+ * `canManageOwners`, admin-tier requires `canManageAdmins`, and everything
+ * else falls under the member tier (`canManageMembers`).
+ */
+export function getRoleTier(roleName: string): RoleTier {
+  if (PROJECT_OWNER_ROLE_NAMES.includes(roleName)) return 'owner';
+  if (PROJECT_ADMIN_ROLE_NAMES.includes(roleName)) return 'admin';
+  return 'member';
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle helpers
+// ---------------------------------------------------------------------------
+
+/** Lifecycle status of a role binding. */
+export type LifecycleStatus = 'active' | 'expired' | 'pending';
+
+/**
+ * Determine the lifecycle status of a binding based on its notBefore/expiresAt
+ * fields. Expired takes precedence over pending.
+ */
+export function getLifecycleStatus(binding: {
+  notBefore?: string;
+  expiresAt?: string;
+}): LifecycleStatus {
+  const now = Date.now();
+
+  if (binding.expiresAt) {
+    const expires = new Date(binding.expiresAt).getTime();
+    if (!isNaN(expires) && expires < now) return 'expired';
+  }
+
+  if (binding.notBefore) {
+    const notBefore = new Date(binding.notBefore).getTime();
+    if (!isNaN(notBefore) && notBefore > now) return 'pending';
+  }
+
+  return 'active';
+}
+
+// ---------------------------------------------------------------------------
+// Icon helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Return the Bootstrap icon name for a given principal type.
+ */
+export function getPrincipalIcon(principalType: string): string {
+  switch (principalType) {
+    case 'user':
+      return 'person';
+    case 'group':
+      return 'diagram-3';
+    case 'agent':
+      return 'cpu';
+    default:
+      return 'question-circle';
+  }
+}

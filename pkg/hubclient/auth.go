@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/apiclient"
 )
@@ -66,9 +67,6 @@ type AuthService interface {
 	// Me returns the current authenticated user.
 	Me(ctx context.Context) (*User, error)
 
-	// GetWSTicket gets a short-lived WebSocket authentication ticket.
-	GetWSTicket(ctx context.Context) (*WSTicketResponse, error)
-
 	// GetAuthProviders returns configured OAuth providers for a client type.
 	GetAuthProviders(ctx context.Context, clientType string) (*AuthProvidersResponse, error)
 
@@ -83,6 +81,35 @@ type AuthService interface {
 
 	// PollDeviceToken polls for the device authorization result.
 	PollDeviceToken(ctx context.Context, deviceCode, provider string) (*DeviceTokenPollResponse, error)
+
+	// FederationToken obtains a short-lived user access credential for the
+	// authenticated user, for one peer hub audience
+	// (POST /api/v1/auth/federation-token). It is never retried.
+	FederationToken(ctx context.Context, req *FederationTokenRequest) (*FederationTokenResponse, error)
+}
+
+// FederationTokenRequest is the request for a user access credential for
+// a peer hub.
+type FederationTokenRequest struct {
+	// Audience is the peer hub's issuer URL.
+	Audience string `json:"audience"`
+}
+
+// FederationTokenResponse is a user access credential for a peer hub and
+// its expiry.
+type FederationTokenResponse struct {
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// FederationToken obtains a user access credential for a peer hub.
+// Issuance is not idempotent, so the request is never retried.
+func (s *authService) FederationToken(ctx context.Context, req *FederationTokenRequest) (*FederationTokenResponse, error) {
+	resp, err := s.c.postNoRetry(ctx, "/api/v1/auth/federation-token", req, nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[FederationTokenResponse](resp)
 }
 
 // authService is the implementation of AuthService.
@@ -111,12 +138,6 @@ type TokenResponse struct {
 	ExpiresAt    string `json:"expiresAt"`
 }
 
-// WSTicketResponse is the response for WebSocket ticket.
-type WSTicketResponse struct {
-	Ticket    string `json:"ticket"`
-	ExpiresAt string `json:"expiresAt"`
-}
-
 // AuthURLResponse is the response containing the OAuth authorization URL.
 type AuthURLResponse struct {
 	URL string `json:"url"`
@@ -143,7 +164,7 @@ func (s *authService) Login(ctx context.Context, req *LoginRequest) (*LoginRespo
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[LoginResponse](resp)
+	return apiclient.DecodeRequired[LoginResponse](resp)
 }
 
 // Logout invalidates the current session.
@@ -166,7 +187,7 @@ func (s *authService) Refresh(ctx context.Context, refreshToken string) (*TokenR
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[TokenResponse](resp)
+	return apiclient.DecodeRequired[TokenResponse](resp)
 }
 
 // Me returns the current authenticated user.
@@ -175,16 +196,7 @@ func (s *authService) Me(ctx context.Context) (*User, error) {
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[User](resp)
-}
-
-// GetWSTicket gets a short-lived WebSocket authentication ticket.
-func (s *authService) GetWSTicket(ctx context.Context) (*WSTicketResponse, error) {
-	resp, err := s.c.post(ctx, "/api/v1/auth/ws-ticket", nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	return apiclient.DecodeResponse[WSTicketResponse](resp)
+	return apiclient.DecodeRequired[User](resp)
 }
 
 // GetAuthProviders returns configured OAuth providers for a client type.
@@ -194,6 +206,9 @@ func (s *authService) GetAuthProviders(ctx context.Context, clientType string) (
 
 	resp, err := s.c.getWithQuery(ctx, "/api/v1/auth/providers", query, nil)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.c.checkLoginResponse(resp); err != nil {
 		return nil, err
 	}
 	defer func() {
@@ -227,7 +242,10 @@ func (s *authService) GetAuthURL(ctx context.Context, callbackURL, state, provid
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[AuthURLResponse](resp)
+	if err := s.c.checkLoginResponse(resp); err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[AuthURLResponse](resp)
 }
 
 // ExchangeCode exchanges an authorization code for tokens.
@@ -245,7 +263,7 @@ func (s *authService) ExchangeCode(ctx context.Context, code, callbackURL, provi
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[CLITokenResponse](resp)
+	return apiclient.DecodeRequired[CLITokenResponse](resp)
 }
 
 // DeviceCodeResponse is the response from initiating a device authorization flow.
@@ -279,7 +297,10 @@ func (s *authService) RequestDeviceCode(ctx context.Context, provider string) (*
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[DeviceCodeResponse](resp)
+	if err := s.c.checkLoginResponse(resp); err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[DeviceCodeResponse](resp)
 }
 
 // PollDeviceToken polls for the device authorization result.

@@ -20,19 +20,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestPopulateAgentConfig_RelativeWorkspacePreserved(t *testing.T) {
-	// Set up a temp HOME so hubManagedProjectPath can resolve.
+	// Set up a temp HOME so the hub-managed workspace path can resolve.
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
 
@@ -57,7 +59,7 @@ func TestPopulateAgentConfig_RelativeWorkspacePreserved(t *testing.T) {
 			},
 		}
 
-		srv.populateAgentConfig(context.Background(), agent, project, nil)
+		require.NoError(t, srv.populateAgentConfig(context.Background(), agent, project, nil))
 
 		assert.Equal(t, "packages/web", agent.AppliedConfig.Workspace,
 			"relative workspace should not be overwritten by hub-managed path")
@@ -71,7 +73,7 @@ func TestPopulateAgentConfig_RelativeWorkspacePreserved(t *testing.T) {
 			},
 		}
 
-		srv.populateAgentConfig(context.Background(), agent, project, nil)
+		require.NoError(t, srv.populateAgentConfig(context.Background(), agent, project, nil))
 
 		assert.Equal(t, "/absolute/path", agent.AppliedConfig.Workspace,
 			"absolute workspace should be preserved as user override")
@@ -85,9 +87,9 @@ func TestPopulateAgentConfig_RelativeWorkspacePreserved(t *testing.T) {
 			},
 		}
 
-		srv.populateAgentConfig(context.Background(), agent, project, nil)
+		require.NoError(t, srv.populateAgentConfig(context.Background(), agent, project, nil))
 
-		expectedPath, err := hubManagedProjectPath(slug)
+		expectedPath, err := localProjectPath(slug)
 		require.NoError(t, err)
 		assert.Equal(t, expectedPath, agent.AppliedConfig.Workspace,
 			"empty workspace should be overwritten with hub-managed path")
@@ -413,7 +415,7 @@ func TestMergeInjectedSkills_ProgenyDeduplication(t *testing.T) {
 	// Count how many times the base URI appears — should be exactly 1.
 	count := 0
 	for _, ref := range agent.AppliedConfig.InlineConfig.Skills {
-		if skillBaseURI(ref.URI) == "scion://shared-skill" {
+		if api.SkillBaseURI(ref.URI) == "scion://shared-skill" {
 			count++
 		}
 	}
@@ -492,29 +494,28 @@ func TestMergeSkillRefs_VersionConflictWarnAndWin(t *testing.T) {
 }
 
 // =============================================================================
-// skillBaseURI unit tests
+// api.SkillBaseURI keying in the hub
 // =============================================================================
 
-func TestSkillBaseURI_StripVersion(t *testing.T) {
-	cases := []struct {
-		uri      string
-		expected string
-	}{
-		{"scion://my-skill@1.0", "scion://my-skill"},
-		{"scion://my-skill@2.3.4", "scion://my-skill"},
-		{"scion://my-skill", "scion://my-skill"},
-		{"scion://org/my-skill@1.0", "scion://org/my-skill"},
-		{"https://example.com/skills/my-skill@1.0", "https://example.com/skills/my-skill"},
-		{"https://example.com/skills/my-skill", "https://example.com/skills/my-skill"},
-		{"scion://my-skill@latest", "scion://my-skill"},
-		{"", ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.uri, func(t *testing.T) {
-			got := skillBaseURI(tc.uri)
-			assert.Equal(t, tc.expected, got)
-		})
-	}
+// TestMergeSkillRefs_KeysLikeBroker checks that the hub keys skill URIs with
+// userinfo or a query by the same rule as the runtime broker (ptone/scion#4179):
+// an "@" outside the last path segment is not a version specifier.
+func TestMergeSkillRefs_KeysLikeBroker(t *testing.T) {
+	// Two different skills on the same host with userinfo stay separate.
+	result := mergeSkillRefs(
+		[]api.SkillReference{{URI: "skill://u@host/a"}},
+		[]api.SkillReference{{URI: "skill://u@host/b"}},
+	)
+	require.Len(t, result, 2, "skills behind the same userinfo must not share a key")
+
+	// Two versions of one skill whose query holds an "@" collapse to one entry,
+	// and the higher-precedence version wins.
+	result = mergeSkillRefs(
+		[]api.SkillReference{{URI: "gh://o/r/s@v1?token=a@b"}},
+		[]api.SkillReference{{URI: "gh://o/r/s@v2?token=a@b"}},
+	)
+	require.Len(t, result, 1, "versions of one skill must share a key despite '@' in the query")
+	assert.Equal(t, "gh://o/r/s@v2?token=a@b", result[0].URI)
 }
 
 // =============================================================================
@@ -542,11 +543,10 @@ func setupPreStartHookStampingTest(t *testing.T) (*Server, store.Store, *store.P
 
 	srv, s := testServer(t)
 	project := &store.Project{
-		ID:         tid("psh-stamp-" + t.Name()),
-		Name:       "PSH Stamping Project",
-		Slug:       "psh-stamp-" + strings.ToLower(t.Name()),
-		Visibility: "private",
-		OwnerID:    "dev@localhost",
+		ID:      tid("psh-stamp-" + t.Name()),
+		Name:    "PSH Stamping Project",
+		Slug:    "psh-stamp-" + strings.ToLower(t.Name()),
+		OwnerID: "dev@localhost",
 	}
 	require.NoError(t, s.CreateProject(t.Context(), project))
 	return srv, s, project
@@ -576,7 +576,7 @@ func TestPopulateAgentConfig_PreStartHook_HubFallback(t *testing.T) {
 	require.NoError(t, err)
 
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Equal(t, hubHook.ID, agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho hub\n", agent.AppliedConfig.ProjectPreStartHookScript)
@@ -603,7 +603,7 @@ func TestPopulateAgentConfig_PreStartHook_ProjectOverridesHub(t *testing.T) {
 	require.NoError(t, err)
 
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Equal(t, projectHook.ID, agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho project\n", agent.AppliedConfig.ProjectPreStartHookScript)
@@ -623,7 +623,7 @@ func TestPopulateAgentConfig_PreStartHook_ProjectOnly(t *testing.T) {
 	require.NoError(t, err)
 
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Equal(t, projectHook.ID, agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho project\n", agent.AppliedConfig.ProjectPreStartHookScript)
@@ -634,7 +634,7 @@ func TestPopulateAgentConfig_PreStartHook_NoneStagesNothing(t *testing.T) {
 	srv, _, project := setupPreStartHookStampingTest(t)
 
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Empty(t, agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Empty(t, agent.AppliedConfig.ProjectPreStartHookScript)
@@ -664,7 +664,7 @@ func TestPopulateAgentConfig_PreStartHook_ArchivedProjectHookFallsBackToHub(t *t
 	require.NoError(t, s.DeleteProjectPreStartHook(t.Context(), projectHook.ID, project.ID))
 
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Equal(t, hubHook.ID, agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho hub\n", agent.AppliedConfig.ProjectPreStartHookScript)
@@ -700,7 +700,7 @@ func TestPopulateAgentConfig_PreStartHook_ProjectLookupErrorStagesNothing(t *tes
 	srv.store = &failingProjectHookStore{Store: s, err: errors.New("database is locked")}
 
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Empty(t, agent.AppliedConfig.ProjectPreStartHookID,
 		"an ambiguous project lookup error must not fall back to the hub hook")
@@ -744,7 +744,7 @@ func TestPopulateAgentConfig_ProjectHookArchivedBySecondCreate_FallsBackToHub(t 
 
 	// The live project hook wins; the archived one is never staged.
 	agent := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 	assert.Equal(t, second.ID, agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho second\n", agent.AppliedConfig.ProjectPreStartHookScript)
 
@@ -755,7 +755,7 @@ func TestPopulateAgentConfig_ProjectHookArchivedBySecondCreate_FallsBackToHub(t 
 
 	// With no project hook left, the hub fallback resumes.
 	next := newStampingAgent()
-	srv.populateAgentConfig(t.Context(), next, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), next, project, nil))
 	assert.Equal(t, hubHook.ID, next.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho hub\n", next.AppliedConfig.ProjectPreStartHookScript)
 	assert.NotContains(t, next.AppliedConfig.ProjectPreStartHookScript, "echo first")
@@ -777,7 +777,7 @@ func TestPopulateAgentConfig_PreStartHook_PreStampedIDPreserved(t *testing.T) {
 	agent.AppliedConfig.ProjectPreStartHookID = "preset-hook-id"
 	agent.AppliedConfig.ProjectPreStartHookScript = "#!/bin/sh\necho preset\n"
 
-	srv.populateAgentConfig(t.Context(), agent, project, nil)
+	require.NoError(t, srv.populateAgentConfig(t.Context(), agent, project, nil))
 
 	assert.Equal(t, "preset-hook-id", agent.AppliedConfig.ProjectPreStartHookID)
 	assert.Equal(t, "#!/bin/sh\necho preset\n", agent.AppliedConfig.ProjectPreStartHookScript)
@@ -828,4 +828,531 @@ func TestResumeInPlaceDecision(t *testing.T) {
 			}
 		})
 	}
+}
+
+// =============================================================================
+// resolveRuntimeBroker — hub-level default broker (Case 2.5)
+// =============================================================================
+
+// TestResolveRuntimeBroker_HubDefault is a table-driven test covering the
+// Case 2.5 (hub-level default broker) cascade step in resolveRuntimeBroker.
+//
+// Key design point: the hub default SILENTLY falls through to auto-select when
+// unavailable, unlike the project default (Case 2) which returns an error.
+// This asymmetry is intentional and pinned by these tests.
+func TestResolveRuntimeBroker_HubDefault(t *testing.T) {
+	tests := []struct {
+		name string
+		// setup configures brokers, providers, and hub defaults and returns
+		// the project to resolve against.
+		setup func(t *testing.T, srv *Server, s store.Store) *store.Project
+		// wantBrokerID is the expected broker ID returned.
+		wantBrokerID string
+		// wantOK indicates whether resolveRuntimeBroker should succeed.
+		wantOK bool
+	}{
+		{
+			name: "hub_default_set_broker_available_and_dispatchable",
+			setup: func(t *testing.T, srv *Server, s store.Store) *store.Project {
+				ctx := context.Background()
+				broker := &store.RuntimeBroker{
+					ID:          tid("hub-def-broker-1"),
+					Name:        "Hub Default Broker",
+					Slug:        "hub-default-broker",
+					Status:      store.BrokerStatusOnline,
+					AutoProvide: true,
+				}
+				require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
+
+				project := &store.Project{
+					ID:   tid("hub-def-project-1"),
+					Slug: "hub-def-proj-1",
+					Name: "Hub Default Project 1",
+				}
+				require.NoError(t, s.CreateProject(ctx, project))
+
+				require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+					ProjectID:  project.ID,
+					BrokerID:   broker.ID,
+					BrokerName: broker.Name,
+					Status:     store.BrokerStatusOnline,
+				}))
+
+				setHubAgentDefaults(srv, opsettings.AgentDefaultsSettings{
+					DefaultRuntimeBroker: broker.ID,
+				})
+				return project
+			},
+			wantBrokerID: tid("hub-def-broker-1"),
+			wantOK:       true,
+		},
+		{
+			name: "hub_default_set_broker_offline_falls_through",
+			setup: func(t *testing.T, srv *Server, s store.Store) *store.Project {
+				ctx := context.Background()
+				// Broker exists but is offline — won't appear in available list.
+				broker := &store.RuntimeBroker{
+					ID:          tid("hub-def-broker-2"),
+					Name:        "Hub Default Broker Offline",
+					Slug:        "hub-default-broker-off",
+					Status:      store.BrokerStatusOffline,
+					AutoProvide: true,
+				}
+				require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
+
+				// Create a fallback online broker for auto-select.
+				fallback := &store.RuntimeBroker{
+					ID:          tid("hub-fb-broker-2"),
+					Name:        "Fallback Broker",
+					Slug:        "fallback-broker-2",
+					Status:      store.BrokerStatusOnline,
+					AutoProvide: true,
+				}
+				require.NoError(t, s.CreateRuntimeBroker(ctx, fallback))
+
+				project := &store.Project{
+					ID:   tid("hub-def-project-2"),
+					Slug: "hub-def-proj-2",
+					Name: "Hub Default Project 2",
+				}
+				require.NoError(t, s.CreateProject(ctx, project))
+
+				require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+					ProjectID:  project.ID,
+					BrokerID:   broker.ID,
+					BrokerName: broker.Name,
+					Status:     store.BrokerStatusOffline,
+				}))
+				require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+					ProjectID:  project.ID,
+					BrokerID:   fallback.ID,
+					BrokerName: fallback.Name,
+					Status:     store.BrokerStatusOnline,
+				}))
+
+				setHubAgentDefaults(srv, opsettings.AgentDefaultsSettings{
+					DefaultRuntimeBroker: broker.ID,
+				})
+				return project
+			},
+			// Hub default offline → not in availableBrokers → falls through
+			// to Case 3 (single online provider auto-select).
+			wantBrokerID: tid("hub-fb-broker-2"),
+			wantOK:       true,
+		},
+		{
+			name: "hub_default_set_broker_not_provider_for_project_falls_through",
+			setup: func(t *testing.T, srv *Server, s store.Store) *store.Project {
+				ctx := context.Background()
+				// Broker exists globally but is NOT a provider for the project.
+				notLinked := &store.RuntimeBroker{
+					ID:          tid("hub-def-broker-3"),
+					Name:        "Hub Default Broker NP",
+					Slug:        "hub-default-broker-np",
+					Status:      store.BrokerStatusOnline,
+					AutoProvide: true,
+				}
+				require.NoError(t, s.CreateRuntimeBroker(ctx, notLinked))
+
+				// This broker IS a provider.
+				linked := &store.RuntimeBroker{
+					ID:          tid("hub-prov-broker-3"),
+					Name:        "Provider Broker",
+					Slug:        "provider-broker-3",
+					Status:      store.BrokerStatusOnline,
+					AutoProvide: true,
+				}
+				require.NoError(t, s.CreateRuntimeBroker(ctx, linked))
+
+				project := &store.Project{
+					ID:   tid("hub-def-project-3"),
+					Slug: "hub-def-proj-3",
+					Name: "Hub Default Project 3",
+				}
+				require.NoError(t, s.CreateProject(ctx, project))
+
+				// Only link the provider broker.
+				require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+					ProjectID:  project.ID,
+					BrokerID:   linked.ID,
+					BrokerName: linked.Name,
+					Status:     store.BrokerStatusOnline,
+				}))
+
+				setHubAgentDefaults(srv, opsettings.AgentDefaultsSettings{
+					DefaultRuntimeBroker: notLinked.ID,
+				})
+				return project
+			},
+			// Hub default not in availableBrokers → falls through to Case 3
+			// (single provider auto-select).
+			wantBrokerID: tid("hub-prov-broker-3"),
+			wantOK:       true,
+		},
+		{
+			name: "hub_default_set_to_name_resolves_correctly",
+			setup: func(t *testing.T, srv *Server, s store.Store) *store.Project {
+				ctx := context.Background()
+				broker := &store.RuntimeBroker{
+					ID:          tid("hub-def-broker-4"),
+					Name:        "My Named Broker",
+					Slug:        "my-named-broker",
+					Status:      store.BrokerStatusOnline,
+					AutoProvide: true,
+				}
+				require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
+
+				project := &store.Project{
+					ID:   tid("hub-def-project-4"),
+					Slug: "hub-def-proj-4",
+					Name: "Hub Default Project 4",
+				}
+				require.NoError(t, s.CreateProject(ctx, project))
+
+				require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+					ProjectID:  project.ID,
+					BrokerID:   broker.ID,
+					BrokerName: broker.Name,
+					Status:     store.BrokerStatusOnline,
+				}))
+
+				// Set hub default to the broker's NAME (not ID).
+				setHubAgentDefaults(srv, opsettings.AgentDefaultsSettings{
+					DefaultRuntimeBroker: "My Named Broker",
+				})
+				return project
+			},
+			wantBrokerID: tid("hub-def-broker-4"),
+			wantOK:       true,
+		},
+		{
+			name: "hub_default_empty_no_op_falls_through",
+			setup: func(t *testing.T, srv *Server, s store.Store) *store.Project {
+				ctx := context.Background()
+				broker := &store.RuntimeBroker{
+					ID:          tid("hub-def-broker-5"),
+					Name:        "Solo Broker",
+					Slug:        "solo-broker-5",
+					Status:      store.BrokerStatusOnline,
+					AutoProvide: true,
+				}
+				require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
+
+				project := &store.Project{
+					ID:   tid("hub-def-project-5"),
+					Slug: "hub-def-proj-5",
+					Name: "Hub Default Project 5",
+				}
+				require.NoError(t, s.CreateProject(ctx, project))
+
+				require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+					ProjectID:  project.ID,
+					BrokerID:   broker.ID,
+					BrokerName: broker.Name,
+					Status:     store.BrokerStatusOnline,
+				}))
+
+				// Hub default is empty → Case 2.5 skipped entirely.
+				setHubAgentDefaults(srv, opsettings.AgentDefaultsSettings{
+					DefaultRuntimeBroker: "",
+				})
+				return project
+			},
+			// Empty hub default → skip Case 2.5, fall through to Case 3
+			// (single provider auto-select).
+			wantBrokerID: tid("hub-def-broker-5"),
+			wantOK:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, s := testServer(t)
+			project := tt.setup(t, srv, s)
+
+			// Create a dev user identity for the context (admin, can dispatch).
+			devUser := NewDevUser(DevUserConfig{
+				Username:    "dev",
+				DisplayName: "Development User",
+				Email:       "dev@localhost",
+			})
+			ctx := contextWithIdentity(context.Background(), devUser)
+
+			w := httptest.NewRecorder()
+			brokerID, err := srv.resolveRuntimeBroker(ctx, w, "", project)
+
+			if tt.wantOK {
+				assert.NoError(t, err, "resolveRuntimeBroker should succeed")
+				assert.Equal(t, tt.wantBrokerID, brokerID, "unexpected broker ID")
+			} else {
+				assert.Error(t, err, "resolveRuntimeBroker should fail")
+				assert.Empty(t, brokerID, "broker ID should be empty on failure")
+			}
+		})
+	}
+}
+
+// TestResolveRuntimeBroker_HubDefaultSilentFallthrough verifies the key design
+// asymmetry: the hub default SILENTLY falls through when unavailable, while the
+// project default (Case 2) errors.
+func TestResolveRuntimeBroker_HubDefaultSilentFallthrough(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	// Create an offline broker to set as hub default.
+	offlineBroker := &store.RuntimeBroker{
+		ID:          tid("hub-off-broker"),
+		Name:        "Offline Hub Default",
+		Slug:        "offline-hub-default",
+		Status:      store.BrokerStatusOffline,
+		AutoProvide: true,
+	}
+	require.NoError(t, s.CreateRuntimeBroker(ctx, offlineBroker))
+
+	// Create an online fallback broker.
+	onlineBroker := &store.RuntimeBroker{
+		ID:          tid("hub-on-fallback"),
+		Name:        "Online Fallback",
+		Slug:        "online-fallback",
+		Status:      store.BrokerStatusOnline,
+		AutoProvide: true,
+	}
+	require.NoError(t, s.CreateRuntimeBroker(ctx, onlineBroker))
+
+	project := &store.Project{
+		ID:   tid("hub-ft-project"),
+		Slug: "hub-ft-proj",
+		Name: "Hub Fallthrough Project",
+	}
+	require.NoError(t, s.CreateProject(ctx, project))
+
+	// Link both brokers (offline one won't appear in available list).
+	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+		ProjectID:  project.ID,
+		BrokerID:   offlineBroker.ID,
+		BrokerName: offlineBroker.Name,
+		Status:     store.BrokerStatusOffline,
+	}))
+	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+		ProjectID:  project.ID,
+		BrokerID:   onlineBroker.ID,
+		BrokerName: onlineBroker.Name,
+		Status:     store.BrokerStatusOnline,
+	}))
+
+	// Set hub default to the OFFLINE broker.
+	setHubAgentDefaults(srv, opsettings.AgentDefaultsSettings{
+		DefaultRuntimeBroker: offlineBroker.ID,
+	})
+
+	devUser := NewDevUser(DevUserConfig{
+		Username:    "dev",
+		DisplayName: "Development User",
+		Email:       "dev@localhost",
+	})
+	authedCtx := contextWithIdentity(ctx, devUser)
+
+	// Hub default is offline → SILENT fall-through → picks online broker.
+	w := httptest.NewRecorder()
+	brokerID, err := srv.resolveRuntimeBroker(authedCtx, w, "", project)
+	assert.NoError(t, err, "hub default should silently fall through, not error")
+	assert.Equal(t, onlineBroker.ID, brokerID, "should fall through to online broker")
+
+	// Now test the CONTRAST: project default ERRORS on unavailability.
+	project.DefaultRuntimeBrokerID = offlineBroker.ID
+	require.NoError(t, s.UpdateProject(ctx, project))
+	setHubAgentDefaults(srv, opsettings.AgentDefaultsSettings{})
+
+	w2 := httptest.NewRecorder()
+	brokerID2, err2 := srv.resolveRuntimeBroker(authedCtx, w2, "", project)
+	assert.Error(t, err2, "project default should error when unavailable")
+	assert.Empty(t, brokerID2, "broker ID should be empty when project default errors")
+}
+
+// TestResolveRuntimeBroker_HubDefaultBySlug verifies that the hub default
+// broker can be specified by slug and resolved correctly.
+func TestResolveRuntimeBroker_HubDefaultBySlug(t *testing.T) {
+	srv, s := testServer(t)
+	ctx := context.Background()
+
+	broker := &store.RuntimeBroker{
+		ID:          tid("hub-slug-broker"),
+		Name:        "Slug Test Broker",
+		Slug:        "slug-test-broker",
+		Status:      store.BrokerStatusOnline,
+		AutoProvide: true,
+	}
+	require.NoError(t, s.CreateRuntimeBroker(ctx, broker))
+
+	project := &store.Project{
+		ID:   tid("hub-slug-project"),
+		Slug: "hub-slug-proj",
+		Name: "Hub Slug Project",
+	}
+	require.NoError(t, s.CreateProject(ctx, project))
+
+	require.NoError(t, s.AddProjectProvider(ctx, &store.ProjectProvider{
+		ProjectID:  project.ID,
+		BrokerID:   broker.ID,
+		BrokerName: broker.Name,
+		Status:     store.BrokerStatusOnline,
+	}))
+
+	// Set hub default by SLUG.
+	setHubAgentDefaults(srv, opsettings.AgentDefaultsSettings{
+		DefaultRuntimeBroker: "slug-test-broker",
+	})
+
+	devUser := NewDevUser(DevUserConfig{
+		Username:    "dev",
+		DisplayName: "Development User",
+		Email:       "dev@localhost",
+	})
+	authedCtx := contextWithIdentity(ctx, devUser)
+
+	w := httptest.NewRecorder()
+	brokerID, err := srv.resolveRuntimeBroker(authedCtx, w, "", project)
+
+	assert.NoError(t, err)
+	assert.Equal(t, broker.ID, brokerID, "should resolve hub default by slug")
+}
+
+// TestHasAnyKey_ProgenySecretResolution verifies that hasAnyKey correctly finds
+// allowProgeny secrets inherited through a progeny agent's ancestry chain.
+func TestHasAnyKey_ProgenySecretResolution(t *testing.T) {
+	srv, st := testServer(t)
+	ctx := context.Background()
+
+	userID := tid("hak-user-1")
+	parentAgentID := tid("hak-parent-agent")
+	childAgentID := tid("hak-child-agent")
+
+	// Create a user-scoped secret with AllowProgeny=true, created by the user.
+	require.NoError(t, st.CreateSecret(ctx, &store.Secret{
+		ID:             tid("sec-progeny-apikey"),
+		Key:            "ANTHROPIC_API_KEY",
+		EncryptedValue: "encrypted-value",
+		SecretType:     store.SecretTypeEnvironment,
+		Scope:          store.ScopeUser,
+		ScopeID:        userID,
+		AllowProgeny:   true,
+		CreatedBy:      userID,
+		InjectionMode:  store.InjectionModeAsNeeded,
+	}))
+
+	t.Run("progeny agent finds inherited secret", func(t *testing.T) {
+		agent := &store.Agent{
+			ID:            childAgentID,
+			OwnerID:       parentAgentID, // Not the user — this is the bug scenario
+			Ancestry:      []string{childAgentID, parentAgentID, userID},
+			AppliedConfig: &store.AgentAppliedConfig{},
+		}
+
+		found, err := srv.hasAnyKey(ctx, agent, []string{"ANTHROPIC_API_KEY"})
+		require.NoError(t, err)
+		assert.True(t, found,
+			"progeny agent should find allowProgeny secret via ancestry")
+	})
+
+	t.Run("direct agent finds own secret", func(t *testing.T) {
+		agent := &store.Agent{
+			ID:            tid("hak-direct-agent"),
+			OwnerID:       userID, // Direct user ownership
+			Ancestry:      []string{tid("hak-direct-agent")},
+			AppliedConfig: &store.AgentAppliedConfig{},
+		}
+
+		found, err := srv.hasAnyKey(ctx, agent, []string{"ANTHROPIC_API_KEY"})
+		require.NoError(t, err)
+		assert.True(t, found,
+			"direct agent should find secret via OwnerID lookup")
+	})
+
+	t.Run("progeny agent without matching secret returns false", func(t *testing.T) {
+		agent := &store.Agent{
+			ID:            childAgentID,
+			OwnerID:       parentAgentID,
+			Ancestry:      []string{childAgentID, parentAgentID, userID},
+			AppliedConfig: &store.AgentAppliedConfig{},
+		}
+
+		found, err := srv.hasAnyKey(ctx, agent, []string{"NONEXISTENT_KEY"})
+		require.NoError(t, err)
+		assert.False(t, found,
+			"progeny agent should not find nonexistent key")
+	})
+}
+
+// TestHasAnyKey_ProgenyEnvVarResolution verifies that hasAnyKey correctly finds
+// allowProgeny env vars inherited through a progeny agent's ancestry chain.
+func TestHasAnyKey_ProgenyEnvVarResolution(t *testing.T) {
+	srv, st := testServer(t)
+	ctx := context.Background()
+
+	userID := tid("hak-ev-user-1")
+	parentAgentID := tid("hak-ev-parent-agent")
+	childAgentID := tid("hak-ev-child-agent")
+
+	// Create a user-scoped env var with AllowProgeny=true.
+	require.NoError(t, st.CreateEnvVar(ctx, &store.EnvVar{
+		ID:            tid("ev-progeny-key"),
+		Key:           "GEMINI_API_KEY",
+		Value:         "gemini-value",
+		Scope:         store.ScopeUser,
+		ScopeID:       userID,
+		AllowProgeny:  true,
+		CreatedBy:     userID,
+		InjectionMode: store.InjectionModeAlways,
+	}))
+
+	t.Run("progeny agent finds inherited env var", func(t *testing.T) {
+		agent := &store.Agent{
+			ID:            childAgentID,
+			OwnerID:       parentAgentID,
+			Ancestry:      []string{childAgentID, parentAgentID, userID},
+			AppliedConfig: &store.AgentAppliedConfig{},
+		}
+
+		found, err := srv.hasAnyKey(ctx, agent, []string{"GEMINI_API_KEY"})
+		require.NoError(t, err)
+		assert.True(t, found,
+			"progeny agent should find allowProgeny env var via ancestry")
+	})
+}
+
+// TestHasAnyKey_NoProgenyForDirectAgent verifies that the progeny code path
+// does not fire for direct agents (ancestry length <= 1).
+func TestHasAnyKey_NoProgenyForDirectAgent(t *testing.T) {
+	srv, st := testServer(t)
+	ctx := context.Background()
+
+	userID := tid("hak-noprog-user")
+	otherUserID := tid("hak-noprog-other")
+
+	// Create a secret owned by otherUser with AllowProgeny=true.
+	require.NoError(t, st.CreateSecret(ctx, &store.Secret{
+		ID:             tid("sec-noprog"),
+		Key:            "SECRET_KEY",
+		EncryptedValue: "encrypted",
+		SecretType:     store.SecretTypeEnvironment,
+		Scope:          store.ScopeUser,
+		ScopeID:        otherUserID,
+		AllowProgeny:   true,
+		CreatedBy:      otherUserID,
+		InjectionMode:  store.InjectionModeAsNeeded,
+	}))
+
+	t.Run("direct agent does not use progeny path", func(t *testing.T) {
+		agent := &store.Agent{
+			ID:            tid("hak-noprog-agent"),
+			OwnerID:       userID, // Different from otherUser
+			Ancestry:      nil,    // No ancestry — direct agent
+			AppliedConfig: &store.AgentAppliedConfig{},
+		}
+
+		found, err := srv.hasAnyKey(ctx, agent, []string{"SECRET_KEY"})
+		require.NoError(t, err)
+		assert.False(t, found,
+			"direct agent should not find secrets via progeny resolution")
+	})
 }

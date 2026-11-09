@@ -1,0 +1,2028 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package hub
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	gouuid "github.com/google/uuid"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/experiments"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/authzop"
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
+)
+
+// ---------------------------------------------------------------------------
+// Request / Response types
+// ---------------------------------------------------------------------------
+
+// createRoleDefinitionRequest is the payload for POST /api/v1/admin/roles.
+type createRoleDefinitionRequest struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	ScopeType   string   `json:"scopeType"`
+	Permissions []string `json:"permissions"`
+}
+
+// updateRoleDefinitionRequest is the payload for PUT /api/v1/admin/roles/:id.
+type updateRoleDefinitionRequest struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Permissions []string `json:"permissions"`
+}
+
+// duplicateRoleDefinitionRequest is the payload for POST /api/v1/admin/roles/:id/duplicate.
+type duplicateRoleDefinitionRequest struct {
+	Name string `json:"name"`
+}
+
+// createRoleBindingRequest is the payload for POST /api/v1/admin/role-bindings.
+type createRoleBindingRequest struct {
+	RoleDefinitionID string     `json:"roleDefinitionId"`
+	PrincipalType    string     `json:"principalType"`
+	PrincipalID      string     `json:"principalId"`
+	ScopeType        string     `json:"scopeType"`
+	ScopeID          string     `json:"scopeId"`
+	NotBefore        *time.Time `json:"notBefore,omitempty"`
+	ExpiresAt        *time.Time `json:"expiresAt,omitempty"`
+}
+
+// listRoleDefinitionsResponse wraps the list result for the API.
+type listRoleDefinitionsResponse struct {
+	Items      []*store.RoleDefinition `json:"items"`
+	TotalCount int                     `json:"totalCount"`
+}
+
+// RoleBindingInfo is a role binding enriched with human-friendly display info.
+type RoleBindingInfo struct {
+	store.RoleBinding
+	RoleName             string `json:"roleName,omitempty"`
+	PrincipalDisplayName string `json:"principalDisplayName,omitempty"`
+	ScopeDisplayName     string `json:"scopeDisplayName,omitempty"`
+	CreatedByDisplayName string `json:"createdByDisplayName,omitempty"`
+	// Source indicates how the binding was obtained: "direct" for bindings
+	// assigned directly to the queried principal, or the group ID for
+	// bindings inherited via group membership.  Only populated when the
+	// request filters by principalType+principalId.
+	Source string `json:"source,omitempty"`
+	// SourceGroupName is the human-friendly group display name when Source
+	// is a group ID (not "direct").
+	SourceGroupName string `json:"sourceGroupName,omitempty"`
+}
+
+// listRoleBindingsResponse wraps the list result for the API.
+type listRoleBindingsResponse struct {
+	Items      []RoleBindingInfo `json:"items"`
+	TotalCount int               `json:"totalCount"`
+}
+
+// listPermissionsResponse wraps the permissions registry for the API.
+type listPermissionsResponse struct {
+	Items      []permissions.Permission `json:"items"`
+	TotalCount int                      `json:"totalCount"`
+}
+
+// exportedRole is the portable representation of a custom role definition.
+type exportedRole struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	ScopeType   string   `json:"scopeType"`
+	Permissions []string `json:"permissions"`
+}
+
+// roleExportResponse is the envelope for GET /api/v1/admin/roles/export.
+type roleExportResponse struct {
+	Version    string         `json:"version"`
+	ExportedAt string         `json:"exportedAt"`
+	Roles      []exportedRole `json:"roles"`
+}
+
+// roleImportRequest is the payload for POST /api/v1/admin/roles/import.
+type roleImportRequest struct {
+	Version string         `json:"version"`
+	Roles   []exportedRole `json:"roles"`
+}
+
+// roleImportResultItem describes the outcome for a single role in an import.
+type roleImportResultItem struct {
+	Name   string `json:"name"`
+	Status string `json:"status"` // "created", "skipped", "error"
+	Reason string `json:"reason,omitempty"`
+	ID     string `json:"id,omitempty"`
+}
+
+// roleImportResponse is the response for POST /api/v1/admin/roles/import.
+type roleImportResponse struct {
+	Created int                    `json:"created"`
+	Skipped int                    `json:"skipped"`
+	Errors  int                    `json:"errors"`
+	Items   []roleImportResultItem `json:"items"`
+}
+
+// safeFilename replaces any characters unsafe for Content-Disposition filenames.
+// After sanitization the result is truncated so that the full filename
+// (prefix "scion-role-" + sanitized name + ".json") stays within 200
+// bytes — well under the 255-byte filesystem limit and safe for all
+// major browsers and operating systems.
+var unsafeFilenameChars = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
+
+// maxSanitizedNameLen caps the sanitized role-name segment so the full
+// attachment filename ("scion-role-" + name + ".json") fits comfortably
+// within 255 bytes.  200 − len("scion-role-") − len(".json") = 184.
+const maxSanitizedNameLen = 184
+
+func sanitizeFilename(name string) string {
+	safe := unsafeFilenameChars.ReplaceAllString(name, "_")
+	// Trim leading/trailing underscores and dots left over from
+	// replacement so the result is clean.
+	safe = strings.Trim(safe, "_.")
+	if safe == "" {
+		safe = "role"
+	}
+	if len(safe) > maxSanitizedNameLen {
+		safe = safe[:maxSanitizedNameLen]
+		// Avoid a trailing dot or underscore after truncation.
+		safe = strings.TrimRight(safe, "_.")
+		if safe == "" {
+			safe = "role"
+		}
+	}
+	return safe
+}
+
+// ---------------------------------------------------------------------------
+// Route handlers: Role Definitions
+// ---------------------------------------------------------------------------
+
+// handleAdminRoles handles GET (list) and POST (create) on
+// /api/v1/admin/roles.
+// Authorization: route guard checks role.read for GET.
+// POST requires role.create via inline Decide.
+func (s *Server) handleAdminRoles(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.listRoleDefinitions(w, r)
+	case http.MethodPost:
+		user, ok := s.requireWritePermissionForRole(w, r, "role.create", "create")
+		if !ok {
+			return
+		}
+		s.createRoleDefinition(w, r, user)
+	default:
+		MethodNotAllowed(w, http.MethodGet, http.MethodPost)
+	}
+}
+
+// handleAdminRoleByID handles GET / PUT / DELETE on
+// /api/v1/admin/roles/:id, GET on /api/v1/admin/roles/:id/export,
+// and POST on /api/v1/admin/roles/:id/duplicate.
+func (s *Server) handleAdminRoleByID(w http.ResponseWriter, r *http.Request) {
+	id, action := extractAction(r, "/api/v1/admin/roles")
+	if id == "" {
+		BadRequest(w, "role definition ID is required")
+		return
+	}
+
+	// Sub-resource action: GET /api/v1/admin/roles/:id/export
+	if action == "export" {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			MethodNotAllowed(w, http.MethodGet, http.MethodHead)
+			return
+		}
+		s.exportSingleRole(w, r, id)
+		return
+	}
+
+	// Sub-resource action: POST /api/v1/admin/roles/:id/duplicate
+	if action == "duplicate" {
+		if r.Method != http.MethodPost {
+			MethodNotAllowed(w, http.MethodPost)
+			return
+		}
+		user, ok := s.requireWritePermissionForRole(w, r, "role.create", "create")
+		if !ok {
+			return
+		}
+		s.duplicateRoleDefinition(w, r, id, user)
+		return
+	}
+
+	if action != "" {
+		NotFound(w, "Route")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		s.getRoleDefinition(w, r, id)
+	case http.MethodPut:
+		user, ok := s.requireWritePermissionForRole(w, r, "role.update", "update")
+		if !ok {
+			return
+		}
+		s.updateRoleDefinition(w, r, id, user)
+	case http.MethodDelete:
+		user, ok := s.requireWritePermissionForRole(w, r, "role.delete", "delete")
+		if !ok {
+			return
+		}
+		s.deleteRoleDefinition(w, r, id, user)
+	default:
+		MethodNotAllowed(w, http.MethodGet, http.MethodPut, http.MethodDelete)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Route handlers: Role Bindings
+// ---------------------------------------------------------------------------
+
+// handleAdminRoleBindings handles GET (list) and POST (create) on
+// /api/v1/admin/role-bindings.
+//
+// Authorization is scope-aware:
+//
+//   - GET requires role_binding.read at hub scope (inline check —
+//     the route guard is RouteAuthenticated, not RouteHubAdmin, because
+//     POST needs scope-dependent auth).
+//
+//   - POST for project-scoped requests defers authorization to
+//     ProjectMembershipService, which checks project.manage + the
+//     governance matrix. This allows project owners (who lack hub-level
+//     role_binding.create) to manage their project's membership.
+//
+//   - POST for system-scoped requests requires role_binding.create at
+//     hub scope (super-admin / hub-admin only).
+func (s *Server) handleAdminRoleBindings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		// Inline authorization: role_binding.read on the hub-level role
+		// binding records.
+		if !s.authorize(w, r, hubScopedResource("role_binding", "hub"), ActionRead) {
+			return
+		}
+		s.listRoleBindings(w, r)
+	case http.MethodPost:
+		s.createRoleBindingScopeAware(w, r)
+	default:
+		MethodNotAllowed(w, http.MethodGet, http.MethodPost)
+	}
+}
+
+// createRoleBindingScopeAware is the POST entry point for
+// /api/v1/admin/role-bindings. It peeks at the request body to determine
+// the scope and applies scope-appropriate authorization:
+//
+//   - Project-scoped requests skip the hub-level role_binding.create check.
+//     Authorization is delegated to ProjectMembershipService which checks
+//     project.manage and the governance matrix. This allows project owners
+//     (who lack hub-level role_binding.create) to manage their project's
+//     membership through the admin API.
+//
+//   - System-scoped requests require role_binding.create at hub scope —
+//     same as before.
+func (s *Server) createRoleBindingScopeAware(w http.ResponseWriter, r *http.Request) {
+	// Read body so we can peek at scope and replay for createRoleBinding.
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		BadRequest(w, "failed to read request body")
+		return
+	}
+	_ = r.Body.Close()
+
+	// Lightweight peek: unmarshal just enough to know scope and role.
+	var peek struct {
+		ScopeType        string `json:"scopeType"`
+		RoleDefinitionID string `json:"roleDefinitionId"`
+	}
+	if err := json.Unmarshal(bodyBytes, &peek); err != nil {
+		BadRequest(w, "invalid request body: "+err.Error())
+		return
+	}
+
+	// Extract identity (required for both paths).
+	identity := GetIdentityFromContext(r.Context())
+	if identity == nil {
+		writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "authentication required", nil)
+		return
+	}
+	user, ok := identity.(UserIdentity)
+	if !ok {
+		Forbidden(w)
+		return
+	}
+
+	// Authorization routing:
+	// - Built-in project roles (owner/admin/member) are authorized by the
+	//   membership service (project.manage + governance matrix) — no hub-level
+	//   role_binding.create needed. This allows project owners to manage
+	//   members via the admin API.
+	// - Custom project-scoped roles and system-scoped requests require
+	//   hub-level role_binding.create permission.
+	requireHubAuth := peek.ScopeType != store.RoleScopeProject
+	if peek.ScopeType == store.RoleScopeProject && peek.RoleDefinitionID != "" {
+		// Check if this is a built-in project role.
+		// A missing role is refused by createRoleBinding; any other lookup
+		// error answers 500 before an admission decision.
+		roleDef, err := s.store.GetRoleDefinition(r.Context(), peek.RoleDefinitionID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusInternalServerError, "internal_error", "failed to load role definition", nil)
+			return
+		}
+		if err == nil && !store.IsBuiltInProjectMembershipRoleDef(roleDef) {
+			// Custom project role — require hub-level auth.
+			requireHubAuth = true
+		}
+	}
+
+	if requireHubAuth {
+		if s.authzService != nil {
+			decision := s.authzService.Decide(r.Context(), AuthzRequest{
+				Principal:  principalContextForIdentity(user),
+				Credential: credentialContextForIdentity(user),
+				Resource:   hubScopedResource("role_binding", "hub"),
+				Action:     Action("create"),
+				Permission: "role_binding.create",
+			})
+			if !decision.Allowed {
+				writeForbiddenStructured(w, "", "role_binding", Action("create"))
+				return
+			}
+		}
+	}
+
+	// Replay the body so createRoleBinding can parse it normally.
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	s.createRoleBinding(w, r, user)
+}
+
+// handleAdminRoleBindingByID handles DELETE on /api/v1/admin/role-bindings/:id
+// and GET on /api/v1/admin/role-bindings/user/:userID.
+func (s *Server) handleAdminRoleBindingByID(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/role-bindings/")
+	path = strings.TrimSuffix(path, "/")
+
+	// Handle user-specific binding lookup.
+	if strings.HasPrefix(path, "user/") {
+		userID := strings.TrimPrefix(path, "user/")
+		if userID == "" {
+			BadRequest(w, "user ID is required")
+			return
+		}
+		if r.Method != http.MethodGet {
+			MethodNotAllowed(w, http.MethodGet)
+			return
+		}
+		// Inline authorization: role_binding.read on the hub-level role
+		// binding records. Structured denial with resource_type +
+		// denied_action.
+		if !s.authorize(w, r, hubScopedResource("role_binding", "hub"), ActionRead) {
+			return
+		}
+		s.listBindingsForUser(w, r, userID)
+		return
+	}
+
+	// Otherwise it's a binding ID.
+	id := path
+	if id == "" {
+		BadRequest(w, "role binding ID is required")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodDelete:
+		user, ok := s.authorizeRoleBindingDelete(w, r, id)
+		if !ok {
+			return
+		}
+		s.deleteRoleBinding(w, r, id, user)
+	default:
+		MethodNotAllowed(w, http.MethodDelete)
+	}
+}
+
+// authorizeRoleBindingDelete admits the caller of DELETE
+// /api/v1/admin/role-bindings/{id}. A project-scoped binding is removed
+// under project governance: the project-scope branch runs first, and a
+// caller holding project.manage on the binding's project (a session, or a
+// user access token whose selectors and boundary allow it) goes straight
+// to the project membership service, which applies the governance matrix,
+// the direct-owner rule and last-owner protection. Any other caller of a
+// project-scoped binding, and every caller of a system-scoped, missing or
+// unreadable binding, must hold role_binding.delete at hub scope.
+func (s *Server) authorizeRoleBindingDelete(w http.ResponseWriter, r *http.Request, id string) (UserIdentity, bool) {
+	ctx := r.Context()
+	identity := GetIdentityFromContext(ctx)
+	if identity == nil {
+		writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "authentication required", nil)
+		return nil, false
+	}
+	user, ok := identity.(UserIdentity)
+	if !ok {
+		Forbidden(w)
+		return nil, false
+	}
+	if s.authzService == nil {
+		Forbidden(w)
+		return nil, false
+	}
+	binding, err := s.store.GetRoleBinding(ctx, id)
+	if err == nil && binding.ScopeType == store.RoleScopeProject && binding.ScopeID != "" {
+		if s.authzService.CheckAccess(ctx, user, Resource{Type: "project", ID: binding.ScopeID}, ActionManage).Allowed {
+			return user, true
+		}
+	}
+	return s.requireWritePermissionForRoleBinding(w, r, "role_binding.delete", "delete")
+}
+
+// ---------------------------------------------------------------------------
+// Route handler: Permissions Registry
+// ---------------------------------------------------------------------------
+
+// handleAdminPermissions handles GET on /api/v1/admin/permissions.
+func (s *Server) handleAdminPermissions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		MethodNotAllowed(w, http.MethodGet)
+		return
+	}
+	s.listPermissions(w, r)
+}
+
+// ---------------------------------------------------------------------------
+// CRUD: Role Definitions
+// ---------------------------------------------------------------------------
+
+// roleDefinitionHidden reports whether def is left out of the role
+// definition API: a role that does not confer membership (project-visitor)
+// is shown only while the federation.project_visitors experiment is on.
+func (s *Server) roleDefinitionHidden(def *store.RoleDefinition) bool {
+	return def != nil && !def.ConfersProjectMembership() &&
+		!s.experimentEnabled(experiments.FederationProjectVisitors)
+}
+
+func (s *Server) listRoleDefinitions(w http.ResponseWriter, r *http.Request) {
+	all, err := s.store.ListRoleDefinitions(r.Context())
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+	defs := make([]*store.RoleDefinition, 0, len(all))
+	for _, d := range all {
+		if !s.roleDefinitionHidden(d) {
+			defs = append(defs, d)
+		}
+	}
+	writeJSON(w, http.StatusOK, listRoleDefinitionsResponse{
+		Items:      defs,
+		TotalCount: len(defs),
+	})
+}
+
+func (s *Server) getRoleDefinition(w http.ResponseWriter, r *http.Request, id string) {
+	def, err := s.store.GetRoleDefinition(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			NotFound(w, "Role Definition")
+			return
+		}
+		writeErrorFromErr(w, err, "")
+		return
+	}
+	if s.roleDefinitionHidden(def) {
+		NotFound(w, "Role Definition")
+		return
+	}
+	writeJSON(w, http.StatusOK, def)
+}
+
+func (s *Server) createRoleDefinition(w http.ResponseWriter, r *http.Request, user UserIdentity) {
+	var req createRoleDefinitionRequest
+	if err := readJSON(r, &req); err != nil {
+		BadRequest(w, "invalid request body: "+err.Error())
+		return
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		BadRequest(w, "name is required")
+		return
+	}
+
+	if req.ScopeType != store.RoleScopeSystem && req.ScopeType != store.RoleScopeProject {
+		BadRequest(w, "scopeType must be \"system\" or \"project\"")
+		return
+	}
+
+	// Validate permissions against registry.
+	if err := validateRolePermissionIDs(req.Permissions); err != nil {
+		BadRequest(w, err.Error())
+		return
+	}
+
+	// CanDelegate check: actor must hold all permissions in the custom role.
+	if s.authzService != nil {
+		decision := s.authzService.CanDelegate(r.Context(), user, GrantDescriptor{
+			Type:                  GrantTypeCustomRole,
+			CustomRolePermissions: req.Permissions,
+			ScopeType:             req.ScopeType,
+		})
+		if !decision.Allowed {
+			writeForbidden(w, "cannot create role: "+decision.Reason)
+			return
+		}
+	}
+
+	rd := &store.RoleDefinition{
+		Name:        req.Name,
+		Description: req.Description,
+		ScopeType:   req.ScopeType,
+		Permissions: req.Permissions,
+		System:      false, // Only seed creates system roles.
+	}
+
+	created, err := s.store.CreateRoleDefinition(r.Context(), rd)
+	if err != nil {
+		if errors.Is(err, store.ErrAlreadyExists) {
+			Conflict(w, "a role definition with this name and scope already exists")
+			return
+		}
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	slog.Info("role definition created",
+		"role_id", created.ID, "name", created.Name, "actor", user.Email())
+
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (s *Server) updateRoleDefinition(w http.ResponseWriter, r *http.Request, id string, user UserIdentity) {
+	var req updateRoleDefinitionRequest
+	if err := readJSON(r, &req); err != nil {
+		BadRequest(w, "invalid request body: "+err.Error())
+		return
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		BadRequest(w, "name is required")
+		return
+	}
+
+	// Fetch existing to check system flag.
+	existing, err := s.store.GetRoleDefinition(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			NotFound(w, "Role Definition")
+			return
+		}
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	if existing.System {
+		writeForbidden(w, "system roles cannot be modified")
+		return
+	}
+
+	// Validate permissions against registry.
+	if err := validateRolePermissionIDs(req.Permissions); err != nil {
+		BadRequest(w, err.Error())
+		return
+	}
+
+	// CanDelegate check: actor must hold all permissions in the updated role.
+	if s.authzService != nil {
+		decision := s.authzService.CanDelegate(r.Context(), user, GrantDescriptor{
+			Type:                  GrantTypeCustomRole,
+			CustomRolePermissions: req.Permissions,
+			ScopeType:             existing.ScopeType,
+		})
+		if !decision.Allowed {
+			writeForbidden(w, "cannot update role: "+decision.Reason)
+			return
+		}
+	}
+
+	existing.Name = req.Name
+	existing.Description = req.Description
+	existing.Permissions = req.Permissions
+
+	updated, err := s.store.UpdateRoleDefinition(r.Context(), existing)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			NotFound(w, "Role Definition")
+			return
+		}
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	s.publishConduitAuthzChanged(conduitAuthzMatch{})
+	slog.Info("role definition updated",
+		"role_id", updated.ID, "name", updated.Name, "actor", user.Email())
+
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) deleteRoleDefinition(w http.ResponseWriter, r *http.Request, id string, user UserIdentity) {
+	// Fetch first to check system flag and include name in logs.
+	def, err := s.store.GetRoleDefinition(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			NotFound(w, "Role Definition")
+			return
+		}
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	if def.System {
+		writeForbidden(w, "system roles cannot be deleted")
+		return
+	}
+
+	if err := s.store.DeleteRoleDefinition(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			NotFound(w, "Role Definition")
+			return
+		}
+		if errors.Is(err, store.ErrInvalidInput) {
+			Conflict(w, err.Error())
+			return
+		}
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	s.publishConduitAuthzChanged(conduitAuthzMatch{})
+	slog.Info("role definition deleted",
+		"role_id", def.ID, "name", def.Name, "actor", user.Email())
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) duplicateRoleDefinition(w http.ResponseWriter, r *http.Request, sourceID string, user UserIdentity) {
+	var req duplicateRoleDefinitionRequest
+	if err := readJSON(r, &req); err != nil {
+		BadRequest(w, "invalid request body: "+err.Error())
+		return
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		BadRequest(w, "name is required")
+		return
+	}
+
+	// Fetch source role (works for both system and custom roles).
+	source, err := s.store.GetRoleDefinition(r.Context(), sourceID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			NotFound(w, "Role Definition")
+			return
+		}
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	// Validate permissions against registry (source may reference
+	// permissions that were removed since seeding; reject if so).
+	if err := validateRolePermissionIDs(source.Permissions); err != nil {
+		BadRequest(w, err.Error())
+		return
+	}
+
+	// CanDelegate check: actor must hold all permissions in the duplicated role.
+	if s.authzService != nil {
+		decision := s.authzService.CanDelegate(r.Context(), user, GrantDescriptor{
+			Type:                  GrantTypeCustomRole,
+			CustomRolePermissions: source.Permissions,
+			ScopeType:             source.ScopeType,
+		})
+		if !decision.Allowed {
+			writeForbidden(w, "cannot duplicate role: "+decision.Reason)
+			return
+		}
+	}
+
+	rd := &store.RoleDefinition{
+		Name:        req.Name,
+		Description: source.Description,
+		ScopeType:   source.ScopeType,
+		Permissions: source.Permissions,
+		System:      false, // Duplicates are always custom roles.
+	}
+
+	created, err := s.store.CreateRoleDefinition(r.Context(), rd)
+	if err != nil {
+		if errors.Is(err, store.ErrAlreadyExists) {
+			Conflict(w, "a role definition with this name and scope already exists")
+			return
+		}
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	slog.Info("role definition duplicated",
+		"source_id", sourceID, "new_role_id", created.ID,
+		"name", created.Name, "actor", user.Email())
+
+	writeJSON(w, http.StatusCreated, created)
+}
+
+// ---------------------------------------------------------------------------
+// Export / Import: Role Definitions
+// ---------------------------------------------------------------------------
+
+// handleAdminRolesExport handles GET/HEAD on /api/v1/admin/roles/export.
+// Returns all custom (non-system) role definitions as a downloadable JSON file.
+// Authorization: route guard checks role.read.
+func (s *Server) handleAdminRolesExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		MethodNotAllowed(w, http.MethodGet, http.MethodHead)
+		return
+	}
+	s.exportRoleDefinitions(w, r)
+}
+
+// handleAdminRolesImport handles POST on /api/v1/admin/roles/import.
+// Authorization: route guard checks role.read; inline check requires role.create.
+func (s *Server) handleAdminRolesImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		MethodNotAllowed(w, http.MethodPost)
+		return
+	}
+	user, ok := s.requireWritePermissionForRole(w, r, "role.create", "create")
+	if !ok {
+		return
+	}
+	s.importRoleDefinitions(w, r, user)
+}
+
+// exportRoleDefinitions writes all custom (non-system) role definitions as a
+// downloadable JSON attachment in the portable envelope format.
+func (s *Server) exportRoleDefinitions(w http.ResponseWriter, r *http.Request) {
+	defs, err := s.store.ListRoleDefinitions(r.Context())
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	var roles []exportedRole
+	for _, d := range defs {
+		if d.System {
+			continue
+		}
+		roles = append(roles, exportedRole{
+			Name:        d.Name,
+			Description: d.Description,
+			ScopeType:   d.ScopeType,
+			Permissions: d.Permissions,
+		})
+	}
+	if roles == nil {
+		roles = []exportedRole{}
+	}
+
+	envelope := roleExportResponse{
+		Version:    "1",
+		ExportedAt: time.Now().UTC().Format(time.RFC3339),
+		Roles:      roles,
+	}
+
+	data, err := json.MarshalIndent(envelope, "", "  ")
+	if err != nil {
+		slog.Error("failed to marshal role export", "error", err)
+		writeErrorFromErr(w, fmt.Errorf("failed to serialize roles: %w", err), "")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", `attachment; filename="scion-custom-roles.json"`)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(data)
+	}
+}
+
+// exportSingleRole writes a single custom role definition as a downloadable
+// JSON attachment. System roles are rejected with 422.
+func (s *Server) exportSingleRole(w http.ResponseWriter, r *http.Request, id string) {
+	def, err := s.store.GetRoleDefinition(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			NotFound(w, "Role Definition")
+			return
+		}
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	if def.System {
+		writeError(w, http.StatusUnprocessableEntity, "system_role",
+			"System roles cannot be exported; only custom roles may be exported.", nil)
+		return
+	}
+
+	envelope := roleExportResponse{
+		Version:    "1",
+		ExportedAt: time.Now().UTC().Format(time.RFC3339),
+		Roles: []exportedRole{{
+			Name:        def.Name,
+			Description: def.Description,
+			ScopeType:   def.ScopeType,
+			Permissions: def.Permissions,
+		}},
+	}
+
+	data, err := json.MarshalIndent(envelope, "", "  ")
+	if err != nil {
+		slog.Error("failed to marshal role export", "error", err)
+		writeErrorFromErr(w, fmt.Errorf("failed to serialize role: %w", err), "")
+		return
+	}
+
+	filename := sanitizeFilename(def.Name)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="scion-role-%s.json"`, filename))
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(data)
+	}
+}
+
+// systemRoleNames is the set of built-in role names that cannot be imported.
+var systemRoleNames = map[string]bool{
+	store.SystemRoleSuperAdmin: true,
+	store.SystemRoleHubAdmin:   true,
+	store.SystemRoleHubMember:  true,
+	store.SystemRoleHubViewer:  true,
+	store.ProjectRoleOwner:     true,
+	store.ProjectRoleAdmin:     true,
+	store.ProjectRoleMember:    true,
+	store.ProjectRoleViewer:    true,
+	store.AgentRoleDefNone:     true,
+	store.AgentRoleDefReadonly: true,
+	store.AgentRoleDefBaseline: true,
+	store.AgentRoleDefFull:     true,
+}
+
+// importRoleDefinitions creates custom role definitions from a portable JSON
+// export. System roles are rejected. Name conflicts with existing custom roles
+// are skipped (reported as "skipped"). Each role's permissions are validated
+// against the registry and checked via CanDelegate.
+func (s *Server) importRoleDefinitions(w http.ResponseWriter, r *http.Request, user UserIdentity) {
+	var req roleImportRequest
+	if err := readJSON(r, &req); err != nil {
+		BadRequest(w, "invalid request body: "+err.Error())
+		return
+	}
+
+	if req.Version != "1" {
+		BadRequest(w, "unsupported export version: expected \"1\"")
+		return
+	}
+
+	if len(req.Roles) == 0 {
+		BadRequest(w, "no roles to import")
+		return
+	}
+
+	resp := roleImportResponse{
+		Items: make([]roleImportResultItem, 0, len(req.Roles)),
+	}
+
+	for _, role := range req.Roles {
+		item := roleImportResultItem{Name: role.Name}
+
+		// Validate name.
+		name := strings.TrimSpace(role.Name)
+		if name == "" {
+			item.Status = "error"
+			item.Reason = "name is required"
+			resp.Errors++
+			resp.Items = append(resp.Items, item)
+			continue
+		}
+
+		// Reject system role names.
+		if systemRoleNames[name] {
+			item.Status = "error"
+			item.Reason = "cannot import system role"
+			resp.Errors++
+			resp.Items = append(resp.Items, item)
+			continue
+		}
+
+		// Validate scope type.
+		if role.ScopeType != store.RoleScopeSystem && role.ScopeType != store.RoleScopeProject {
+			item.Status = "error"
+			item.Reason = "scopeType must be \"system\" or \"project\""
+			resp.Errors++
+			resp.Items = append(resp.Items, item)
+			continue
+		}
+
+		// Validate permissions against registry.
+		if err := validateRolePermissionIDs(role.Permissions); err != nil {
+			item.Status = "error"
+			item.Reason = err.Error()
+			resp.Errors++
+			resp.Items = append(resp.Items, item)
+			continue
+		}
+
+		// CanDelegate check: actor must hold all permissions being imported.
+		if s.authzService != nil {
+			decision := s.authzService.CanDelegate(r.Context(), user, GrantDescriptor{
+				Type:                  GrantTypeCustomRole,
+				CustomRolePermissions: role.Permissions,
+				ScopeType:             role.ScopeType,
+			})
+			if !decision.Allowed {
+				item.Status = "error"
+				item.Reason = "cannot delegate: " + decision.Reason
+				resp.Errors++
+				resp.Items = append(resp.Items, item)
+				continue
+			}
+		}
+
+		// Attempt to create. Name conflicts with existing roles are skipped.
+		rd := &store.RoleDefinition{
+			Name:        name,
+			Description: role.Description,
+			ScopeType:   role.ScopeType,
+			Permissions: role.Permissions,
+			System:      false,
+		}
+		created, err := s.store.CreateRoleDefinition(r.Context(), rd)
+		if err != nil {
+			if errors.Is(err, store.ErrAlreadyExists) {
+				item.Status = "skipped"
+				item.Reason = "role with this name and scope already exists"
+				resp.Skipped++
+				resp.Items = append(resp.Items, item)
+				continue
+			}
+			item.Status = "error"
+			item.Reason = err.Error()
+			resp.Errors++
+			resp.Items = append(resp.Items, item)
+			continue
+		}
+
+		item.Status = "created"
+		item.ID = created.ID
+		resp.Created++
+		resp.Items = append(resp.Items, item)
+
+		slog.Info("role definition imported",
+			"role_id", created.ID, "name", created.Name, "actor", user.Email())
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// ---------------------------------------------------------------------------
+// CRUD: Role Bindings
+// ---------------------------------------------------------------------------
+
+func (s *Server) listRoleBindings(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// ---------------------------------------------------------------------------
+	// Principal-filtered path: when principalType and principalId are both
+	// provided, return only bindings that apply to that principal — direct
+	// bindings plus (optionally) group-derived bindings.  Each returned
+	// binding carries a "source" field ("direct" or a group ID) and, for
+	// group-derived bindings, a "sourceGroupName" display label.
+	//
+	// When neither filter param is set, the existing unfiltered paginated
+	// path is used (admin binding list).
+	// ---------------------------------------------------------------------------
+	principalType := strings.TrimSpace(r.URL.Query().Get("principalType"))
+	principalID := strings.TrimSpace(r.URL.Query().Get("principalId"))
+
+	if principalType != "" && principalID != "" {
+		s.listRoleBindingsForPrincipal(w, r, principalType, principalID)
+		return
+	}
+
+	// Partial filter: one param set without the other is a client error.
+	// Must never fall through to the unfiltered global binding list.
+	if principalType != "" || principalID != "" {
+		BadRequest(w, "both principalType and principalId are required for filtered queries")
+		return
+	}
+
+	// Unfiltered admin list — original behaviour.
+	limit, offset := parsePaginationParams(r)
+
+	// Parse optional sort parameters.
+	sortBy := store.RoleBindingSortCreated // default
+	if v := r.URL.Query().Get("sort_by"); v != "" {
+		if !store.ValidRoleBindingSortField(v) {
+			BadRequest(w, "invalid sort_by value: must be one of principal, role, created")
+			return
+		}
+		sortBy = store.RoleBindingSortField(v)
+	}
+	sortOrder := "desc"
+	if v := r.URL.Query().Get("sort_order"); v != "" {
+		if v != "asc" && v != "desc" {
+			BadRequest(w, "invalid sort_order value: must be asc or desc")
+			return
+		}
+		sortOrder = v
+	}
+
+	bindings, err := s.store.ListAllRoleBindings(ctx, store.RoleBindingListOptions{
+		Limit:     limit,
+		Offset:    offset,
+		SortBy:    sortBy,
+		SortOrder: sortOrder,
+	})
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+	if bindings == nil {
+		bindings = []*store.RoleBinding{}
+	}
+
+	total, err := s.store.CountAllRoleBindings(ctx)
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	// Enrich bindings with human-friendly display names.
+	enriched := make([]RoleBindingInfo, 0, len(bindings))
+	for i, b := range bindings {
+		if b == nil {
+			slog.Warn("nil role binding in list result, skipping", "index", i)
+			continue
+		}
+		info := RoleBindingInfo{RoleBinding: *b}
+		info.PrincipalDisplayName = s.resolveGroupMemberDisplayName(ctx, b.PrincipalType, b.PrincipalID)
+		info.CreatedByDisplayName = s.resolveGroupMemberDisplayName(ctx, store.GroupMemberTypeUser, b.CreatedBy)
+		if b.ScopeType == store.RoleScopeProject && b.ScopeID != "" {
+			project, err := s.store.GetProject(ctx, b.ScopeID)
+			if err == nil && project != nil {
+				info.ScopeDisplayName = project.Name
+			}
+		}
+		enriched = append(enriched, info)
+	}
+
+	s.enrichBindingRoleNames(ctx, enriched)
+
+	writeJSON(w, http.StatusOK, listRoleBindingsResponse{
+		Items:      enriched,
+		TotalCount: total,
+	})
+}
+
+// maxEffectiveGroups is the hard cap on the number of effective groups
+// resolved for a single principal in the filtered binding path. If the
+// closure exceeds this limit the request is rejected with a truthful error
+// rather than silently truncating provenance. The BFS depth cap in
+// GetEffectiveGroups is 32, but there is no limit on how many groups a
+// principal can belong to at each level; this cap makes the fan-out
+// defensibly bounded (1 batch binding query + 1 batch group-name query).
+const maxEffectiveGroups = 200
+
+// listRoleBindingsForPrincipal returns the bindings that apply to a specific
+// principal (direct + optionally group-derived), with provenance tagging.
+//
+// Store-call budget for the filtered path:
+//   - 1 × ListRoleBindingsForPrincipal       (direct bindings)
+//   - 1 × GetEffectiveGroups[ForAgent]        (group closure, if requested)
+//   - 1 × ListRoleBindingsForPrincipals       (batch: all group bindings)
+//   - 1 × GetGroupsByIDs                      (batch: group display names)
+//   - O(projects) × GetProject                (scope display name enrichment)
+//   - 1 × enrichBindingRoleNames              (batch: role display names)
+//
+// Total store calls = O(1) + O(distinct-project-scopes), independent of group count.
+func (s *Server) listRoleBindingsForPrincipal(w http.ResponseWriter, r *http.Request, principalType, principalID string) {
+	ctx := r.Context()
+	normalizedType := NormalizePrincipalType(principalType)
+
+	// Validate principal type.
+	switch normalizedType {
+	case store.RoleBindingPrincipalUser, store.RoleBindingPrincipalAgent:
+		// ok
+	default:
+		BadRequest(w, "principalType must be 'user' or 'agent'")
+		return
+	}
+
+	includeGroupDerived := r.URL.Query().Get("includeGroupDerived") == "true"
+
+	// 1. Direct bindings — assigned to this principal directly.
+	directBindings, err := s.store.ListRoleBindingsForPrincipal(ctx, normalizedType, principalID)
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	// Build seen-set for deduplication (direct bindings always win).
+	seen := make(map[string]struct{}, len(directBindings))
+
+	enriched := make([]RoleBindingInfo, 0, len(directBindings))
+	for _, b := range directBindings {
+		if b == nil {
+			continue
+		}
+		seen[b.ID] = struct{}{}
+		info := RoleBindingInfo{RoleBinding: *b, Source: "direct"}
+		info.PrincipalDisplayName = s.resolveGroupMemberDisplayName(ctx, b.PrincipalType, b.PrincipalID)
+		info.CreatedByDisplayName = s.resolveGroupMemberDisplayName(ctx, store.GroupMemberTypeUser, b.CreatedBy)
+		if b.ScopeType == store.RoleScopeProject && b.ScopeID != "" {
+			if project, err := s.store.GetProject(ctx, b.ScopeID); err == nil && project != nil {
+				info.ScopeDisplayName = project.Name
+			}
+		}
+		enriched = append(enriched, info)
+	}
+
+	// 2. Group-derived bindings (optional).
+	if includeGroupDerived {
+		var groupIDs []string
+		switch normalizedType {
+		case store.RoleBindingPrincipalUser:
+			groupIDs, err = s.store.GetEffectiveGroups(ctx, principalID)
+		case store.RoleBindingPrincipalAgent:
+			groupIDs, err = s.store.GetEffectiveGroupsForAgent(ctx, principalID)
+		}
+		if err != nil {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+
+		// Hard cap: reject with a truthful error if the effective-group
+		// closure is pathologically large rather than silently truncating.
+		if len(groupIDs) > maxEffectiveGroups {
+			slog.Warn("effective-group count exceeds cap",
+				"principalID", principalID,
+				"groupCount", len(groupIDs),
+				"cap", maxEffectiveGroups)
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"error": fmt.Sprintf(
+					"principal belongs to %d effective groups, exceeding the maximum of %d; "+
+						"reduce group nesting or membership to use this endpoint",
+					len(groupIDs), maxEffectiveGroups),
+			})
+			return
+		}
+
+		// Batch-resolve group display names in a single store call.
+		groupNames := make(map[string]string, len(groupIDs))
+		if len(groupIDs) > 0 {
+			groups, err := s.store.GetGroupsByIDs(ctx, groupIDs)
+			if err != nil {
+				slog.Warn("failed to batch-resolve group names", "error", err)
+				// Non-fatal: provenance will lack display names.
+			} else {
+				for _, g := range groups {
+					groupNames[g.ID] = g.Name
+				}
+			}
+		}
+
+		// Batch-fetch bindings for ALL group principals in a single query.
+		if len(groupIDs) > 0 {
+			principals := make([]store.PrincipalRef, len(groupIDs))
+			for i, gid := range groupIDs {
+				principals[i] = store.PrincipalRef{
+					Type: store.RoleBindingPrincipalGroup,
+					ID:   gid,
+				}
+			}
+			groupBindings, err := s.store.ListRoleBindingsForPrincipals(ctx, principals, nil, nil)
+			if err != nil {
+				writeErrorFromErr(w, err, "")
+				return
+			}
+
+			for _, b := range groupBindings {
+				if b == nil {
+					continue
+				}
+				// Skip if already present as a direct binding.
+				if _, dup := seen[b.ID]; dup {
+					continue
+				}
+				seen[b.ID] = struct{}{}
+				// The binding's PrincipalID is the group that granted it.
+				sourceGroupID := b.PrincipalID
+				info := RoleBindingInfo{RoleBinding: *b, Source: sourceGroupID}
+				if name, ok := groupNames[sourceGroupID]; ok {
+					info.SourceGroupName = name
+				}
+				info.PrincipalDisplayName = s.resolveGroupMemberDisplayName(ctx, b.PrincipalType, b.PrincipalID)
+				info.CreatedByDisplayName = s.resolveGroupMemberDisplayName(ctx, store.GroupMemberTypeUser, b.CreatedBy)
+				if b.ScopeType == store.RoleScopeProject && b.ScopeID != "" {
+					if project, err := s.store.GetProject(ctx, b.ScopeID); err == nil && project != nil {
+						info.ScopeDisplayName = project.Name
+					}
+				}
+				enriched = append(enriched, info)
+			}
+		}
+	}
+
+	s.enrichBindingRoleNames(ctx, enriched)
+
+	writeJSON(w, http.StatusOK, listRoleBindingsResponse{
+		Items:      enriched,
+		TotalCount: len(enriched),
+	})
+}
+
+// parsePaginationParams extracts limit and offset from query parameters.
+// Returns 0 for limit (store uses default) and 0 for offset if not provided.
+func parsePaginationParams(r *http.Request) (limit, offset int) {
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	return limit, offset
+}
+
+func (s *Server) createRoleBinding(w http.ResponseWriter, r *http.Request, user UserIdentity) {
+	var req createRoleBindingRequest
+	if err := readJSON(r, &req); err != nil {
+		BadRequest(w, "invalid request body: "+err.Error())
+		return
+	}
+
+	if req.RoleDefinitionID == "" {
+		BadRequest(w, "roleDefinitionId is required")
+		return
+	}
+	if req.PrincipalType == "" {
+		BadRequest(w, "principalType is required")
+		return
+	}
+	if req.PrincipalType != store.RoleBindingPrincipalUser && req.PrincipalType != store.RoleBindingPrincipalAgent && req.PrincipalType != store.RoleBindingPrincipalGroup {
+		BadRequest(w, "principalType must be \"user\", \"agent\", or \"group\"")
+		return
+	}
+	if req.PrincipalID == "" {
+		BadRequest(w, "principalId is required")
+		return
+	}
+	// requestedPrincipalID is the principal ID as the request sent it; the
+	// principal-address check below runs on it once permissions are decided.
+	requestedPrincipalID := req.PrincipalID
+
+	// Resolve email to UUID for user principals (mirrors addGroupMember pattern).
+	if req.PrincipalType == store.RoleBindingPrincipalUser && strings.Contains(req.PrincipalID, "@") {
+		resolvedUser, err := s.store.GetUserByEmail(r.Context(), req.PrincipalID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				BadRequest(w, "user not found with email: "+req.PrincipalID)
+				return
+			}
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		if resolvedUser == nil {
+			BadRequest(w, "user not found with email: "+req.PrincipalID)
+			return
+		}
+		req.PrincipalID = resolvedUser.ID
+	}
+
+	// principalIsMembersGroup records whether the group principal is a
+	// project members group. The refusal is applied below, after routing:
+	// built-in project roles are refused by the membership service once the
+	// actor is authorized; the remaining routes are already behind hub-level
+	// role_binding.create.
+	principalIsMembersGroup := false
+
+	// Verify group exists for group principals.
+	// Try UUID first, fall back to slug lookup (mirrors email→UUID for users).
+	if req.PrincipalType == store.RoleBindingPrincipalGroup {
+		g, err := s.store.GetGroup(r.Context(), req.PrincipalID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				g, err = s.store.GetGroupBySlug(r.Context(), req.PrincipalID)
+				if err != nil {
+					if errors.Is(err, store.ErrNotFound) {
+						BadRequest(w, "group not found: "+req.PrincipalID)
+					} else {
+						writeErrorFromErr(w, err, "")
+					}
+					return
+				}
+			} else {
+				writeErrorFromErr(w, err, "")
+				return
+			}
+		}
+		req.PrincipalID = g.ID
+		principalIsMembersGroup = store.IsProjectMembersGroup(g)
+	}
+
+	if req.ScopeType != store.RoleScopeSystem && req.ScopeType != store.RoleScopeProject {
+		BadRequest(w, "scopeType must be \"system\" or \"project\"")
+		return
+	}
+	if req.ScopeType == store.RoleScopeProject && req.ScopeID == "" {
+		BadRequest(w, "scope_id is required when scope_type is 'project'")
+		return
+	}
+
+	// Containment: a hub test identity holds no hub-level (system-scoped)
+	// role bindings, so it can never be granted admin or issuer authority.
+	// Project-scoped bindings stay allowed: a test identity works inside
+	// projects like any member.
+	if req.PrincipalType == store.RoleBindingPrincipalUser && req.ScopeType == store.RoleScopeSystem {
+		target, err := s.store.GetUser(r.Context(), req.PrincipalID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) && !errors.Is(err, store.ErrInvalidInput) {
+			writeErrorFromErr(w, err, "")
+			return
+		}
+		if err == nil && !target.IsHumanKind() {
+			writeError(w, http.StatusUnprocessableEntity, ErrCodeUnprocessable,
+				"a test identity cannot hold hub-level role bindings",
+				map[string]interface{}{"reason": "test_identity_hub_binding_forbidden"})
+			return
+		}
+	}
+
+	// Resolve project slug to UUID for project-scoped bindings.
+	// Accepts either a UUID (passed through unchanged) or a project slug
+	// (resolved to UUID via store lookup). Storage always receives UUID,
+	// and authorization evaluates the resolved UUID.
+	if req.ScopeType == store.RoleScopeProject && req.ScopeID != "" {
+		if gouuid.Validate(req.ScopeID) != nil {
+			// Not a valid UUID — treat as project slug (case-insensitive).
+			project, err := s.store.GetProjectBySlugCaseInsensitive(r.Context(), req.ScopeID)
+			if err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					BadRequest(w, "project not found with slug: "+req.ScopeID)
+					return
+				}
+				writeErrorFromErr(w, err, "")
+				return
+			}
+			if project == nil {
+				BadRequest(w, "project not found with slug: "+req.ScopeID)
+				return
+			}
+			req.ScopeID = project.ID
+		}
+	}
+
+	// Agents are project-bound; system-scope bindings on agents are
+	// ineffective because agent credentials are scoped to their project
+	// and the live delegation ceiling prevents hub-level privilege.
+	if req.PrincipalType == store.RoleBindingPrincipalAgent && req.ScopeType == store.RoleScopeSystem {
+		BadRequest(w, "agent principals are project-bound and cannot hold system-scoped role bindings")
+		return
+	}
+
+	// Validate lifecycle fields.
+	if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now()) {
+		BadRequest(w, "expiresAt must be in the future")
+		return
+	}
+	if req.NotBefore != nil && req.ExpiresAt != nil && !req.ExpiresAt.After(*req.NotBefore) {
+		BadRequest(w, "expiresAt must be after notBefore")
+		return
+	}
+
+	// R4 brief item 2: project-scoped role-binding create for built-in
+	// project roles (owner/admin/member) MUST route through
+	// ProjectMembershipService for typed governance, delegation, lock,
+	// last-owner protection, transactional audit, and D4 enforcement.
+	// Custom project-scoped roles (e.g. agent delegation bindings) fall
+	// through to the generic CanDelegate path below.
+	// R5-1: fail-closed — if membershipService is nil for built-in roles,
+	// return 500. Never fall through to direct store mutation.
+	if req.ScopeType == store.RoleScopeProject {
+		// Resolve the role definition to check if it's a built-in project role.
+		roleDef, err := s.store.GetRoleDefinition(r.Context(), req.RoleDefinitionID)
+		if err != nil {
+			BadRequest(w, "role definition not found")
+			return
+		}
+		if store.IsBuiltInProjectMembershipRoleDef(roleDef) {
+			// Built-in project role — route through membership service.
+			if s.membershipService == nil {
+				writeError(w, http.StatusInternalServerError, "internal_error",
+					"membership service unavailable — project-scope mutations require governance", nil)
+				return
+			}
+			mReq := MembershipRequest{
+				Op:            MembershipOpAdd,
+				ProjectID:     req.ScopeID,
+				Actor:         user,
+				PrincipalType: req.PrincipalType,
+				PrincipalID:   req.PrincipalID,
+				RoleDefID:     req.RoleDefinitionID,
+				NotBefore:     req.NotBefore,
+				ExpiresAt:     req.ExpiresAt,
+				// RS3: generic role-binding POST is create-only — an
+				// existing built-in membership must conflict (409), not
+				// be silently replaced. The explicit membership
+				// endpoints leave CreateOnly false.
+				CreateOnly: true,
+			}
+			result, denial := s.membershipService.AddMember(r.Context(), mReq)
+			if denial != nil && !denial.Allowed {
+				// Error contract: membership-service 403s surfaced through the
+				// role-binding endpoint include structured details.
+				details := legacyMembershipDenialDetails(denial)
+				if denial.HTTPStatus == http.StatusForbidden {
+					details = withSessionOnlyDenialDetails(map[string]interface{}{
+						"resource_type": "role_binding",
+						"denied_action": "create",
+					}, denial.Details)
+				}
+				writeError(w, denial.HTTPStatus, denial.DenialCode, denial.Reason, details)
+				return
+			}
+			writeJSON(w, http.StatusCreated, result.Binding)
+			return
+		}
+		// Custom project-scoped role — fall through to CanDelegate path.
+	}
+
+	// Project members groups cannot be granted roles, on any scope.
+	if principalIsMembersGroup {
+		writeError(w, http.StatusBadRequest, ErrCodePrincipalIneligible,
+			projectMembersGroupPrincipalMessage, projectMembersGroupPrincipalDetails(req.PrincipalID))
+		return
+	}
+
+	// CanDelegate check: security invariant — the actor must hold all
+	// permissions granted by the target role.
+	canDelegateResult, canDelegateReason := "", ""
+	if s.authzService != nil {
+		decision := s.authzService.CanDelegate(r.Context(), user, GrantDescriptor{
+			Type:             GrantTypeRoleBinding,
+			RoleDefinitionID: req.RoleDefinitionID,
+			ScopeType:        req.ScopeType,
+			ScopeID:          req.ScopeID,
+			GranteeType:      req.PrincipalType,
+			GranteeID:        req.PrincipalID,
+		})
+		if !decision.Allowed {
+			writeForbiddenStructured(w, "cannot create binding: "+decision.Reason, "role_binding", Action("create"))
+			return
+		}
+		canDelegateResult, canDelegateReason = "allow", decision.Reason
+	}
+
+	// Same principal-address check as members PUT: a user must be an email
+	// or a well-formed user ID, an agent a well-formed agent ID
+	// (ptone/scion#3478). The canonical spelling is stored. Built-in
+	// project roles get the same check from the membership service above.
+	principalID, ok := validateMemberPrincipalAddress(w, req.PrincipalType, requestedPrincipalID)
+	if !ok {
+		return
+	}
+	if req.PrincipalID == requestedPrincipalID {
+		// Not replaced by email or group resolution above.
+		req.PrincipalID = principalID
+	}
+
+	rb := &store.RoleBinding{
+		RoleDefinitionID: req.RoleDefinitionID,
+		PrincipalType:    req.PrincipalType,
+		PrincipalID:      req.PrincipalID,
+		ScopeType:        req.ScopeType,
+		ScopeID:          req.ScopeID,
+		NotBefore:        req.NotBefore,
+		ExpiresAt:        req.ExpiresAt,
+		CreatedBy:        user.ID(),
+	}
+
+	// The binding and its audit record commit or roll back together.
+	var created *store.RoleBinding
+	err := s.store.WithTx(r.Context(), func(tx store.Store) error {
+		c, err := tx.CreateRoleBinding(r.Context(), rb)
+		if err != nil {
+			return err
+		}
+		created = c
+		return s.writeRoleBindingAuditTx(r.Context(), tx, &store.MutationAuditRecord{
+			MutationType:      "role_binding_create",
+			TargetType:        "role_binding",
+			TargetID:          c.ID,
+			AfterSummary:      roleBindingSummary(c),
+			CanDelegateResult: canDelegateResult,
+			CanDelegateReason: canDelegateReason,
+		})
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrAlreadyExists) {
+			Conflict(w, "this role binding already exists")
+			return
+		}
+		if errors.Is(err, store.ErrBuiltInMembershipConflict) {
+			Conflict(w, "principal already has a built-in membership role in this project")
+			return
+		}
+		if errors.Is(err, store.ErrSuperAdminBindingRestricted) {
+			writeForbidden(w, "super-admin role bindings can only be created by the system reconciler")
+			return
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			BadRequest(w, "role definition not found")
+			return
+		}
+		// ErrScopeMismatch, ErrDirectUserOnly, and other store errors
+		// are mapped to appropriate HTTP status codes by writeErrorFromErr.
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	slog.Info("role binding created",
+		"binding_id", created.ID, "role_definition_id", req.RoleDefinitionID,
+		"principal", req.PrincipalType+":"+req.PrincipalID, "actor", user.Email())
+
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (s *Server) deleteRoleBinding(w http.ResponseWriter, r *http.Request, id string, user UserIdentity) {
+	ctx := r.Context()
+
+	// Verify the binding exists before deleting.
+	binding, err := s.store.GetRoleBinding(ctx, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			NotFound(w, "Role Binding")
+			return
+		}
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	// R4 brief item 2: project-scoped role-binding delete MUST route
+	// through ProjectMembershipService for serialization lock,
+	// last-owner protection, typed governance, transactional audit,
+	// and stable denial mapping. System-scoped operations remain generic.
+	// R5-1: fail-closed — if membershipService is nil, return 500. Never fall
+	// through to direct store mutation for project scope.
+	if binding.ScopeType == store.RoleScopeProject {
+		if s.membershipService == nil {
+			writeError(w, http.StatusInternalServerError, "internal_error",
+				"membership service unavailable — project-scope mutations require governance", nil)
+			return
+		}
+		mReq := MembershipRequest{
+			Op:          MembershipOpRemove,
+			ProjectID:   binding.ScopeID,
+			Actor:       user,
+			BindingID:   id,
+			LossTrigger: store.MembershipLossTriggerAdminBindingDelete,
+		}
+		_, denial := s.membershipService.RemoveMember(ctx, mReq)
+		if denial != nil && !denial.Allowed {
+			// Error contract: membership-service 403s surfaced through the
+			// role-binding endpoint must include structured details with
+			// truthful resource_type and denied_action. The stable error
+			// code (e.g. role_assignment_forbidden) stays in error.code;
+			// details carry the resource context the UI needs.
+			var details map[string]interface{}
+			if denial.HTTPStatus == http.StatusForbidden {
+				details = withSessionOnlyDenialDetails(map[string]interface{}{
+					"resource_type": "role_binding",
+					"denied_action": "delete",
+				}, denial.Details)
+			}
+			writeError(w, denial.HTTPStatus, denial.DenialCode, denial.Reason, details)
+			return
+		}
+		s.publishConduitAuthzChanged(conduitAuthzMatchForRoleBinding(binding))
+		slog.Info("role binding deleted (via membership service)",
+			"binding_id", id, "actor", user.Email())
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// R6: system-scoped super-admin binding deletion must go through the
+	// same invariant guards as user PATCH role demotion: CanDelegate,
+	// last-admin serialized check, self-lockout, and transactional audit.
+	// Without this, any hub-admin with role_binding.delete could delete
+	// the sole super-admin binding and lock out the system.
+	superAdminRD, err := s.store.GetRoleDefinitionByName(ctx, store.SystemRoleSuperAdmin, store.RoleScopeSystem)
+	if err != nil {
+		writeErrorFromErr(w, err, "super-admin role definition lookup")
+		return
+	}
+	if binding.RoleDefinitionID == superAdminRD.ID && binding.ScopeType == store.RoleScopeSystem {
+		s.deleteSystemSuperAdminBinding(w, r, binding, user, superAdminRD)
+		return
+	}
+
+	// The deletion and its audit record commit or roll back together.
+	if err := s.store.WithTx(ctx, func(tx store.Store) error {
+		if err := checkRoleBindingRemovalAdminLockout(ctx, tx, time.Now(), binding); err != nil {
+			return err
+		}
+		if err := tx.DeleteRoleBinding(ctx, id); err != nil {
+			return err
+		}
+		return s.writeRoleBindingAuditTx(ctx, tx, &store.MutationAuditRecord{
+			MutationType:  "role_binding_delete",
+			TargetType:    "role_binding",
+			TargetID:      binding.ID,
+			BeforeSummary: roleBindingSummary(binding),
+			AfterSummary:  `{"deleted":true}`,
+		})
+	}); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			NotFound(w, "Role Binding")
+			return
+		}
+		if writeConstraintAdminLockoutError(w, err) {
+			return
+		}
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	s.publishConduitAuthzChanged(conduitAuthzMatchForRoleBinding(binding))
+	slog.Info("role binding deleted",
+		"binding_id", id, "actor", user.Email())
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// roleBindingSummary is the audit summary of b, a JSON object with its
+// principal, role definition and scope.
+func roleBindingSummary(b *store.RoleBinding) string {
+	out, err := json.Marshal(struct {
+		PrincipalType    string `json:"principal_type"`
+		PrincipalID      string `json:"principal_id"`
+		RoleDefinitionID string `json:"role_definition_id"`
+		ScopeType        string `json:"scope_type"`
+		ScopeID          string `json:"scope_id"`
+	}{b.PrincipalType, b.PrincipalID, b.RoleDefinitionID, b.ScopeType, b.ScopeID})
+	// json.Marshal cannot fail for a struct of string fields (invalid UTF-8
+	// is replaced, not rejected), so this fallback is defensive only.
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
+}
+
+// writeRoleBindingAuditTx stamps record, attributes it to the request actor
+// and writes it on tx.
+func (s *Server) writeRoleBindingAuditTx(ctx context.Context, tx store.Store, record *store.MutationAuditRecord) error {
+	record.Timestamp = time.Now()
+	s.buildAuditActorFromContext(ctx).ApplyActor(record)
+	applyHubActorFallback(record)
+	if err := tx.CreateMutationAudit(ctx, record); err != nil {
+		return fmt.Errorf("audit %s: %w", record.MutationType, err)
+	}
+	return nil
+}
+
+// deleteSystemSuperAdminBinding handles deletion of a system-scoped
+// super-admin binding through the generic DELETE endpoint. It applies the
+// same invariant guards as user PATCH role demotion (R6):
+//
+//   - Credential boundary: session/dev credentials only (no broker/agent/UAT/federation)
+//   - CanDelegate: caller must have delegation authority over the super-admin role
+//   - Self-lockout: caller cannot remove their own super-admin binding
+//   - Last-admin: serialized check prevents removing the sole active admin
+//   - Audit: transactional mutation audit record
+//
+// Without these guards, any hub-admin with role_binding.delete could delete
+// the sole super-admin binding and lock out the system.
+func (s *Server) deleteSystemSuperAdminBinding(
+	w http.ResponseWriter, r *http.Request,
+	binding *store.RoleBinding, actor UserIdentity, rd *store.RoleDefinition,
+) {
+	ctx := r.Context()
+
+	// Credential boundary: super-admin binding mutations require interactive
+	// session or dev credentials. Reject broker, agent JWT, UAT, and
+	// federation tokens (R6 credential gate).
+	// Session-only with the GOV_PENDING reason (session_only_gate.go).
+	if !sessionCredentialAllowed(ctx) {
+		writeSessionOnlyDenial(w, ErrCodeForbidden,
+			fmt.Sprintf("super-admin binding deletion requires an interactive session; credential kind %q is not allowed",
+				GetCredentialContextFromContext(ctx).Kind),
+			authzop.ReasonGovernancePending)
+		return
+	}
+
+	// CanDelegate: caller must have delegation authority over super-admin.
+	canDel := s.authzService.CanDelegate(ctx, actor, GrantDescriptor{
+		Type:             GrantTypeRoleBinding,
+		RoleDefinitionID: rd.ID,
+		ScopeType:        store.RoleScopeSystem,
+	})
+	if !canDel.Allowed {
+		writeForbiddenStructured(w, "insufficient authority to delete super-admin binding: "+canDel.Reason, "role_binding", Action("delete"))
+		return
+	}
+
+	// Self-lockout: prevent the actor from removing their own super-admin binding.
+	if binding.PrincipalType == store.RoleBindingPrincipalUser && binding.PrincipalID == actor.ID() {
+		writeError(w, http.StatusConflict, "self_lockout",
+			"cannot delete your own super-admin binding; ask another admin", nil)
+		return
+	}
+
+	// All mutations inside a single atomic transaction with serialization.
+	txErr := s.store.WithTx(ctx, func(tx store.Store) error {
+		// Last-admin guard with serialization lock.
+		if err := s.checkLastSuperAdminTx(ctx, tx, binding.PrincipalID, rd); err != nil {
+			return err
+		}
+		// Constraint-admin lockout guard, shared with user suspend and
+		// delete.
+		if err := checkRoleBindingRemovalAdminLockout(ctx, tx, time.Now(), binding); err != nil {
+			return err
+		}
+
+		// Delete the binding.
+		if err := tx.DeleteRoleBinding(ctx, binding.ID); err != nil {
+			return fmt.Errorf("delete super-admin binding: %w", err)
+		}
+
+		// Synchronous transactional audit.
+		auditActor := s.buildAuditActorFromContext(ctx)
+		record := &store.MutationAuditRecord{
+			MutationType:  "role_binding_delete",
+			TargetType:    "role_binding",
+			TargetID:      binding.ID,
+			BeforeSummary: fmt.Sprintf(`{"principal_type":%q,"principal_id":%q,"role":%q,"scope_type":%q}`, binding.PrincipalType, binding.PrincipalID, store.SystemRoleSuperAdmin, binding.ScopeType),
+			AfterSummary:  `{"deleted":true,"source":"generic_delete_endpoint"}`,
+			Timestamp:     time.Now(),
+		}
+		auditActor.ApplyActor(record)
+		if err := tx.CreateMutationAudit(ctx, record); err != nil {
+			return fmt.Errorf("audit super-admin binding delete: %w", err)
+		}
+
+		return nil
+	})
+	if txErr != nil {
+		if errors.Is(txErr, errLastSuperAdmin) {
+			writeError(w, http.StatusConflict, "last_admin",
+				txErr.Error(), nil)
+			return
+		}
+		if writeConstraintAdminLockoutError(w, txErr) {
+			return
+		}
+		writeErrorFromErr(w, txErr, "")
+		return
+	}
+
+	s.publishConduitAuthzChanged(conduitAuthzMatchForRoleBinding(binding))
+	slog.Info("deleted super-admin binding via generic delete endpoint",
+		"binding_id", binding.ID, "principal_id", binding.PrincipalID,
+		"actor", actor.Email())
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) listBindingsForUser(w http.ResponseWriter, r *http.Request, userID string) {
+	ctx := r.Context()
+	bindings, err := s.store.ListRoleBindingsForPrincipal(ctx, store.RoleBindingPrincipalUser, userID)
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+	if bindings == nil {
+		bindings = []*store.RoleBinding{}
+	}
+
+	// Enrich bindings with human-friendly display names.
+	enriched := make([]RoleBindingInfo, 0, len(bindings))
+	for i, b := range bindings {
+		if b == nil {
+			slog.Warn("nil role binding in list result, skipping", "index", i)
+			continue
+		}
+		info := RoleBindingInfo{RoleBinding: *b}
+		info.PrincipalDisplayName = s.resolveGroupMemberDisplayName(ctx, b.PrincipalType, b.PrincipalID)
+		info.CreatedByDisplayName = s.resolveGroupMemberDisplayName(ctx, store.GroupMemberTypeUser, b.CreatedBy)
+		if b.ScopeType == store.RoleScopeProject && b.ScopeID != "" {
+			project, err := s.store.GetProject(ctx, b.ScopeID)
+			if err == nil && project != nil {
+				info.ScopeDisplayName = project.Name
+			}
+		}
+		enriched = append(enriched, info)
+	}
+
+	s.enrichBindingRoleNames(ctx, enriched)
+
+	writeJSON(w, http.StatusOK, listRoleBindingsResponse{
+		Items:      enriched,
+		TotalCount: len(enriched),
+	})
+}
+
+// enrichBindingRoleNames resolves role-definition names for a slice of
+// RoleBindingInfo, setting the RoleName field. Uses a single batch lookup
+// to avoid N+1 queries, falling back to per-binding lookups when the batch
+// API is unavailable.
+func (s *Server) enrichBindingRoleNames(ctx context.Context, bindings []RoleBindingInfo) {
+	// Collect unique role definition IDs.
+	idSet := make(map[string]struct{}, len(bindings))
+	for _, b := range bindings {
+		if b.RoleDefinitionID != "" {
+			idSet[b.RoleDefinitionID] = struct{}{}
+		}
+	}
+	if len(idSet) == 0 {
+		return
+	}
+
+	ids := make([]string, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+
+	nameMap := make(map[string]string, len(ids))
+
+	// Try batch lookup first.
+	defs, err := s.store.GetRoleDefinitionsByIDs(ctx, ids)
+	if err == nil {
+		for _, d := range defs {
+			if d == nil {
+				continue
+			}
+			nameMap[d.ID] = d.Name
+		}
+	} else {
+		// Fallback: per-ID lookup.
+		for _, id := range ids {
+			rd, err := s.store.GetRoleDefinition(ctx, id)
+			if err == nil && rd != nil {
+				nameMap[rd.ID] = rd.Name
+			}
+		}
+	}
+
+	for i := range bindings {
+		if name, ok := nameMap[bindings[i].RoleDefinitionID]; ok {
+			bindings[i].RoleName = name
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Permissions Registry
+// ---------------------------------------------------------------------------
+
+func (s *Server) listPermissions(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, listPermissionsResponse{
+		Items:      permissions.Registry,
+		TotalCount: len(permissions.Registry),
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Authorization helpers
+// ---------------------------------------------------------------------------
+
+// requireWritePermissionForRole checks that the authenticated user has the
+// specified role permission.
+func (s *Server) requireWritePermissionForRole(w http.ResponseWriter, r *http.Request, permission string, action string) (UserIdentity, bool) {
+	identity := GetIdentityFromContext(r.Context())
+	if identity == nil {
+		writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "authentication required", nil)
+		return nil, false
+	}
+	user, ok := identity.(UserIdentity)
+	if !ok {
+		Forbidden(w)
+		return nil, false
+	}
+	if s.authzService == nil {
+		Forbidden(w)
+		return nil, false
+	}
+	decision := s.authzService.Decide(r.Context(), AuthzRequest{
+		Principal:  principalContextForIdentity(user),
+		Credential: credentialContextForIdentity(user),
+		Resource:   hubScopedResource("role", "hub"),
+		Action:     Action(action),
+		Permission: permission,
+	})
+	if !decision.Allowed {
+		Forbidden(w)
+		return nil, false
+	}
+	return user, true
+}
+
+// requireWritePermissionForRoleBinding checks that the authenticated user has
+// the specified role_binding permission.
+func (s *Server) requireWritePermissionForRoleBinding(w http.ResponseWriter, r *http.Request, permission string, action string) (UserIdentity, bool) {
+	identity := GetIdentityFromContext(r.Context())
+	if identity == nil {
+		writeError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "authentication required", nil)
+		return nil, false
+	}
+	user, ok := identity.(UserIdentity)
+	if !ok {
+		Forbidden(w)
+		return nil, false
+	}
+	if s.authzService == nil {
+		Forbidden(w)
+		return nil, false
+	}
+	decision := s.authzService.Decide(r.Context(), AuthzRequest{
+		Principal:  principalContextForIdentity(user),
+		Credential: credentialContextForIdentity(user),
+		Resource:   hubScopedResource("role_binding", "hub"),
+		Action:     Action(action),
+		Permission: permission,
+	})
+	if !decision.Allowed {
+		writeForbiddenStructured(w, "", "role_binding", Action(action))
+		return nil, false
+	}
+	return user, true
+}
+
+// validateRolePermissionIDs validates the permission list of a custom role
+// definition (create, update, duplicate, import). Beyond
+// validatePermissionIDs it rejects Reserved permissions: nothing checks
+// them yet, so no role may hold one (see permissions.Permission.Reserved).
+// Access constraint ceilings keep using validatePermissionIDs: a ceiling
+// listing a reserved permission restricts rather than grants.
+func validateRolePermissionIDs(ids []string) error {
+	if err := validatePermissionIDs(ids); err != nil {
+		return err
+	}
+	reserved := make(map[string]bool)
+	for _, id := range permissions.ReservedIDs() {
+		reserved[id] = true
+	}
+	for _, id := range ids {
+		if reserved[id] {
+			return fmt.Errorf("permission %s is reserved: nothing checks it yet", id)
+		}
+	}
+	return nil
+}
+
+// validatePermissionIDs checks that all provided IDs exist in the permissions registry.
+func validatePermissionIDs(ids []string) error {
+	valid := make(map[string]bool, len(permissions.Registry))
+	for _, p := range permissions.Registry {
+		valid[p.ID] = true
+	}
+	var invalid []string
+	for _, id := range ids {
+		if !valid[id] {
+			invalid = append(invalid, id)
+		}
+	}
+	if len(invalid) > 0 {
+		return errors.New("invalid permission IDs: " + strings.Join(invalid, ", "))
+	}
+	return nil
+}

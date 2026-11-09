@@ -40,6 +40,10 @@ type SecretService interface {
 	// agent's token. Use this instead of Set when running as an agent.
 	AgentSet(ctx context.Context, agentID, key string, req *AgentSetSecretRequest) (*AgentSetSecretResponse, error)
 
+	// UpdateMeta updates only the metadata of an existing secret (PATCH).
+	// The secret value is not modified.
+	UpdateMeta(ctx context.Context, key string, req *UpdateSecretMetaRequest) (*Secret, error)
+
 	// Delete removes a secret.
 	Delete(ctx context.Context, key string, opts *SecretScopeOptions) error
 }
@@ -79,7 +83,7 @@ type SetSecretRequest struct {
 	InjectionMode string `json:"injectionMode,omitempty"` // "always" or "as_needed" (default: as_needed)
 	Type          string `json:"type,omitempty"`          // Secret type: environment (default), variable, file
 	Target        string `json:"target,omitempty"`        // Projection target (defaults to key)
-	AllowProgeny  bool   `json:"allowProgeny,omitempty"`  // Allow creator's progeny agents to access (user scope only)
+	AllowProgeny  *bool  `json:"allowProgeny,omitempty"`  // Allow creator's progeny agents to access (user scope only)
 }
 
 // SetSecretResponse is the response from setting a secret.
@@ -91,11 +95,12 @@ type SetSecretResponse struct {
 // AgentSetSecretRequest is the request for setting a secret via the agent-scoped endpoint.
 // Scope defaults to "project" (derived from JWT); set to "user" for personal credentials.
 type AgentSetSecretRequest struct {
-	Value  string `json:"value"`            // Required: base64-encoded secret value
-	Type   string `json:"type,omitempty"`   // Secret type: environment (default), variable, file
-	Target string `json:"target,omitempty"` // Projection target (defaults to key)
-	Force  bool   `json:"force,omitempty"`  // Overwrite existing secret
-	Scope  string `json:"scope,omitempty"`  // "project" (default) or "user"
+	Value        string `json:"value"`                  // Required: base64-encoded secret value
+	Type         string `json:"type,omitempty"`         // Secret type: environment (default), variable, file
+	Target       string `json:"target,omitempty"`       // Projection target (defaults to key)
+	Force        bool   `json:"force,omitempty"`        // Overwrite existing secret
+	Scope        string `json:"scope,omitempty"`        // "project" (default) or "user"
+	AllowProgeny *bool  `json:"allowProgeny,omitempty"` // Allow creator's progeny agents to access (user scope only)
 }
 
 // AgentSetSecretResponse is the response from the agent-scoped set endpoint.
@@ -104,6 +109,18 @@ type AgentSetSecretResponse struct {
 	Scope   string `json:"scope"`
 	ScopeID string `json:"scopeId,omitempty"`
 	Created bool   // Derived from HTTP status code (201 = created, 204 = updated)
+}
+
+// UpdateSecretMetaRequest is the request for metadata-only secret updates (PATCH).
+// Only non-null/non-empty fields are applied. The secret value is never modified.
+type UpdateSecretMetaRequest struct {
+	Description   *string `json:"description,omitempty"`   // null = no change, "" = clear
+	InjectionMode string  `json:"injectionMode,omitempty"` // "" = no change
+	Type          string  `json:"type,omitempty"`          // "" = no change
+	Target        string  `json:"target,omitempty"`        // "" = no change
+	AllowProgeny  *bool   `json:"allowProgeny,omitempty"`  // null = no change
+	Scope         string  `json:"scope,omitempty"`         // Scope type (default: user)
+	ScopeID       string  `json:"scopeId,omitempty"`       // Required for project/runtime_broker scope
 }
 
 // List returns secret metadata for the specified scope.
@@ -125,7 +142,7 @@ func (s *secretService) List(ctx context.Context, opts *ListSecretOptions) (*Lis
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[ListSecretResponse](resp)
+	return apiclient.DecodeRequired[ListSecretResponse](resp)
 }
 
 // Get returns metadata for a specific secret by key.
@@ -144,7 +161,15 @@ func (s *secretService) Get(ctx context.Context, key string, opts *SecretScopeOp
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[Secret](resp)
+	secret, err := apiclient.DecodeResponse[Secret](resp)
+	if err != nil {
+		return nil, err
+	}
+	if secret == nil {
+		// A 204 No Content response decodes to nil, nil.
+		return nil, &noContentError{key: key}
+	}
+	return secret, nil
 }
 
 // Set creates or updates a secret.
@@ -153,7 +178,7 @@ func (s *secretService) Set(ctx context.Context, key string, req *SetSecretReque
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.DecodeResponse[SetSecretResponse](resp)
+	return apiclient.DecodeRequired[SetSecretResponse](resp)
 }
 
 // AgentSet creates or updates a secret using the agent-scoped endpoint.
@@ -178,6 +203,28 @@ func (s *secretService) AgentSet(ctx context.Context, agentID, key string, req *
 	}
 	result.Created = true
 	return result, nil
+}
+
+// UpdateMeta updates only the metadata of an existing secret (PATCH).
+func (s *secretService) UpdateMeta(ctx context.Context, key string, req *UpdateSecretMetaRequest) (*Secret, error) {
+	query := url.Values{}
+	if req.Scope != "" {
+		query.Set("scope", req.Scope)
+	}
+	if req.ScopeID != "" {
+		query.Set("scopeId", req.ScopeID)
+	}
+
+	path := "/api/v1/secrets/" + url.PathEscape(key)
+	if len(query) > 0 {
+		path += "?" + query.Encode()
+	}
+
+	resp, err := s.c.patch(ctx, path, req, nil)
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.DecodeRequired[Secret](resp)
 }
 
 // Delete removes a secret.

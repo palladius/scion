@@ -1,0 +1,65 @@
+# DERIVED, not written. Regenerate with:
+#   go test ./cmd -run TestHelmChartHAGateWalk -update-chart-contract
+#
+# Each arm loads the settings.yaml the chart renders - taken from the
+# golden named in the header - through the real config.LoadGlobalConfig,
+# then drives the real validateHostedHAPreflight, satisfying one gate at a
+# time because the preflight returns on first failure.
+#
+# THE COUNT DEPENDS ON WHAT THE ARM SUPPLIES. Each step records its grant.
+# The arm's audience is offered only if the hub asks for one. The chart's
+# proxy shapes all render one, so the audience format gate is checked by
+# TestHelmChartIAPAudiencePattern rather than by a malformed-audience arm.
+#
+# CORPUS BINDING. This walk reads the committed goldens, so on its own it
+# measures the goldens and not the chart. The digests below close that gap
+# from the other end: hack/verify.sh proves the goldens are a current render
+# and then checks these digests against the files it just proved, so a walk
+# taken over a stale golden cannot be presented as a walk over the chart.
+# Neither half is sufficient alone and the shell step names the other.
+#
+# GOLDEN DIGESTS (sha256, as walked)
+#   existing-secret.yaml     0cc440df7a2515807777971364450da0658506fbb88c4d5e543820e60503c752
+#   minimal.yaml             8887c056ca9d2046b45995f1f4ad42e5e8a71076b7957dc2078a21c48ec6986a
+#   session-existing.yaml    59d4605fe7ac7cc750ba7c11b3941e1b0a20ce4e29c8c22dbee87d6eef206795
+#   settings-oauth.yaml      2549e1ddeb1565a6e56575f37124e21c823b67321beef5511d748c1df597d058
+#   settings.yaml            b5a24069c3b9b223be13dc46e23a80edee20505da72fe90b3ca5e22c08e3efb5
+#   varied.yaml              9c086916f39f483cf4e4911f651dd022c380b1eeba4b6c07cc1341a7fddc9e2c
+
+===== existing-secret.yaml
+NO RENDERED settings.yaml: no "settings.yaml: |" block in this golden
+
+===== minimal.yaml [audience well-formed = "/projects/1/locations/us-central1/services/hub"]
+config   mode="hosted" hub_id="ci-minimal" driver="sqlite" storage="local" auth.mode="proxy"
+routes   isHADeployment=false hostedHAGuardsRequired=false
+TERMINATED no gates: the preflight does not run for this shape.
+
+===== session-existing.yaml [audience well-formed = "/projects/1/locations/us-central1/services/hub"]
+config   mode="hosted" hub_id="ci-session-existing" driver="sqlite" storage="local" auth.mode="proxy"
+routes   isHADeployment=false hostedHAGuardsRequired=false
+TERMINATED no gates: the preflight does not run for this shape.
+
+===== settings-oauth.yaml [audience well-formed = "/projects/1/locations/us-central1/services/hub"]
+config   mode="hosted" hub_id="ci-settings" driver="postgres" storage="gcs" auth.mode="oauth"
+routes   isHADeployment=true hostedHAGuardsRequired=true
+ 1  hosted HA deployment requires a durable session/signing secret; set --session-secret or SCION_SERVER_SESSION_SECRET
+    granted env SCION_SERVER_SESSION_SECRET="probe-secret"
+TERMINATED the hub ran out of gates: preflight passes after 1.
+CANON BEGIN
+PROSE hosted HA deployment requires a durable session/signing secret; set --session-secret or SCION_SERVER_SESSION_SECRET
+CANON END
+
+===== settings.yaml [audience well-formed = "/projects/1/locations/us-central1/services/hub"]
+config   mode="hosted" hub_id="ci-settings" driver="postgres" storage="gcs" auth.mode="proxy"
+routes   isHADeployment=true hostedHAGuardsRequired=true
+ 1  hosted HA deployment requires a durable session/signing secret; set --session-secret or SCION_SERVER_SESSION_SECRET
+    granted env SCION_SERVER_SESSION_SECRET="probe-secret"
+TERMINATED the hub ran out of gates: preflight passes after 1.
+CANON BEGIN
+PROSE hosted HA deployment requires a durable session/signing secret; set --session-secret or SCION_SERVER_SESSION_SECRET
+CANON END
+
+===== varied.yaml [audience well-formed = "/projects/1/locations/us-central1/services/hub"]
+config   mode="hosted" hub_id="ci-varied" driver="sqlite" storage="local" auth.mode="proxy"
+routes   isHADeployment=false hostedHAGuardsRequired=false
+TERMINATED no gates: the preflight does not run for this shape.

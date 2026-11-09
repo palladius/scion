@@ -17,15 +17,30 @@ name: Build Multi-Arch Release
 on:
   push:
     tags:
-      - '*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'          # Stable: v0.3.0, v1.2.3
+      - 'v[0-9]+.[0-9]+.[0-9]+-preview.*' # Preview: v0.3.0-preview.1
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc.*'      # RC: v0.3.0-rc.1
+      - 'nightly-[0-9]*'                   # Nightly: nightly-20260916
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (tag) to build'
+        required: true
+        type: string
 
-permissions:
-  contents: write
-
+# Fork guard: forks (e.g. ptone/scion) mirror upstream tags, so without this every
+# upstream tag push would also run this pipeline on the fork, publishing a fork
+# release, moving the fork's channel branch, and merging a LATEST.json PR into fork
+# main. Every job carries the guard (not just the roots) so nothing relies solely on
+# skip propagation through `needs`. Same repository guard as build-nightly.yml (applied to every job here). When called
+# via workflow_call, `github` is the caller's context, so upstream callers still run.
 jobs:
   build:
     name: Build Multi-Arch Binaries
     runs-on: ubuntu-latest
+    if: github.repository == 'GoogleCloudPlatform/scion'
+    permissions:
+      contents: read     # Only needs to read code for building
     strategy:
       matrix:
         include:
@@ -43,24 +58,39 @@ jobs:
           - goos: darwin
             goarch: arm64
             output: scion-darwin-arm64
+          # Windows builds: scion.exe in a .zip (what Windows opens without
+          # extra tools). The docs name these assets exactly.
+          - goos: windows
+            goarch: amd64
+            output: scion-windows-amd64
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            output: scion-windows-arm64
+            archive: zip
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
+          ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
+          # Blobless partial clone: later steps need only commits and tags
+          # (git rev-parse of the built tag and HEAD, and the go build VCS
+          # stamp), never file contents of older commits.
+          filter: blob:none
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6
         with:
           go-version-file: 'go.mod'
-          cache: true
+          cache: false  # release artifacts never restore a cache (zizmor cache-poisoning)
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
         with:
           node-version: '24'
-          cache: 'npm'
-          cache-dependency-path: 'web/package-lock.json'
+          package-manager-cache: false  # release artifacts never restore a cache (zizmor cache-poisoning)
 
       - name: Build Web UI
         working-directory: ./web
@@ -70,39 +100,179 @@ jobs:
 
       - name: Get version info
         id: version
+        env:
+          REF: ${{ inputs.ref || github.ref }}
         run: |
-          # Get version from git tag
-          if git describe --tags --exact-match >/dev/null 2>&1; then
-            VERSION=$(git describe --tags --exact-match)
-          else
-            VERSION=""
+          # The version is the tag being built, not `git describe`: a weekly
+          # preview or stable tag sits on the same commit as a nightly tag, and
+          # with several lightweight tags on HEAD `git describe` returns the
+          # first in refname order (nightly-* before v*), so previews were
+          # stamped with the nightly name and put on the nightly update channel.
+          #
+          # Every caller builds a tag (push of a release tag, or workflow_call
+          # with a tag name), so anything else fails here instead of publishing
+          # a release with a guessed version.
+          set -euo pipefail
+          TAG="${REF#refs/tags/}"
+          if [[ ! "$TAG" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            printf '::error::Release builds need a tag ref; got %q.\n' "$REF"
+            exit 1
           fi
-          
-          COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+          if ! TAG_COMMIT=$(git rev-parse --verify --quiet "refs/tags/${TAG}^{commit}"); then
+            printf "::error::'%s' is not a tag in this checkout (ref %q); release builds need a tag ref.\n" "$TAG" "$REF"
+            exit 1
+          fi
+          COMMIT=$(git rev-parse HEAD)
+          if [ "$TAG_COMMIT" != "$COMMIT" ]; then
+            echo "::error::Tag '${TAG}' points at ${TAG_COMMIT}, but the checkout is ${COMMIT}."
+            exit 1
+          fi
+          VERSION="$TAG"
+
           BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           PKG="github.com/GoogleCloudPlatform/scion/pkg/version"
-          
-          # Build ldflags, only including version if available
-          LDFLAGS="-X ${PKG}.Commit=${COMMIT} -X ${PKG}.BuildTime=${BUILD_TIME}"
-          if [ -n "$VERSION" ]; then
-            LDFLAGS="${LDFLAGS} -X ${PKG}.Version=${VERSION}"
-          fi
-          
-          echo "ldflags=${LDFLAGS}" >> $GITHUB_OUTPUT
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          LDFLAGS="-X ${PKG}.Commit=${COMMIT} -X ${PKG}.BuildTime=${BUILD_TIME} -X ${PKG}.Version=${VERSION}"
+
+          echo "ldflags=${LDFLAGS}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Build binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
+          LDFLAGS: ${{ steps.version.outputs.ldflags }}
+          OUTPUT_NAME: ${{ matrix.output }}
         run: |
           mkdir -p dist
-          go build -ldflags "${{ steps.version.outputs.ldflags }}" -o dist/scion ./cmd/scion
-          tar -czvf ${{ matrix.output }}.tar.gz -C dist scion
+          BIN=scion
+          if [ "${GOOS}" = "windows" ]; then BIN=scion.exe; fi
+          go build -ldflags "${LDFLAGS}" -o "dist/${BIN}" ./cmd/scion
+          if [ "${GOOS}" = "windows" ]; then
+            (cd dist && zip -q "../${OUTPUT_NAME}.zip" "${BIN}")
+          else
+            tar -czvf "${OUTPUT_NAME}.tar.gz" -C dist "${BIN}"
+          fi
+
+      # Only linux/amd64 can run on the runner; the other platforms get the
+      # same ldflags from the step above.
+      - name: Verify binary version
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Run outside the checkout so no project settings are picked up.
+          OUT=$(cd "${RUNNER_TEMP:?}" && "${GITHUB_WORKSPACE:?}/dist/scion" version)
+          printf '%s\n' "$OUT"
+          if [[ "$OUT" != *"scion ${VERSION:?} (commit "* ]]; then
+            echo "::error::Built binary does not report version '${VERSION}'."
+            exit 1
+          fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.output }}
+          path: ${{ matrix.output }}.${{ matrix.archive || 'tar.gz' }}
+          if-no-files-found: error
+
+  build-plugins:
+    name: Build Plugin Binaries
+    runs-on: ubuntu-latest
+    if: github.repository == 'GoogleCloudPlatform/scion'
+    permissions:
+      contents: read     # Only needs to read code for building
+    strategy:
+      matrix:
+        include:
+          # Telegram plugin
+          - goos: linux
+            goarch: amd64
+            module_dir: extras/scion-telegram
+            build_path: ./cmd/scion-plugin-telegram
+            binary_name: scion-plugin-telegram
+            output: scion-plugin-telegram-linux-amd64
+          - goos: linux
+            goarch: arm64
+            module_dir: extras/scion-telegram
+            build_path: ./cmd/scion-plugin-telegram
+            binary_name: scion-plugin-telegram
+            output: scion-plugin-telegram-linux-arm64
+          # Discord plugin
+          - goos: linux
+            goarch: amd64
+            module_dir: extras/scion-discord
+            build_path: ./cmd/scion-plugin-discord
+            binary_name: scion-plugin-discord
+            output: scion-plugin-discord-linux-amd64
+          - goos: linux
+            goarch: arm64
+            module_dir: extras/scion-discord
+            build_path: ./cmd/scion-plugin-discord
+            binary_name: scion-plugin-discord
+            output: scion-plugin-discord-linux-arm64
+          # Slack plugin
+          - goos: linux
+            goarch: amd64
+            module_dir: extras/scion-slack
+            build_path: ./cmd/scion-plugin-slack
+            binary_name: scion-plugin-slack
+            output: scion-plugin-slack-linux-amd64
+          - goos: linux
+            goarch: arm64
+            module_dir: extras/scion-slack
+            build_path: ./cmd/scion-plugin-slack
+            binary_name: scion-plugin-slack
+            output: scion-plugin-slack-linux-arm64
+          # Teams plugin
+          - goos: linux
+            goarch: amd64
+            module_dir: extras/scion-teams
+            build_path: ./cmd/scion-plugin-teams
+            binary_name: scion-plugin-teams
+            output: scion-plugin-teams-linux-amd64
+          - goos: linux
+            goarch: arm64
+            module_dir: extras/scion-teams
+            build_path: ./cmd/scion-plugin-teams
+            binary_name: scion-plugin-teams
+            output: scion-plugin-teams-linux-arm64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+          # Blobless partial clone: no step reads history here (the go build
+          # VCS stamp needs only HEAD), so file contents of older commits are
+          # never needed.
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6
+        with:
+          go-version-file: '${{ matrix.module_dir }}/go.mod'
+          cache: false  # release artifacts never restore a cache (zizmor cache-poisoning)
+
+      - name: Build plugin binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+          MODULE_DIR: ${{ matrix.module_dir }}
+          BUILD_PATH: ${{ matrix.build_path }}
+          BINARY_NAME: ${{ matrix.binary_name }}
+          OUTPUT_NAME: ${{ matrix.output }}
+        run: |
+          cd "${MODULE_DIR}"
+          mkdir -p dist
+          go build -o "dist/${BINARY_NAME}" "${BUILD_PATH}"
+          tar -czvf "${GITHUB_WORKSPACE}/${OUTPUT_NAME}.tar.gz" -C dist "${BINARY_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.output }}
           path: ${{ matrix.output }}.tar.gz
@@ -110,11 +280,93 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build, build-plugins]
     runs-on: ubuntu-latest
+    if: github.repository == 'GoogleCloudPlatform/scion'
+    permissions:
+      contents: write    # Needs to create releases and push branches
+    outputs:
+      channel: ${{ steps.channel.outputs.channel }}
+      tag: ${{ steps.channel.outputs.tag }}
     steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          # All tags, so the release notes can start from the previous release
+          # in the same channel. Blobless: only refs and commits are needed.
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Determine release channel
+        id: channel
+        env:
+          REF: ${{ inputs.ref || github.ref }}
+        run: |
+          # Strip refs/tags/ prefix if present
+          TAG="${REF#refs/tags/}"
+          if [[ "$TAG" == nightly-* ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+            echo "channel=nightly" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" == *"-preview."* ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+            echo "channel=preview" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" == *"-rc."* ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+            echo "channel=rc" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+            echo "channel=stable" >> $GITHUB_OUTPUT
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      # Preview, rc and stable releases: GitHub's automatic notes would start
+      # from the newest earlier tag of any kind, usually yesterday's nightly.
+      # Pick the previous release in the same channel instead
+      # (scripts/release/select-previous-release-tag.sh) for Create Release's
+      # previous_tag, and write a body file linking the docs release notes page
+      # for the tag. Nightly releases skip this step and keep the automatic
+      # notes from GitHub's own choice of previous tag.
+      - name: Write release notes
+        id: notes
+        if: steps.channel.outputs.channel != 'nightly'
+        env:
+          TAG: ${{ steps.channel.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Stable, preview and rc tags, as select-previous-release-tag.sh
+          # accepts them (no leading zeros).
+          RELEASE_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(preview|rc)\.(0|[1-9][0-9]*))?$'
+          DOCS_RELEASE_NOTES='https://googlecloudplatform.github.io/scion/release-notes'
+          if [[ ! "$TAG" =~ $RELEASE_RE ]]; then
+            # The trigger's tag patterns are looser than RELEASE_RE; keep
+            # GitHub's automatic notes for such a tag rather than fail.
+            printf '::warning::%q is not a vX.Y.Z[-preview.N|-rc.N] tag; GitHub picks the previous tag for the release notes.\n' "$TAG"
+            exit 0
+          fi
+
+          if ! PREV_TAG=$(./scripts/release/select-previous-release-tag.sh "$TAG"); then
+            echo "::warning::select-previous-release-tag.sh failed for ${TAG}; GitHub picks the previous tag for the release notes."
+            PREV_TAG=""
+          elif [[ -n "$PREV_TAG" && ! "$PREV_TAG" =~ $RELEASE_RE ]]; then
+            echo "::warning::Ignoring an unexpected previous tag; GitHub picks the previous tag for the release notes."
+            PREV_TAG=""
+          elif [[ -z "$PREV_TAG" ]]; then
+            echo "::warning::No earlier release found in the channel of ${TAG}; GitHub picks the previous tag for the release notes."
+          else
+            echo "Release notes for ${TAG} start from ${PREV_TAG}."
+          fi
+
+          # The docs page slug is the tag with every "." replaced by "-"
+          # (v0.3.0-preview.6 -> v0-3-0-preview-6).
+          notes="${RUNNER_TEMP:?}/release-notes.md"
+          printf '**Release notes:** %s/%s/\n' "$DOCS_RELEASE_NOTES" "${TAG//./-}" > "$notes"
+
+          echo "previous_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          echo "body_path=${notes}" >> "$GITHUB_OUTPUT"
+
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: binaries
 
@@ -123,10 +375,193 @@ jobs:
           mkdir -p release
           find binaries -type f -exec mv {} release/ \;
 
+      - name: Generate checksums
+        working-directory: release
+        run: |
+          # Cover every published asset (scion-* binaries and scion-plugin-*
+          # binaries) with a single checksums file so deploy tooling can
+          # verify a download before extracting/installing it. Sort for a
+          # stable, reviewable diff between releases.
+          #
+          # Write the sums outside this directory, then move them in: with
+          # `> SHA256SUMS` the shell can create the empty file before the `*`
+          # glob expands, so the file would list itself (ptone/scion#6005).
+          # pipefail makes a sha256sum failure stop the job.
+          set -o pipefail
+          sums="${RUNNER_TEMP:?}/SHA256SUMS"
+          sha256sum -- * | sort -k2 > "$sums"
+          mv -- "$sums" SHA256SUMS
+
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
+          tag_name: ${{ steps.channel.outputs.tag }}
           files: release/*
           draft: false
-          prerelease: false
+          prerelease: ${{ steps.channel.outputs.prerelease == 'true' }}
+          name: ${{ steps.channel.outputs.tag }}
+          # Both empty (unset) for nightly releases, whose notes step is
+          # skipped. Otherwise the body holds the docs link, which comes before
+          # the generated notes; an empty previous_tag lets GitHub pick.
+          body_path: ${{ steps.notes.outputs.body_path }}
+          previous_tag: ${{ steps.notes.outputs.previous_tag }}
           generate_release_notes: true
+
+      - name: Update channel branch
+        continue-on-error: true
+        id: branch-update
+        env:
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+          TAG: ${{ steps.channel.outputs.tag }}
+        run: |
+          if [[ "$CHANNEL" == "stable" ]]; then
+            BRANCH="stable"
+          elif [[ "$CHANNEL" == "nightly" ]]; then
+            BRANCH="nightly"
+          else
+            BRANCH="preview"
+          fi
+          # Force-update the channel branch to point at this tag's commit
+          git push origin "HEAD:refs/heads/${BRANCH}" --force
+
+      - name: Warn on branch update failure
+        if: steps.branch-update.outcome == 'failure'
+        env:
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+          TAG: ${{ steps.channel.outputs.tag }}
+        run: |
+          if [[ "$CHANNEL" == "stable" ]]; then
+            BRANCH="stable"
+          elif [[ "$CHANNEL" == "nightly" ]]; then
+            BRANCH="nightly"
+          else
+            BRANCH="preview"
+          fi
+          echo "::warning::Failed to update channel branch '${BRANCH}' to ${TAG}. Manual update may be needed."
+
+  update-manifest:
+    name: Update LATEST.json
+    needs: release
+    runs-on: ubuntu-latest
+    if: github.repository == 'GoogleCloudPlatform/scion'
+    permissions:
+      contents: write
+      pull-requests: write    # Needed to create and merge PRs
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          ref: main
+
+      - name: Update manifest
+        env:
+          CHANNEL: ${{ needs.release.outputs.channel }}
+          TAG: ${{ needs.release.outputs.tag }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          RELEASE_URL="${REPO_URL}/releases/tag/${TAG}"
+
+          # Map rc channel to preview in the manifest
+          MANIFEST_CHANNEL="${CHANNEL}"
+          if [ "${MANIFEST_CHANNEL}" = "rc" ]; then
+            MANIFEST_CHANNEL="preview"
+          fi
+
+          export DATE RELEASE_URL MANIFEST_CHANNEL
+
+          # Create or update LATEST.json using python if available, otherwise jq
+          if command -v python3 >/dev/null 2>&1; then
+            python3 <<'PYEOF'
+          import json, os
+
+          manifest_path = "LATEST.json"
+          if os.path.exists(manifest_path):
+              with open(manifest_path) as f:
+                  manifest = json.load(f)
+          else:
+              manifest = {"channels": {"stable": {"version": "", "date": "", "url": ""}, "preview": {"version": "", "date": "", "url": ""}, "nightly": {"version": "", "date": "", "url": ""}}}
+
+          channel = os.environ["MANIFEST_CHANNEL"]
+          manifest["channels"][channel] = {
+              "version": os.environ["TAG"],
+              "date": os.environ["DATE"],
+              "url": os.environ["RELEASE_URL"]
+          }
+
+          with open(manifest_path, "w") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+          PYEOF
+          elif command -v jq >/dev/null 2>&1; then
+            if [ -f LATEST.json ]; then
+              jq --arg ch "${MANIFEST_CHANNEL}" \
+                 --arg ver "${TAG}" \
+                 --arg date "${DATE}" \
+                 --arg url "${RELEASE_URL}" \
+                 '.channels[$ch] = {"version": $ver, "date": $date, "url": $url}' \
+                 LATEST.json > LATEST.json.tmp && mv LATEST.json.tmp LATEST.json
+            fi
+          fi
+
+      - name: Create manifest update PR
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if there are actual changes
+          if git diff --quiet LATEST.json; then
+            echo "No changes to LATEST.json"
+            exit 0
+          fi
+
+          BRANCH="automated/update-manifest-${TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${BRANCH}"
+          git add LATEST.json
+          git commit -m "chore: update LATEST.json for ${TAG}"
+          git push origin "${BRANCH}"
+
+          PR_URL=$(gh pr create \
+            --title "chore: update LATEST.json for ${TAG}" \
+            --body "Automated manifest update for release ${TAG}." \
+            --base main \
+            --head "${BRANCH}")
+
+          echo "Created PR: ${PR_URL}"
+
+          # Merge directly with retries instead of --auto. cla/google always fails on
+          # bot-authored commits (expected, non-blocking, not a required check) and its
+          # near-instant completion races with enablePullRequestAutoMerge, which rejects
+          # enabling auto-merge if mergeStateStatus is already "unstable" at call time.
+          # A direct merge only cares about `mergeable` (no conflicts), not non-required
+          # check status, so it isn't subject to that race.
+          MERGED="false"
+          for attempt in 1 2 3 4 5; do
+            if gh pr merge "${PR_URL}" --squash --delete-branch; then
+              echo "Merged ${PR_URL} on attempt ${attempt}"
+              MERGED="true"
+              break
+            fi
+            echo "Merge attempt ${attempt} failed, retrying in 10s..."
+            sleep 10
+          done
+
+          if [ "${MERGED}" != "true" ]; then
+            echo "::warning::Failed to merge ${PR_URL} after retries. Manual merge required."
+          fi
+
+  # Preview releases only: build the homebrew-scion images and update the
+  # tap formula. The called jobs read HOMEBREW_SCION_TOKEN from the
+  # "homebrew" environment, so no secret is passed here; they skip with a
+  # notice when it is not set.
+  publish-homebrew:
+    name: Publish to Homebrew
+    needs: release
+    if: github.repository == 'GoogleCloudPlatform/scion' && needs.release.outputs.channel == 'preview'
+    permissions:
+      contents: read     # The called jobs only check out code
+    uses: ./.github/workflows/publish-homebrew.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}

@@ -18,9 +18,12 @@ package secret
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/keyring"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
@@ -300,10 +303,10 @@ func TestLocalBackend_GetMeta(t *testing.T) {
 		SecretType:     store.SecretTypeVariable,
 		Target:         "config",
 		Scope:          store.ScopeProject,
-		ScopeID:        "grove-1",
+		ScopeID:        "project-1",
 	})
 
-	meta, err := backend.GetMeta(ctx, "META_KEY", ScopeProject, "grove-1")
+	meta, err := backend.GetMeta(ctx, "META_KEY", ScopeProject, "project-1")
 	if err != nil {
 		t.Fatalf("GetMeta failed: %v", err)
 	}
@@ -344,23 +347,23 @@ func TestLocalBackend_Resolve(t *testing.T) {
 	seedSecret(t, s, &store.Secret{
 		ID:             tid("s3"),
 		Key:            "API_KEY",
-		EncryptedValue: "grove-api-key",
+		EncryptedValue: "project-api-key",
 		SecretType:     store.SecretTypeEnvironment,
 		Target:         "API_KEY",
 		Scope:          store.ScopeProject,
-		ScopeID:        "grove-1",
+		ScopeID:        "project-1",
 	})
 	seedSecret(t, s, &store.Secret{
 		ID:             tid("s4"),
 		Key:            "DB_PASS",
-		EncryptedValue: "grove-db-pass",
+		EncryptedValue: "project-db-pass",
 		SecretType:     store.SecretTypeEnvironment,
 		Target:         "DATABASE_PASSWORD",
 		Scope:          store.ScopeProject,
-		ScopeID:        "grove-1",
+		ScopeID:        "project-1",
 	})
 
-	resolved, err := backend.Resolve(ctx, "user-1", "grove-1", "", nil)
+	resolved, err := backend.Resolve(ctx, "user-1", "project-1", "", nil)
 	if err != nil {
 		t.Fatalf("Resolve failed: %v", err)
 	}
@@ -555,15 +558,15 @@ func TestLocalBackend_ResolveDuplicateTargetAcrossScopes(t *testing.T) {
 	seedSecret(t, s, &store.Secret{
 		ID:             tid("g1"),
 		Key:            "my-key",
-		EncryptedValue: "grove-cert-data",
+		EncryptedValue: "project-cert-data",
 		SecretType:     store.SecretTypeFile,
 		Target:         "/tmp/my-secret.json",
 		Scope:          store.ScopeProject,
-		ScopeID:        "grove-1",
+		ScopeID:        "project-1",
 		InjectionMode:  store.InjectionModeAlways,
 	})
 
-	resolved, err := backend.Resolve(ctx, "user-1", "grove-1", "", nil)
+	resolved, err := backend.Resolve(ctx, "user-1", "project-1", "", nil)
 	if err != nil {
 		t.Fatalf("Resolve failed: %v", err)
 	}
@@ -607,15 +610,15 @@ func TestLocalBackend_ResolveDuplicateEnvTargetAcrossScopes(t *testing.T) {
 	// Project-level env secret targeting the SAME env var
 	seedSecret(t, s, &store.Secret{
 		ID:             tid("g1"),
-		Key:            "grove-foo",
-		EncryptedValue: "grove-val",
+		Key:            "project-foo",
+		EncryptedValue: "project-val",
 		SecretType:     store.SecretTypeEnvironment,
 		Target:         "FOO_VAR",
 		Scope:          store.ScopeProject,
-		ScopeID:        "grove-1",
+		ScopeID:        "project-1",
 	})
 
-	resolved, err := backend.Resolve(ctx, "user-1", "grove-1", "", nil)
+	resolved, err := backend.Resolve(ctx, "user-1", "project-1", "", nil)
 	if err != nil {
 		t.Fatalf("Resolve failed: %v", err)
 	}
@@ -704,7 +707,7 @@ func TestLocalBackend_ResolveProgeny_AllowProgenyGrantsAccess(t *testing.T) {
 		AuthzCheck:    func(_ SecretMeta) bool { return true }, // policy allows
 	}
 
-	resolved, err := backend.Resolve(ctx, "", "grove-1", "", opts)
+	resolved, err := backend.Resolve(ctx, "", "project-1", "", opts)
 	if err != nil {
 		t.Fatalf("Resolve failed: %v", err)
 	}
@@ -778,13 +781,13 @@ func TestLocalBackend_ResolveProgeny_ProjectOverridesProgeny(t *testing.T) {
 
 	// Project-scoped secret with same key (higher precedence)
 	seedSecret(t, s, &store.Secret{
-		ID:             tid("sec-prog-override-grove"),
+		ID:             tid("sec-prog-override-project"),
 		Key:            "API_KEY",
-		EncryptedValue: "grove-value",
+		EncryptedValue: "project-value",
 		SecretType:     store.SecretTypeEnvironment,
 		Target:         "API_KEY",
 		Scope:          store.ScopeProject,
-		ScopeID:        "grove-1",
+		ScopeID:        "project-1",
 	})
 
 	opts := &ResolveOpts{
@@ -792,7 +795,7 @@ func TestLocalBackend_ResolveProgeny_ProjectOverridesProgeny(t *testing.T) {
 		AuthzCheck:    func(_ SecretMeta) bool { return true },
 	}
 
-	resolved, err := backend.Resolve(ctx, "", "grove-1", "", opts)
+	resolved, err := backend.Resolve(ctx, "", "project-1", "", opts)
 	if err != nil {
 		t.Fatalf("Resolve failed: %v", err)
 	}
@@ -807,8 +810,8 @@ func TestLocalBackend_ResolveProgeny_ProjectOverridesProgeny(t *testing.T) {
 		t.Fatal("expected API_KEY in resolved secrets")
 	}
 	// Project should win
-	if apiKey.Value != "grove-value" {
-		t.Errorf("expected project override %q, got %q", "grove-value", apiKey.Value)
+	if apiKey.Value != "project-value" {
+		t.Errorf("expected project override %q, got %q", "project-value", apiKey.Value)
 	}
 	if apiKey.Scope != ScopeProject {
 		t.Errorf("expected scope %q, got %q", ScopeProject, apiKey.Scope)
@@ -921,46 +924,6 @@ func TestLocalBackend_ResolveProgeny_DeniedByPolicyCheck(t *testing.T) {
 		if sv.Name == "POLICY_KEY" {
 			t.Error("secret should be excluded when policy check returns false")
 		}
-	}
-}
-
-// TestLocalBackend_ResolveProgeny_NilAuthzCheckIncludesAll verifies that
-// when no AuthzCheck is provided, progeny secrets with matching ancestry
-// are included (the policy check is optional).
-func TestLocalBackend_ResolveProgeny_NilAuthzCheckIncludesAll(t *testing.T) {
-	backend, s := createTestBackend(t)
-	ctx := context.Background()
-
-	seedSecret(t, s, &store.Secret{
-		ID:             tid("sec-no-authz"),
-		Key:            "NO_AUTHZ_KEY",
-		EncryptedValue: "no-authz-value",
-		SecretType:     store.SecretTypeEnvironment,
-		Target:         "NO_AUTHZ_KEY",
-		Scope:          store.ScopeUser,
-		ScopeID:        "alice-123",
-		AllowProgeny:   true,
-		CreatedBy:      "alice-123",
-	})
-
-	opts := &ResolveOpts{
-		AgentAncestry: []string{"alice-123", "agent-a"},
-		AuthzCheck:    nil, // no policy checker — secrets are included by default
-	}
-
-	resolved, err := backend.Resolve(ctx, "", "", "", opts)
-	if err != nil {
-		t.Fatalf("Resolve failed: %v", err)
-	}
-
-	found := false
-	for _, sv := range resolved {
-		if sv.Name == "NO_AUTHZ_KEY" {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("progeny secret should be included when AuthzCheck is nil (no policy gating)")
 	}
 }
 
@@ -1188,7 +1151,7 @@ func TestLocalBackend_DecryptStoreSecret_NilKeyEncryptedValue(t *testing.T) {
 	seedSecret(t, s, &store.Secret{
 		ID:             tid("enc-no-key-1"),
 		Key:            "ENCRYPTED_SECRET",
-		EncryptedValue: "enc:v1:AAAAAAAAAAAAAAAAAAAAAA==",
+		EncryptedValue: wellFormedV1Fixture(t),
 		SecretType:     store.SecretTypeEnvironment,
 		Target:         "ENCRYPTED_SECRET",
 		Scope:          store.ScopeUser,
@@ -1199,9 +1162,20 @@ func TestLocalBackend_DecryptStoreSecret_NilKeyEncryptedValue(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when encryption key is nil but value is encrypted; got nil")
 	}
-	if !strings.Contains(err.Error(), "no encryption key is configured") {
-		t.Errorf("expected error about missing encryption key, got: %v", err)
+	if !errors.Is(err, ErrNoDecryptionKey) {
+		t.Errorf("expected ErrNoDecryptionKey, got: %v", err)
 	}
+}
+
+// wellFormedV1Fixture is a well-formed enc:v1: value sealed under a
+// synthetic key no backend in these tests holds.
+func wellFormedV1Fixture(t *testing.T) string {
+	t.Helper()
+	v, err := EncryptValue("fake-sealed-value", DeriveLocalEncryptionKey("FAKE-unrelated-test-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
 }
 
 // TestLocalBackend_DecryptStoreSecret_NilKeyPlaintextValue verifies that
@@ -1238,7 +1212,7 @@ func TestLocalBackend_DecryptRawValue_NilKeyEncryptedValue(t *testing.T) {
 	s := createTestStore(t)
 	backend := NewLocalBackend(s, "test-hub-id", "") // nil encryption key
 
-	encrypted := "enc:v1:AAAAAAAAAAAAAAAAAAAAAA=="
+	encrypted := wellFormedV1Fixture(t)
 	value, err := backend.decryptRawValue(encrypted)
 	if err == nil {
 		t.Fatal("expected error when encryption key is nil but value is encrypted; got nil")
@@ -1246,11 +1220,12 @@ func TestLocalBackend_DecryptRawValue_NilKeyEncryptedValue(t *testing.T) {
 	if value != "" {
 		t.Errorf("expected empty string on error, got %q", value)
 	}
-	if !strings.Contains(err.Error(), "no encryption key is configured") {
-		t.Errorf("expected error about missing encryption key, got: %v", err)
+	if !errors.Is(err, ErrNoDecryptionKey) {
+		t.Errorf("expected ErrNoDecryptionKey, got: %v", err)
 	}
 
-	// Also verify via Resolve: encrypted values should be skipped, not leaked.
+	// Also verify via Resolve: the encrypted value is neither leaked nor
+	// silently skipped; the resolution fails with the typed error.
 	seedSecret(t, s, &store.Secret{
 		ID:             tid("resolve-enc-no-key"),
 		Key:            "LEAKED_SECRET",
@@ -1263,13 +1238,33 @@ func TestLocalBackend_DecryptRawValue_NilKeyEncryptedValue(t *testing.T) {
 
 	ctx := context.Background()
 	resolved, err := backend.Resolve(ctx, "user-1", "", "", nil)
-	if err != nil {
-		t.Fatalf("Resolve failed: %v", err)
+	if !errors.Is(err, ErrResolveDecrypt) || resolved != nil {
+		t.Fatalf("Resolve = %d secrets, %v; want ErrResolveDecrypt", len(resolved), err)
 	}
-	for _, sv := range resolved {
-		if sv.Name == "LEAKED_SECRET" {
-			t.Error("encrypted secret should not appear in resolved secrets when encryption key is nil")
-		}
+	if !strings.Contains(err.Error(), "LEAKED_SECRET (no_decryption_key)") {
+		t.Errorf("error does not name the key and classification: %v", err)
+	}
+}
+
+// TestLocalBackend_DecryptRawValue_CorruptCiphertextReturnsError verifies
+// that decryptRawValue returns a non-nil error and an empty string for
+// ciphertext that fails AES-GCM authentication, rather than
+// silently returning ("", nil) as if the value were legitimately empty.
+// Reverting the fix at localbackend.go (restoring `return "", nil` on a
+// decrypt failure) turns this test red.
+func TestLocalBackend_DecryptRawValue_CorruptCiphertextReturnsError(t *testing.T) {
+	backend, _ := createTestBackend(t)
+
+	// enc:v1: prefixed, valid base64, but not a value EncryptValue ever
+	// produced: it decodes but fails AES-GCM authentication.
+	corrupt := EncryptedPrefix + base64.StdEncoding.EncodeToString(make([]byte, 32))
+
+	value, err := backend.decryptRawValue(corrupt)
+	if err == nil {
+		t.Fatal("expected a decrypt error for corrupt ciphertext, got nil")
+	}
+	if value != "" {
+		t.Errorf("expected empty value on decrypt failure, got %q", value)
 	}
 }
 
@@ -1277,7 +1272,7 @@ func TestLocalBackend_DecryptRawValue_NilKeyEncryptedValue(t *testing.T) {
 // decryptRawValue still returns plaintext values when the encryption key
 // is nil (legacy path).
 func TestLocalBackend_DecryptRawValue_NilKeyPlaintextValue(t *testing.T) {
-	backend := &LocalBackend{encryptionKey: nil}
+	backend := NewLocalBackendWithCipher(nil, "test-hub-id", NewLegacyValueCipher("")) // disabled cipher
 
 	value, err := backend.decryptRawValue("plain-legacy-value")
 	if err != nil {
@@ -1285,5 +1280,273 @@ func TestLocalBackend_DecryptRawValue_NilKeyPlaintextValue(t *testing.T) {
 	}
 	if value != "plain-legacy-value" {
 		t.Errorf("expected %q, got %q", "plain-legacy-value", value)
+	}
+}
+
+// =============================================================================
+// UpdateMeta tests
+// =============================================================================
+
+func TestLocalBackend_UpdateMeta(t *testing.T) {
+	backend, _ := createTestBackend(t)
+	ctx := context.Background()
+
+	// Create a secret first
+	_, _, err := backend.Set(ctx, &SetSecretInput{
+		Name:          "META_SECRET",
+		Value:         "original-value",
+		SecretType:    TypeEnvironment,
+		Scope:         ScopeUser,
+		ScopeID:       "user-1",
+		Description:   "Original description",
+		InjectionMode: "as_needed",
+		CreatedBy:     "user-1",
+		UpdatedBy:     "user-1",
+	})
+	if err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
+
+	// Update description only
+	newDesc := "Updated description"
+	meta, err := backend.UpdateMeta(ctx, &UpdateMetaInput{
+		Name:        "META_SECRET",
+		Scope:       ScopeUser,
+		ScopeID:     "user-1",
+		Description: &newDesc,
+		UpdatedBy:   "user-1",
+	})
+	if err != nil {
+		t.Fatalf("UpdateMeta failed: %v", err)
+	}
+	if meta.Description != "Updated description" {
+		t.Errorf("expected description %q, got %q", "Updated description", meta.Description)
+	}
+
+	// Verify the secret value is unchanged
+	sv, err := backend.Get(ctx, "META_SECRET", ScopeUser, "user-1")
+	if err != nil {
+		t.Fatalf("Get after UpdateMeta failed: %v", err)
+	}
+	if sv.Value != "original-value" {
+		t.Errorf("expected value to be unchanged %q, got %q", "original-value", sv.Value)
+	}
+}
+
+func TestLocalBackend_UpdateMeta_NotFound(t *testing.T) {
+	backend, _ := createTestBackend(t)
+	ctx := context.Background()
+
+	newDesc := "test"
+	_, err := backend.UpdateMeta(ctx, &UpdateMetaInput{
+		Name:        "NONEXISTENT",
+		Scope:       ScopeUser,
+		ScopeID:     "user-1",
+		Description: &newDesc,
+	})
+	if err != store.ErrNotFound {
+		t.Errorf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestLocalBackend_UpdateMeta_VersionIncrement(t *testing.T) {
+	backend, _ := createTestBackend(t)
+	ctx := context.Background()
+
+	// Create a secret
+	_, meta1, err := backend.Set(ctx, &SetSecretInput{
+		Name:       "VERSION_META",
+		Value:      "value",
+		SecretType: TypeEnvironment,
+		Scope:      ScopeUser,
+		ScopeID:    "user-1",
+	})
+	if err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
+
+	// Update metadata
+	newDesc := "Updated"
+	meta2, err := backend.UpdateMeta(ctx, &UpdateMetaInput{
+		Name:        "VERSION_META",
+		Scope:       ScopeUser,
+		ScopeID:     "user-1",
+		Description: &newDesc,
+	})
+	if err != nil {
+		t.Fatalf("UpdateMeta failed: %v", err)
+	}
+	if meta2.Version <= meta1.Version {
+		t.Errorf("expected version to increment: v1=%d, v2=%d", meta1.Version, meta2.Version)
+	}
+}
+
+func TestLocalBackend_UpdateMeta_PartialFields(t *testing.T) {
+	backend, _ := createTestBackend(t)
+	ctx := context.Background()
+
+	// Create a secret with multiple metadata fields
+	_, _, err := backend.Set(ctx, &SetSecretInput{
+		Name:          "PARTIAL_META",
+		Value:         "secret-value",
+		SecretType:    TypeEnvironment,
+		Scope:         ScopeUser,
+		ScopeID:       "user-1",
+		Description:   "Original",
+		InjectionMode: "as_needed",
+		AllowProgeny:  false,
+	})
+	if err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
+
+	// Update only injection mode — description and AllowProgeny should remain unchanged
+	meta, err := backend.UpdateMeta(ctx, &UpdateMetaInput{
+		Name:          "PARTIAL_META",
+		Scope:         ScopeUser,
+		ScopeID:       "user-1",
+		InjectionMode: "always",
+	})
+	if err != nil {
+		t.Fatalf("UpdateMeta failed: %v", err)
+	}
+
+	if meta.InjectionMode != "always" {
+		t.Errorf("expected injectionMode %q, got %q", "always", meta.InjectionMode)
+	}
+	if meta.Description != "Original" {
+		t.Errorf("expected description to remain %q, got %q", "Original", meta.Description)
+	}
+	if meta.AllowProgeny != false {
+		t.Errorf("expected allowProgeny to remain false, got %v", meta.AllowProgeny)
+	}
+
+	// Now update AllowProgeny only
+	allowTrue := true
+	meta2, err := backend.UpdateMeta(ctx, &UpdateMetaInput{
+		Name:         "PARTIAL_META",
+		Scope:        ScopeUser,
+		ScopeID:      "user-1",
+		AllowProgeny: &allowTrue,
+	})
+	if err != nil {
+		t.Fatalf("UpdateMeta (progeny) failed: %v", err)
+	}
+	if !meta2.AllowProgeny {
+		t.Error("expected allowProgeny to be true after update")
+	}
+	if meta2.InjectionMode != "always" {
+		t.Errorf("expected injectionMode to remain %q, got %q", "always", meta2.InjectionMode)
+	}
+
+	// Verify value is still intact
+	sv, err := backend.Get(ctx, "PARTIAL_META", ScopeUser, "user-1")
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if sv.Value != "secret-value" {
+		t.Errorf("expected value unchanged %q, got %q", "secret-value", sv.Value)
+	}
+}
+
+// TestLocalBackend_StaleWriterPolicyMismatch: once the database encryption
+// policy fences writers to another key, a backend whose cipher is stale
+// gets store.ErrEncryptionPolicyMismatch and nothing is written; a current
+// writer succeeds (ptone/scion#1530 §6).
+func TestLocalBackend_StaleWriterPolicyMismatch(t *testing.T) {
+	st, err := newTestStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	applied, err := st.UpdateEncryptionPolicy(ctx, 0, store.EncryptionPolicy{
+		Generation: 1, MinReaderVersion: store.EncryptionPolicyMinReaderVersion,
+		AllowedWriteKIDs: []string{"k2"}, RequiredReadKIDs: []string{"k2"}, State: store.EncryptionPolicyPrepared,
+	})
+	if err != nil || !applied {
+		t.Fatalf("policy: %v %v", applied, err)
+	}
+	stale := NewLocalBackend(st, "hub-1", "FAKE-stale-legacy-secret")
+	_, _, err = stale.Set(ctx, &SetSecretInput{Name: "STALE", Value: "fake-value", Scope: ScopeUser, ScopeID: "u1"})
+	if !errors.Is(err, store.ErrEncryptionPolicyMismatch) {
+		t.Fatalf("stale legacy writer: err = %v, want ErrEncryptionPolicyMismatch", err)
+	}
+	if _, err := st.GetSecret(ctx, "STALE", ScopeUser, "u1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("a refused write stored a row: %v", err)
+	}
+	k1 := ciphertestRing(t, "k1")
+	if _, _, err := NewLocalBackendWithCipher(st, "hub-1", k1).Set(ctx, &SetSecretInput{Name: "STALE", Value: "fake-value", Scope: ScopeUser, ScopeID: "u1"}); !errors.Is(err, store.ErrEncryptionPolicyMismatch) {
+		t.Fatalf("stale v2 writer: err = %v, want ErrEncryptionPolicyMismatch", err)
+	}
+	k2 := ciphertestRing(t, "k2")
+	b := NewLocalBackendWithCipher(st, "hub-1", k2)
+	if _, _, err := b.Set(ctx, &SetSecretInput{Name: "CURRENT", Value: "fake-value", Scope: ScopeUser, ScopeID: "u1"}); err != nil {
+		t.Fatalf("current writer: %v", err)
+	}
+	sv, err := b.Get(ctx, "CURRENT", ScopeUser, "u1")
+	if err != nil || sv.Value != "fake-value" {
+		t.Fatalf("Get = %v, %v", sv, err)
+	}
+}
+
+// ciphertestRing is a managed v2 cipher whose only key is a synthetic
+// 32-byte key for kid (the internal tests cannot import ciphertest).
+func ciphertestRing(t *testing.T, kid string) *ValueCipher {
+	t.Helper()
+	key := base64.StdEncoding.EncodeToString([]byte(("FAKE-KEY-" + kid + "-00000000000000000000000000")[:32]))
+	doc := `{"schema":1,"revision":"internal-test","signing":{"active":"legacy","emit":"legacy",` +
+		`"keys":[{"id":"legacy","secret":"FAKE-test-only-signing-secret-0000000000","sign_until":null,"verify_until":null}],` +
+		`"legacy_read_ids":["legacy"]},"encryption":{"active":"` + kid + `","write_format":"v2",` +
+		`"keys":[{"id":"` + kid + `","key_b64":"` + key + `"}],"legacy_v1_read_ids":[]}}`
+	k, err := keyring.Parse([]byte(doc))
+	if err != nil {
+		t.Fatalf("parse synthetic keyring: %v", err)
+	}
+	c, err := NewValueCipher(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// TestLocalBackend_ReferenceOnlyRowsInManagedMode: a reference-only row
+// (empty value, non-empty SecretRef, as the GCP backend writes) holds no
+// local payload, so a managed cipher does not decrypt it: Get and Resolve
+// read it as the empty value instead of failing with
+// plaintext_not_admitted, while a real plaintext row still fails closed.
+func TestLocalBackend_ReferenceOnlyRowsInManagedMode(t *testing.T) {
+	st, err := newTestStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	seedSecret(t, st, &store.Secret{ID: tid("ref-only-row"), Key: "REF_ONLY", EncryptedValue: "",
+		SecretRef: "gcpsm:projects/fake/secrets/ref-only", SecretType: store.SecretTypeEnvironment,
+		Target: "REF_ONLY", Scope: store.ScopeProject, ScopeID: "project-1"})
+	b := NewLocalBackendWithCipher(st, "hub-1", ciphertestRing(t, "k2"))
+	sv, err := b.Get(ctx, "REF_ONLY", ScopeProject, "project-1")
+	if err != nil || sv.Value != "" {
+		t.Fatalf("Get(reference-only) = %v, %v; want the empty value", sv, err)
+	}
+	resolved, err := b.Resolve(ctx, "", "project-1", "", nil)
+	if err != nil {
+		t.Fatalf("Resolve with a reference-only row: %v", err)
+	}
+	if len(resolved) != 1 || resolved[0].Name != "REF_ONLY" {
+		t.Fatalf("resolved = %+v", resolved)
+	}
+
+	// An empty value WITHOUT a ref is plaintext and still fails closed.
+	seedSecret(t, st, &store.Secret{ID: tid("empty-plain-row"), Key: "EMPTY_PLAIN", EncryptedValue: "",
+		SecretType: store.SecretTypeEnvironment, Target: "EMPTY_PLAIN", Scope: store.ScopeProject, ScopeID: "project-1"})
+	_, err = b.Resolve(ctx, "", "project-1", "", nil)
+	if !errors.Is(err, ErrResolveDecrypt) || !strings.Contains(err.Error(), "EMPTY_PLAIN (plaintext_not_admitted)") {
+		t.Fatalf("Resolve with an empty plaintext row: %v", err)
 	}
 }

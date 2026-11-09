@@ -20,10 +20,13 @@ follow the [Hub Setup](/scion/hosted/single-node/hub-server/) guide.
   tier: a single-node Hub can serve one user with a simple token, or many users through an OAuth
   identity provider with Groups and access policies.
 - **Low cost and operational simplicity.** One VM or one Cloud Run instance backed by SQLite —
-  nothing else to run.
+  nothing else to run. 
 
 The `sqlite` database driver (`SCION_SERVER_DATABASE_DRIVER=sqlite`) is what pins the Hub to a
 single instance: a single DB connection and in-memory lifecycle-hook deduplication.
+
+### Cloud Run Sandbox Tier
+The simplest realization of this tier is the **Single-node Cloud Run sandbox tier**. A single deploy command produces a `run.app` URL where the Hub and every agent run as a sandbox inside one Cloud Run Instance. It offers a cheaper, faster path to a shared filesystem environment compared to full HA, complementing the per-service Cloud Run Instances runtime used in larger deployments.
 
 ## The trade-off: non-HA
 
@@ -57,7 +60,7 @@ If you need to survive node loss and redeploys **without downtime**, step up to
 | Database driver | Embedded `sqlite` | External `postgres` (Cloud SQL) |
 | State & durability | Single-volume; non-HA | External DB + object storage; highly available |
 | Downtime on restart/redeploy | Yes | No |
-| Typical realization | One VM (starter-hub scripts) or one Cloud Run instance + SQLite | Cloud Run (min-instances ≥ 2) + Cloud SQL |
+| Typical realization | One VM (Developer Hub or single-node-vm scripts) or one Cloud Run instance + SQLite | Cloud Run (min-instances ≥ 2) + Cloud SQL |
 | Cost & complexity | Low | Higher |
 | Tenancy | Single- or multi-user | Single- or multi-user |
 
@@ -67,6 +70,7 @@ The two tiers are distinguished purely by the **availability tier** dimension �
 ## Next steps
 
 - [Hub Setup](/scion/hosted/single-node/hub-server/) — configure and run the Hub.
-- [Deploy on a VM (GCE)](/scion/hosted/single-node/hub-setup-gce/) — the starter-hub path.
+- [Deploy on a VM (GCE)](/scion/hosted/single-node/hub-setup-gce/) — the Developer Hub path (build from source), or the binary-release single-node VM script with IAP, headless `--config` installs, and automatic updates.
+- [Deploy on Cloud Run (Sandbox)](/scion/hosted/single-node/hub-setup-cloudrun/) — one-command deploy on a Cloud Run Instance with IAP.
 - [Auth & Tenancy](/scion/hosted/single-node/auth/) — single- vs multi-user access.
 - [Connecting to a Hub](/scion/hosted/user/hosted-user/) — the user-facing journey.

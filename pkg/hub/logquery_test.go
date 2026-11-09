@@ -15,6 +15,8 @@
 package hub
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -96,6 +98,21 @@ func TestBuildLogFilter(t *testing.T) {
 			},
 			expected: `labels.agent_id = "agent-123" AND labels.project_id = "project-abc"`,
 		},
+		{
+			name:     "severity clause uses the table constant",
+			opts:     LogQueryOptions{Severity: "Notice"},
+			expected: `severity >= NOTICE`,
+		},
+		{
+			name:     "unknown severity writes no clause",
+			opts:     LogQueryOptions{AgentID: "agent-123", Severity: "INFO OR true"},
+			expected: `labels.agent_id = "agent-123"`,
+		},
+		{
+			name:     "non-ASCII severity writes no clause",
+			opts:     LogQueryOptions{Severity: "\u0131nfo"},
+			expected: "",
+		},
 	}
 
 	for _, tt := range tests {
@@ -105,6 +122,53 @@ func TestBuildLogFilter(t *testing.T) {
 				t.Errorf("BuildLogFilter() = %q, want %q", result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestNormalizeLogSeverity(t *testing.T) {
+	for _, name := range []string{"DEFAULT", "DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY"} {
+		for _, in := range []string{name, strings.ToLower(name), strings.ToUpper(name[:1]) + strings.ToLower(name[1:])} {
+			got, ok := normalizeLogSeverity(in)
+			if !ok || got != name {
+				t.Errorf("normalizeLogSeverity(%q) = %q, %v; want %q, true", in, got, ok, name)
+			}
+		}
+	}
+
+	for _, in := range []string{
+		"",
+		"TRACE",
+		"warn",
+		"INFO ",
+		" INFO",
+		"INFO OR true",
+		"INFO\x00",
+		"5",
+		"\u0131nfo", // dotless i: strings.ToUpper would give INFO
+		// The Kelvin sign Unicode-folds to k and the long s to s, but no
+		// table name contains k or s, so no table name can Unicode-fold
+		// to a non-ASCII form: EqualFold refuses these two even without
+		// the non-ASCII byte check, which is defence in depth.
+		"\u212Aritical",
+		"CRITICA\u017F",
+	} {
+		if got, ok := normalizeLogSeverity(in); ok {
+			t.Errorf("normalizeLogSeverity(%q) = %q, true; want refused", in, got)
+		}
+	}
+}
+
+func TestLogQueryService_InvalidSeverityRefusedBeforeFilter(t *testing.T) {
+	// A zero-value service has no clients: reaching the client would panic,
+	// so a returned error shows the check runs before any filter is built.
+	svc := &LogQueryService{}
+	opts := LogQueryOptions{Severity: "TRACE"}
+
+	if _, err := svc.Query(context.Background(), opts); !errors.Is(err, errInvalidLogSeverity) {
+		t.Errorf("Query error = %v, want errInvalidLogSeverity", err)
+	}
+	if _, _, err := svc.Tail(context.Background(), opts); !errors.Is(err, errInvalidLogSeverity) {
+		t.Errorf("Tail error = %v, want errInvalidLogSeverity", err)
 	}
 }
 
@@ -122,7 +186,7 @@ func TestBuildLogFilter_LogID(t *testing.T) {
 				LogID:   "scion-messages",
 			},
 			projectID: "my-project",
-			expected:  `logName = "projects/my-project/logs/scion-messages" AND (labels.recipient_id = "agent-123" OR labels.sender_id = "agent-123")`,
+			expected:  `logName = "projects/my-project/logs/scion-messages" AND (labels.recipient_id = "agent-123" OR labels.sender_id = "agent-123") AND NOT labels.log_kind = "event" AND (labels.sender:* OR labels.recipient:*)`,
 		},
 		{
 			name: "logID without project ID",
@@ -131,7 +195,7 @@ func TestBuildLogFilter_LogID(t *testing.T) {
 				LogID:   "scion-messages",
 			},
 			projectID: "",
-			expected:  `(labels.recipient_id = "agent-123" OR labels.sender_id = "agent-123")`,
+			expected:  `(labels.recipient_id = "agent-123" OR labels.sender_id = "agent-123") AND NOT labels.log_kind = "event" AND (labels.sender:* OR labels.recipient:*)`,
 		},
 		{
 			name: "no logID with project ID uses whitelist filter",
@@ -139,7 +203,7 @@ func TestBuildLogFilter_LogID(t *testing.T) {
 				AgentID: "agent-123",
 			},
 			projectID: "my-project",
-			expected:  `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages") AND labels.agent_id = "agent-123"`,
+			expected:  `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages" OR logName = "projects/my-project/logs/scion-artifacts") AND labels.agent_id = "agent-123"`,
 		},
 		{
 			name: "message log uses ID-based sender and recipient filter",
@@ -148,7 +212,19 @@ func TestBuildLogFilter_LogID(t *testing.T) {
 				LogID:   "scion-messages",
 			},
 			projectID: "my-project",
-			expected:  `logName = "projects/my-project/logs/scion-messages" AND (labels.recipient_id = "agent-123" OR labels.sender_id = "agent-123")`,
+			expected:  `logName = "projects/my-project/logs/scion-messages" AND (labels.recipient_id = "agent-123" OR labels.sender_id = "agent-123") AND NOT labels.log_kind = "event" AND (labels.sender:* OR labels.recipient:*)`,
+		},
+		{
+			// Project Messages view: only message records, no
+			// log_kind=event entries and none without sender or
+			// recipient labels.
+			name: "project message log keeps message records only",
+			opts: LogQueryOptions{
+				ProjectID: "project-abc",
+				LogID:     "scion-messages",
+			},
+			projectID: "my-project",
+			expected:  `logName = "projects/my-project/logs/scion-messages" AND NOT labels.log_kind = "event" AND (labels.sender:* OR labels.recipient:*) AND labels.project_id = "project-abc"`,
 		},
 		{
 			name: "message log with project_id filter",
@@ -158,7 +234,7 @@ func TestBuildLogFilter_LogID(t *testing.T) {
 				LogID:     "scion-messages",
 			},
 			projectID: "my-project",
-			expected:  `logName = "projects/my-project/logs/scion-messages" AND (labels.recipient_id = "agent-123" OR labels.sender_id = "agent-123") AND labels.project_id = "project-abc"`,
+			expected:  `logName = "projects/my-project/logs/scion-messages" AND (labels.recipient_id = "agent-123" OR labels.sender_id = "agent-123") AND NOT labels.log_kind = "event" AND (labels.sender:* OR labels.recipient:*) AND labels.project_id = "project-abc"`,
 		},
 	}
 
@@ -183,23 +259,23 @@ func TestBuildLogFilter_Whitelist(t *testing.T) {
 			name:      "default filter produces whitelist not exclusion",
 			opts:      LogQueryOptions{},
 			projectID: "my-project",
-			expected:  `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages")`,
+			expected:  `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages" OR logName = "projects/my-project/logs/scion-artifacts")`,
 		},
 		{
 			name:      "whitelist excludes Cloud SQL logs implicitly",
 			opts:      LogQueryOptions{},
 			projectID: "my-project",
-			// The whitelist only admits scion-server, scion-agents, scion-messages.
+			// The whitelist only admits scion-server, scion-agents, scion-messages, scion-artifacts.
 			// A Cloud SQL logName like "projects/my-project/logs/cloudsql.googleapis.com%2Fpostgres.log"
 			// would NOT match any of these, so it is excluded.
-			expected: `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages")`,
+			expected: `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages" OR logName = "projects/my-project/logs/scion-artifacts")`,
 		},
 		{
 			name:      "whitelist excludes request log implicitly",
 			opts:      LogQueryOptions{},
 			projectID: "my-project",
 			// scion_request_log is NOT in the whitelist, so it is excluded.
-			expected: `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages")`,
+			expected: `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages" OR logName = "projects/my-project/logs/scion-artifacts")`,
 		},
 		{
 			name: "explicit LogID overrides whitelist",
@@ -207,7 +283,7 @@ func TestBuildLogFilter_Whitelist(t *testing.T) {
 				LogID: "scion-messages",
 			},
 			projectID: "my-project",
-			expected:  `logName = "projects/my-project/logs/scion-messages"`,
+			expected:  `logName = "projects/my-project/logs/scion-messages" AND NOT labels.log_kind = "event" AND (labels.sender:* OR labels.recipient:*)`,
 		},
 	}
 
@@ -234,7 +310,7 @@ func TestBuildLogFilter_HubName(t *testing.T) {
 				HubName: "scion-community",
 			},
 			projectID: "my-project",
-			expected:  `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages") AND labels.hub = "scion-community"`,
+			expected:  `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages" OR logName = "projects/my-project/logs/scion-artifacts") AND labels.hub = "scion-community"`,
 		},
 		{
 			name: "HubName filter omitted when empty",
@@ -242,7 +318,7 @@ func TestBuildLogFilter_HubName(t *testing.T) {
 				HubName: "",
 			},
 			projectID: "my-project",
-			expected:  `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages")`,
+			expected:  `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages" OR logName = "projects/my-project/logs/scion-artifacts")`,
 		},
 		{
 			name: "HubName filter with agent and severity",
@@ -252,7 +328,7 @@ func TestBuildLogFilter_HubName(t *testing.T) {
 				Severity: "ERROR",
 			},
 			projectID: "my-project",
-			expected:  `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages") AND labels.agent_id = "agent-123" AND severity >= ERROR AND labels.hub = "scion-gteam"`,
+			expected:  `(logName = "projects/my-project/logs/scion-server" OR logName = "projects/my-project/logs/scion-agents" OR logName = "projects/my-project/logs/scion-messages" OR logName = "projects/my-project/logs/scion-artifacts") AND labels.agent_id = "agent-123" AND severity >= ERROR AND labels.hub = "scion-gteam"`,
 		},
 		{
 			name: "HubName filter without project ID",
@@ -521,5 +597,107 @@ func TestConvertProtoLogEntry_Resource(t *testing.T) {
 	}
 	if result.Resource["type"] != "gce_instance" {
 		t.Errorf("Resource.type = %v, want %q", result.Resource["type"], "gce_instance")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEF-128b: ParticipantID filter
+// ---------------------------------------------------------------------------
+
+func TestBuildLogFilter_ParticipantID(t *testing.T) {
+	tests := []struct {
+		name      string
+		opts      LogQueryOptions
+		projectID string
+		want      string
+		wantIn    string // substring that must be present
+		wantOut   string // substring that must be absent
+	}{
+		{
+			name: "participant filter added for message logs",
+			opts: LogQueryOptions{
+				AgentID:       "agent-123",
+				ParticipantID: "user-456",
+				ProjectID:     "project-abc",
+				LogID:         "scion-messages",
+			},
+			projectID: "my-project",
+			wantIn:    `(labels.recipient_id = "user-456" OR labels.sender_id = "user-456")`,
+		},
+		{
+			name: "participant filter absent when ParticipantID is empty",
+			opts: LogQueryOptions{
+				AgentID:   "agent-123",
+				ProjectID: "project-abc",
+				LogID:     "scion-messages",
+			},
+			projectID: "my-project",
+			wantOut:   "user-456",
+		},
+		{
+			name: "participant filter applies regardless of LogID",
+			opts: LogQueryOptions{
+				AgentID:       "agent-123",
+				ParticipantID: "user-456",
+				LogID:         "scion-agents",
+			},
+			projectID: "my-project",
+			// Access-control constraint is unconditional on log-routing.
+			wantIn: `(labels.recipient_id = "user-456" OR labels.sender_id = "user-456")`,
+		},
+		{
+			name: "participant filter applies with no LogID",
+			opts: LogQueryOptions{
+				AgentID:       "agent-123",
+				ParticipantID: "user-456",
+			},
+			projectID: "",
+			wantIn:    `(labels.recipient_id = "user-456" OR labels.sender_id = "user-456")`,
+		},
+		{
+			name: "participant and agent filters coexist",
+			opts: LogQueryOptions{
+				AgentID:       "agent-123",
+				ParticipantID: "user-456",
+				LogID:         "scion-messages",
+			},
+			projectID: "my-project",
+			wantIn:    `(labels.recipient_id = "agent-123" OR labels.sender_id = "agent-123") AND NOT labels.log_kind = "event" AND (labels.sender:* OR labels.recipient:*)`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := BuildLogFilter(tt.opts, tt.projectID)
+			if tt.want != "" && result != tt.want {
+				t.Errorf("BuildLogFilter() = %q, want %q", result, tt.want)
+			}
+			if tt.wantIn != "" && !strings.Contains(result, tt.wantIn) {
+				t.Errorf("BuildLogFilter() = %q, want substring %q", result, tt.wantIn)
+			}
+			if tt.wantOut != "" && strings.Contains(result, tt.wantOut) {
+				t.Errorf("BuildLogFilter() = %q, must NOT contain %q", result, tt.wantOut)
+			}
+		})
+	}
+}
+
+// TestBuildLogFilter_DEF128b_MutationTest verifies that removing the
+// participant constraint causes the test to fail. This is the mutation
+// test required by the DEF-128b spec.
+func TestBuildLogFilter_DEF128b_MutationTest(t *testing.T) {
+	opts := LogQueryOptions{
+		AgentID:       "agent-123",
+		ParticipantID: "user-456",
+		LogID:         "scion-messages",
+	}
+	result := BuildLogFilter(opts, "my-project")
+
+	// The participant filter MUST be present.
+	if !strings.Contains(result, `labels.recipient_id = "user-456"`) {
+		t.Fatalf("DEF-128b mutation: participant recipient_id filter missing from %q", result)
+	}
+	if !strings.Contains(result, `labels.sender_id = "user-456"`) {
+		t.Fatalf("DEF-128b mutation: participant sender_id filter missing from %q", result)
 	}
 }

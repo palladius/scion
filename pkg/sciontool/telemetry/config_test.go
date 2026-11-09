@@ -39,6 +39,9 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	if cfg.CAFile != "" {
 		t.Errorf("Expected CAFile to be empty by default, got %q", cfg.CAFile)
 	}
+	if cfg.CertFile != "" || cfg.KeyFile != "" {
+		t.Errorf("Expected CertFile and KeyFile to be empty by default, got %q and %q", cfg.CertFile, cfg.KeyFile)
+	}
 	if cfg.MetricsDebug {
 		t.Error("Expected MetricsDebug to be false by default")
 	}
@@ -59,6 +62,8 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	if err := os.Setenv(EnvCAFile, "/etc/ssl/certs/custom-root.pem"); err != nil {
 		t.Fatalf("failed to set %s: %v", EnvCAFile, err)
 	}
+	_ = os.Setenv(EnvCertFile, "/etc/ssl/certs/client.pem")
+	_ = os.Setenv(EnvKeyFile, "/etc/ssl/private/client-key.pem")
 	_ = os.Setenv(EnvGRPCPort, "14317")
 	_ = os.Setenv(EnvHTTPPort, "14318")
 	_ = os.Setenv(EnvProjectID, "my-project")
@@ -86,6 +91,12 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	}
 	if cfg.CAFile != "/etc/ssl/certs/custom-root.pem" {
 		t.Errorf("Expected CAFile to be '/etc/ssl/certs/custom-root.pem', got %q", cfg.CAFile)
+	}
+	if cfg.CertFile != "/etc/ssl/certs/client.pem" {
+		t.Errorf("Expected CertFile to be '/etc/ssl/certs/client.pem', got %q", cfg.CertFile)
+	}
+	if cfg.KeyFile != "/etc/ssl/private/client-key.pem" {
+		t.Errorf("Expected KeyFile to be '/etc/ssl/private/client-key.pem', got %q", cfg.KeyFile)
 	}
 	if cfg.GRPCPort != 14317 {
 		t.Errorf("Expected GRPCPort to be 14317, got %d", cfg.GRPCPort)
@@ -153,39 +164,6 @@ func TestIsCloudConfigured(t *testing.T) {
 	}
 }
 
-func TestParseBoolEnv(t *testing.T) {
-	tests := []struct {
-		value      string
-		defaultVal bool
-		expected   bool
-	}{
-		{"", true, true},
-		{"", false, false},
-		{"true", false, true},
-		{"True", false, true},
-		{"TRUE", false, true},
-		{"1", false, true},
-		{"yes", false, true},
-		{"on", false, true},
-		{"false", true, false},
-		{"False", true, false},
-		{"0", true, false},
-		{"no", true, false},
-		{"off", true, false},
-		{"invalid", true, true},
-		{"invalid", false, false},
-	}
-
-	for _, tt := range tests {
-		_ = os.Setenv("TEST_BOOL", tt.value)
-		got := parseBoolEnv("TEST_BOOL", tt.defaultVal)
-		if got != tt.expected {
-			t.Errorf("parseBoolEnv(%q, %v) = %v, want %v", tt.value, tt.defaultVal, got, tt.expected)
-		}
-	}
-	_ = os.Unsetenv("TEST_BOOL")
-}
-
 func TestParseCSVEnv(t *testing.T) {
 	tests := []struct {
 		value    string
@@ -222,19 +200,30 @@ func TestIsCloudConfigured_GCP(t *testing.T) {
 		expected bool
 	}{
 		{
-			name: "gcp with credentials",
+			name: "gcp with credentials and project ID",
+			config: &Config{
+				CloudEnabled:       true,
+				CloudProvider:      "gcp",
+				GCPCredentialsFile: "/path/to/creds.json",
+				ProjectID:          "my-project",
+			},
+			expected: true,
+		},
+		{
+			name: "gcp without project ID returns false",
 			config: &Config{
 				CloudEnabled:       true,
 				CloudProvider:      "gcp",
 				GCPCredentialsFile: "/path/to/creds.json",
 			},
-			expected: true,
+			expected: false,
 		},
 		{
-			name: "gcp without credentials (ADC fallback)",
+			name: "gcp without credentials but with project ID (ADC fallback)",
 			config: &Config{
 				CloudEnabled:  true,
 				CloudProvider: "gcp",
+				ProjectID:     "my-project",
 			},
 			expected: true,
 		},
@@ -244,15 +233,17 @@ func TestIsCloudConfigured_GCP(t *testing.T) {
 				CloudEnabled:       false,
 				CloudProvider:      "gcp",
 				GCPCredentialsFile: "/path/to/creds.json",
+				ProjectID:          "my-project",
 			},
 			expected: false,
 		},
 		{
-			name: "gcp with credentials and no endpoint is OK",
+			name: "gcp with credentials and project ID, no endpoint is OK",
 			config: &Config{
 				CloudEnabled:       true,
 				CloudProvider:      "gcp",
 				GCPCredentialsFile: "/path/to/creds.json",
+				ProjectID:          "my-project",
 				Endpoint:           "", // no endpoint needed for GCP
 			},
 			expected: true,
@@ -542,13 +533,32 @@ func TestIsGCP_WithEndpointNoCreds(t *testing.T) {
 	cfg := &Config{
 		CloudEnabled:  true,
 		CloudProvider: "gcp",
+		ProjectID:     "my-project",
 		Endpoint:      "cloudtrace.googleapis.com:443",
 	}
 	if !cfg.IsGCP() {
 		t.Error("IsGCP() should return true when CloudProvider=gcp, even without credentials file")
 	}
 	if !cfg.IsCloudConfigured() {
-		t.Error("IsCloudConfigured() should return true when CloudProvider=gcp, even without credentials file")
+		t.Error("IsCloudConfigured() should return true when CloudProvider=gcp with project ID, even without credentials file")
+	}
+}
+
+func TestIsCloudConfigured_GCPRequiresProjectID(t *testing.T) {
+	// GCP mode without a ProjectID should not be considered configured,
+	// preventing indefinite retry loops when credentials exist but project
+	// ID is missing.
+	cfg := &Config{
+		CloudEnabled:       true,
+		CloudProvider:      "gcp",
+		GCPCredentialsFile: "/path/to/creds.json",
+	}
+	if cfg.IsCloudConfigured() {
+		t.Error("IsCloudConfigured() should return false when CloudProvider=gcp but ProjectID is empty")
+	}
+	cfg.ProjectID = "my-project"
+	if !cfg.IsCloudConfigured() {
+		t.Error("IsCloudConfigured() should return true when CloudProvider=gcp and ProjectID is set")
 	}
 }
 
@@ -578,6 +588,8 @@ func clearTelemetryEnv() {
 	if err := os.Unsetenv(EnvCAFile); err != nil {
 		panic(err)
 	}
+	_ = os.Unsetenv(EnvCertFile)
+	_ = os.Unsetenv(EnvKeyFile)
 	_ = os.Unsetenv(EnvGRPCPort)
 	_ = os.Unsetenv(EnvHTTPPort)
 	_ = os.Unsetenv(EnvFilterExclude)

@@ -16,19 +16,47 @@ package hub
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/permissions"
 	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/google/uuid"
 )
 
-// mockUATStore implements store.UserAccessTokenStore for testing.
+// ---------------------------------------------------------------------------
+// Unit tests for ValidateToken, expandScopes, ScopedUserIdentity, IsUAT.
+// These exercise internal helpers that do not require the bounded domain
+// service (authorization, transactions, audit). The full integration matrix
+// for CreateToken/RevokeToken/DeleteToken lives in rs4_credential_test.go.
+// ---------------------------------------------------------------------------
+
+// mockUATStore implements store.UserAccessTokenStore for validate-only tests.
+// ValidateToken updates last-used from a background goroutine, so every
+// access to tokens goes through mu. Tests that edit a stored row use mutate.
 type mockUATStore struct {
 	mu     sync.Mutex
 	tokens map[string]*store.UserAccessToken
+}
+
+// mutate applies fn to the stored token with the given ID while holding mu.
+func (m *mockUATStore) mutate(t *testing.T, id string, fn func(*store.UserAccessToken)) {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tok, ok := m.tokens[id]
+	if !ok {
+		t.Fatalf("token %q not found in mock store", id)
+	}
+	fn(tok)
 }
 
 func newMockUATStore() *mockUATStore {
@@ -40,11 +68,6 @@ func (m *mockUATStore) CreateUserAccessToken(_ context.Context, token *store.Use
 	defer m.mu.Unlock()
 	if _, exists := m.tokens[token.ID]; exists {
 		return store.ErrAlreadyExists
-	}
-	for _, t := range m.tokens {
-		if t.KeyHash == token.KeyHash {
-			return store.ErrAlreadyExists
-		}
 	}
 	cp := *token
 	m.tokens[token.ID] = &cp
@@ -131,191 +154,115 @@ func (m *mockUATStore) CountUserAccessTokens(_ context.Context, userID string) (
 	return count, nil
 }
 
-// mockUserStore implements store.UserStore for testing (minimal).
-type mockUserStore struct {
-	users map[string]*store.User
-}
-
-func (m *mockUserStore) GetUser(_ context.Context, id string) (*store.User, error) {
-	u, ok := m.users[id]
-	if !ok {
-		return nil, store.ErrNotFound
+func (m *mockUATStore) RevokeUserAccessTokensForUser(_ context.Context, userID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, t := range m.tokens {
+		if t.UserID == userID && !t.Revoked {
+			t.Revoked = true
+			n++
+		}
 	}
-	return u, nil
-}
-func (m *mockUserStore) GetUserByEmail(context.Context, string) (*store.User, error) {
-	return nil, store.ErrNotFound
-}
-func (m *mockUserStore) CreateUser(context.Context, *store.User) error { return nil }
-func (m *mockUserStore) UpdateUser(context.Context, *store.User) error { return nil }
-func (m *mockUserStore) ListUsers(context.Context, store.UserFilter, store.ListOptions) (*store.ListResult[store.User], error) {
-	return nil, nil
-}
-func (m *mockUserStore) DeleteUser(context.Context, string) error                    { return nil }
-func (m *mockUserStore) UpdateUserLastSeen(context.Context, string, time.Time) error { return nil }
-func (m *mockUserStore) IsUserInvitedOrActive(context.Context, string) (bool, error) {
-	return false, nil
+	return n, nil
 }
 
-// mockProjectStore implements store.ProjectStore for testing (minimal).
-type mockProjectStore struct {
-	projects map[string]*store.Project
-}
-
-func (m *mockProjectStore) GetProject(_ context.Context, id string) (*store.Project, error) {
-	g, ok := m.projects[id]
-	if !ok {
-		return nil, store.ErrNotFound
+func (m *mockUATStore) DeleteUserAccessTokensByProject(_ context.Context, projectID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	count := 0
+	for id, t := range m.tokens {
+		if t.ProjectID == projectID {
+			delete(m.tokens, id)
+			count++
+		}
 	}
-	return g, nil
-}
-func (m *mockProjectStore) CreateProject(context.Context, *store.Project) error { return nil }
-func (m *mockProjectStore) UpdateProject(context.Context, *store.Project) error { return nil }
-func (m *mockProjectStore) DeleteProject(context.Context, string) error         { return nil }
-func (m *mockProjectStore) GetProjectBySlug(context.Context, string) (*store.Project, error) {
-	return nil, store.ErrNotFound
-}
-func (m *mockProjectStore) GetProjectBySlugCaseInsensitive(context.Context, string) (*store.Project, error) {
-	return nil, store.ErrNotFound
-}
-func (m *mockProjectStore) GetProjectsByGitRemote(context.Context, string) ([]*store.Project, error) {
-	return []*store.Project{}, nil
-}
-func (m *mockProjectStore) NextAvailableSlug(_ context.Context, baseSlug string) (string, error) {
-	return baseSlug, nil
-}
-func (m *mockProjectStore) ListProjects(context.Context, store.ProjectFilter, store.ListOptions) (*store.ListResult[store.Project], error) {
-	return nil, nil
+	return count, nil
 }
 
-func newTestUATService() (*UserAccessTokenService, *mockUATStore, *mockUserStore) {
+func (m *mockUATStore) LockUserForTokens(_ context.Context, _ string) error {
+	return nil
+}
+
+// newTestValidateService creates a minimal UAT service for ValidateToken tests.
+func newTestValidateService() (*UserAccessTokenService, *mockUATStore, *mockUserStore) {
 	tokenStore := newMockUATStore()
 	userStore := &mockUserStore{
 		users: map[string]*store.User{
-			tid("user-1"): {ID: tid("user-1"), Email: "test@example.com", DisplayName: "Test User", Role: "member"},
+			tid("user-1"): {ID: tid("user-1"), Email: "test@example.com", DisplayName: "Test User", Role: "member", Status: store.UserStatusActive},
 		},
 	}
-	projectStore := &mockProjectStore{
-		projects: map[string]*store.Project{
-			tid("project-1"): {ID: tid("project-1"), Name: "test-project"},
-		},
+	svc := &UserAccessTokenService{
+		tokens:  tokenStore,
+		users:   userStore,
+		nowFunc: time.Now,
+		logger:  slog.Default(),
 	}
-	svc := NewUserAccessTokenService(tokenStore, userStore, projectStore)
 	return svc, tokenStore, userStore
 }
 
-func TestCreateToken(t *testing.T) {
-	svc, _, _ := newTestUATService()
-	ctx := context.Background()
+// seedTestToken creates a real token (with proper hash) directly in the store.
+type testTokenPair struct {
+	plaintext string
+	stored    *store.UserAccessToken
+}
 
-	t.Run("basic creation", func(t *testing.T) {
-		key, token, err := svc.CreateToken(ctx, tid("user-1"), "ci-token", tid("project-1"),
-			[]string{"agent:dispatch", "agent:read"}, nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if !strings.HasPrefix(key, store.UATPrefix) {
-			t.Errorf("expected key to start with %q, got %q", store.UATPrefix, key[:20])
-		}
-		if token.Name != "ci-token" {
-			t.Errorf("expected name 'ci-token', got %q", token.Name)
-		}
-		if token.ProjectID != tid("project-1") {
-			t.Errorf("expected projectID 'project-1', got %q", token.ProjectID)
-		}
-		if len(token.Scopes) != 2 {
-			t.Errorf("expected 2 scopes, got %d", len(token.Scopes))
-		}
-		if token.ExpiresAt == nil {
-			t.Error("expected default expiry to be set")
-		}
-	})
+func seedTestToken(t *testing.T, tokenStore *mockUATStore, userID, projectID string, scopes []string) testTokenPair {
+	t.Helper()
 
-	t.Run("expands agent:manage", func(t *testing.T) {
-		_, token, err := svc.CreateToken(ctx, tid("user-1"), "manage-token", tid("project-1"),
-			[]string{"agent:manage"}, nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(token.Scopes) != len(store.UATManageScopes) {
-			t.Errorf("expected %d expanded scopes, got %d", len(store.UATManageScopes), len(token.Scopes))
-		}
-	})
+	randomBytes := make([]byte, UATRandomBytes)
+	if _, err := rand.Read(randomBytes); err != nil {
+		t.Fatalf("failed to generate random bytes: %v", err)
+	}
 
-	t.Run("accepts project:update", func(t *testing.T) {
-		_, token, err := svc.CreateToken(ctx, tid("user-1"), "proj-update-token", tid("project-1"),
-			[]string{"project:read", "project:update"}, nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		found := false
-		for _, sc := range token.Scopes {
-			if sc == store.UATScopeProjectUpdate {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("expected project:update in token scopes, got %v", token.Scopes)
-		}
-	})
+	keyBody := base64.RawURLEncoding.EncodeToString(randomBytes)
+	fullKey := store.UATPrefix + keyBody
+	prefix := store.UATPrefix + keyBody[:UATPrefixLength]
+	hash := sha256.Sum256([]byte(fullKey))
+	hashStr := hex.EncodeToString(hash[:])
 
-	t.Run("rejects invalid scope", func(t *testing.T) {
-		_, _, err := svc.CreateToken(ctx, tid("user-1"), "bad-token", tid("project-1"),
-			[]string{"invalid:scope"}, nil)
-		if !errors.Is(err, ErrInvalidUATScope) {
-			t.Errorf("expected ErrInvalidUATScope, got %v", err)
-		}
-	})
-
-	t.Run("rejects missing project", func(t *testing.T) {
-		_, _, err := svc.CreateToken(ctx, tid("user-1"), "bad-token", "nonexistent",
-			[]string{"agent:read"}, nil)
-		if err == nil {
-			t.Error("expected error for nonexistent project")
-		}
-	})
-
-	t.Run("rejects expiry too long", func(t *testing.T) {
-		tooFar := time.Now().Add(400 * 24 * time.Hour)
-		_, _, err := svc.CreateToken(ctx, tid("user-1"), "bad-token", tid("project-1"),
-			[]string{"agent:read"}, &tooFar)
-		if !errors.Is(err, ErrUATExpiryTooLong) {
-			t.Errorf("expected ErrUATExpiryTooLong, got %v", err)
-		}
-	})
-
-	t.Run("rejects empty scopes", func(t *testing.T) {
-		_, _, err := svc.CreateToken(ctx, tid("user-1"), "bad-token", tid("project-1"),
-			[]string{}, nil)
-		if err == nil {
-			t.Error("expected error for empty scopes")
-		}
-	})
+	future := time.Now().Add(90 * 24 * time.Hour)
+	tok := &store.UserAccessToken{
+		ID:           uuid.New().String(),
+		UserID:       userID,
+		Name:         "test-token",
+		Prefix:       prefix,
+		KeyHash:      hashStr,
+		BoundaryKind: string(permissions.BoundaryKindProject),
+		ProjectID:    projectID,
+		Scopes:       scopes,
+		ExpiresAt:    &future,
+		Created:      time.Now(),
+	}
+	if err := tokenStore.CreateUserAccessToken(context.Background(), tok); err != nil {
+		t.Fatalf("failed to seed token: %v", err)
+	}
+	return testTokenPair{plaintext: fullKey, stored: tok}
 }
 
 func TestValidateToken(t *testing.T) {
-	svc, _, _ := newTestUATService()
+	svc, tokenStore, _ := newTestValidateService()
 	ctx := context.Background()
 
-	key, _, err := svc.CreateToken(ctx, tid("user-1"), "test-token", tid("project-1"),
-		[]string{"agent:dispatch", "agent:read"}, nil)
-	if err != nil {
-		t.Fatalf("failed to create token: %v", err)
-	}
+	token := seedTestToken(t, tokenStore, tid("user-1"), tid("project-1"),
+		[]string{"agent:attach", "agent:read"})
 
 	t.Run("valid token", func(t *testing.T) {
-		identity, err := svc.ValidateToken(ctx, key)
+		identity, err := svc.ValidateToken(ctx, token.plaintext)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if identity.ID() != tid("user-1") {
 			t.Errorf("expected user ID 'user-1', got %q", identity.ID())
 		}
-		if identity.ScopedProjectID() != tid("project-1") {
-			t.Errorf("expected project 'project-1', got %q", identity.ScopedProjectID())
+		if identity.Boundary().ProjectID != tid("project-1") {
+			t.Errorf("expected project 'project-1', got %q", identity.Boundary().ProjectID)
 		}
-		if !identity.HasScope("agent:dispatch") {
-			t.Error("expected identity to have scope agent:dispatch")
+		if identity.CredentialID() != token.stored.ID {
+			t.Errorf("expected credential ID %q, got %q", token.stored.ID, identity.CredentialID())
+		}
+		if !identity.HasScope("agent:attach") {
+			t.Error("expected identity to have scope agent:attach")
 		}
 		if identity.HasScope("agent:delete") {
 			t.Error("expected identity NOT to have scope agent:delete")
@@ -335,109 +282,201 @@ func TestValidateToken(t *testing.T) {
 			t.Errorf("expected ErrInvalidUATFormat, got %v", err)
 		}
 	})
-}
 
-func TestRevokeToken(t *testing.T) {
-	svc, _, _ := newTestUATService()
-	ctx := context.Background()
-
-	key, token, err := svc.CreateToken(ctx, tid("user-1"), "test-token", tid("project-1"),
-		[]string{"agent:read"}, nil)
-	if err != nil {
-		t.Fatalf("failed to create token: %v", err)
-	}
-
-	// Revoke it
-	if err := svc.RevokeToken(ctx, tid("user-1"), token.ID); err != nil {
-		t.Fatalf("failed to revoke token: %v", err)
-	}
-
-	// Validation should fail
-	_, err = svc.ValidateToken(ctx, key)
-	if !errors.Is(err, ErrUATRevoked) {
-		t.Errorf("expected ErrUATRevoked after revocation, got %v", err)
-	}
-
-	// Wrong user can't revoke
-	if err := svc.RevokeToken(ctx, tid("other-user"), token.ID); !errors.Is(err, store.ErrNotFound) {
-		t.Errorf("expected ErrNotFound for wrong user, got %v", err)
-	}
-}
-
-func TestDeleteToken(t *testing.T) {
-	svc, _, _ := newTestUATService()
-	ctx := context.Background()
-
-	key, token, err := svc.CreateToken(ctx, tid("user-1"), "test-token", tid("project-1"),
-		[]string{"agent:read"}, nil)
-	if err != nil {
-		t.Fatalf("failed to create token: %v", err)
-	}
-
-	if err := svc.DeleteToken(ctx, tid("user-1"), token.ID); err != nil {
-		t.Fatalf("failed to delete token: %v", err)
-	}
-
-	// Validation should fail
-	_, err = svc.ValidateToken(ctx, key)
-	if !errors.Is(err, ErrInvalidUAT) {
-		t.Errorf("expected ErrInvalidUAT after deletion, got %v", err)
-	}
-}
-
-func TestTokenLimit(t *testing.T) {
-	svc, _, _ := newTestUATService()
-	ctx := context.Background()
-
-	// Create max tokens
-	for i := 0; i < store.UATMaxPerUser; i++ {
-		_, _, err := svc.CreateToken(ctx, tid("user-1"), "token-"+string(rune('a'+i%26))+string(rune('0'+i/26)), tid("project-1"),
-			[]string{"agent:read"}, nil)
-		if err != nil {
-			t.Fatalf("failed to create token %d: %v", i, err)
+	t.Run("revoked token", func(t *testing.T) {
+		revokedToken := seedTestToken(t, tokenStore, tid("user-1"), tid("project-1"),
+			[]string{"agent:read"})
+		tokenStore.mutate(t, revokedToken.stored.ID, func(tok *store.UserAccessToken) {
+			tok.Revoked = true
+		})
+		_, err := svc.ValidateToken(ctx, revokedToken.plaintext)
+		if !errors.Is(err, ErrUATRevoked) {
+			t.Errorf("expected ErrUATRevoked, got %v", err)
 		}
-	}
+	})
 
-	// Next one should fail
-	_, _, err := svc.CreateToken(ctx, tid("user-1"), "one-too-many", tid("project-1"),
-		[]string{"agent:read"}, nil)
-	if !errors.Is(err, ErrUATLimitExceeded) {
-		t.Errorf("expected ErrUATLimitExceeded, got %v", err)
+	t.Run("expired token", func(t *testing.T) {
+		expiredToken := seedTestToken(t, tokenStore, tid("user-1"), tid("project-1"),
+			[]string{"agent:read"})
+		past := time.Now().Add(-1 * time.Hour)
+		tokenStore.mutate(t, expiredToken.stored.ID, func(tok *store.UserAccessToken) {
+			tok.ExpiresAt = &past
+		})
+		_, err := svc.ValidateToken(ctx, expiredToken.plaintext)
+		if !errors.Is(err, ErrUATExpired) {
+			t.Errorf("expected ErrUATExpired, got %v", err)
+		}
+	})
+}
+
+// TestValidateToken_RejectsMalformedStoredBoundary pins that a stored row
+// whose boundary_kind/project_id combination is invalid must never
+// authenticate. Each case simulates a row a real database could never
+// produce through CreateUserAccessToken's own ValidateBoundary call — the
+// point is that ValidateToken denies it anyway, as a second, independent
+// check at load, not just at write. An empty or malformed project ID is
+// never coerced into a hub boundary.
+func TestValidateToken_RejectsMalformedStoredBoundary(t *testing.T) {
+	cases := []struct {
+		name         string
+		boundaryKind string
+		projectID    string
+	}{
+		{"hub kind with a project id set", "hub", tid("mismatch-project")},
+		{"empty kind", "", tid("mismatch-project")},
+		{"unrecognized kind", "org", tid("mismatch-project")},
+		{"project kind with an empty project id", "project", ""},
+		{"project kind with the nil uuid as project id", "project", "00000000-0000-0000-0000-000000000000"},
+		{"project kind with a non-uuid project id", "project", "not-a-uuid"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			svc, tokenStore, _ := newTestValidateService()
+			token := seedTestToken(t, tokenStore, tid("user-1"), tid("mismatch-project"), []string{"agent:read"})
+
+			// Overwrite the stored row directly: no production write path
+			// (CreateUserAccessToken) can produce this shape, but a stored
+			// row's own load-time validation must still catch it — belt and
+			// suspenders, since a malformed row must never authenticate
+			// regardless of how it came to exist.
+			tokenStore.mutate(t, token.stored.ID, func(stored *store.UserAccessToken) {
+				stored.BoundaryKind = c.boundaryKind
+				stored.ProjectID = c.projectID
+			})
+
+			_, err := svc.ValidateToken(context.Background(), token.plaintext)
+			if !errors.Is(err, ErrInvalidUAT) {
+				t.Errorf("expected ErrInvalidUAT, got %v", err)
+			}
+			var rejection *UATRejection
+			if !errors.As(err, &rejection) {
+				t.Fatalf("expected a *UATRejection, got %T: %v", err, err)
+			}
+			if rejection.Reason != "invalid" {
+				t.Errorf("expected reason %q, got %q", "invalid", rejection.Reason)
+			}
+			if !rejection.Found || rejection.TokenID != token.stored.ID {
+				t.Errorf("expected Found=true and TokenID=%q (a matched, rejected record), got Found=%v TokenID=%q",
+					token.stored.ID, rejection.Found, rejection.TokenID)
+			}
+		})
 	}
 }
 
-func TestListTokens(t *testing.T) {
-	svc, _, _ := newTestUATService()
-	ctx := context.Background()
+// TestValidateToken_CarriesStoredBoundary pins that ValidateToken carries
+// the stored row's boundary kind and project ID onto the ScopedUserIdentity,
+// and that credentialContextForIdentity fills CredentialContext.Boundary
+// from that identity, for both boundary kinds.
+func TestValidateToken_CarriesStoredBoundary(t *testing.T) {
+	projectID := tid("carried-project")
+	cases := []struct {
+		name           string
+		boundaryKind   string
+		projectID      string
+		wantBoundary   TokenBoundary
+		wantProjectID  string
+		wantDecoration decorationBoundary
+	}{
+		{
+			name:           "hub row",
+			boundaryKind:   string(permissions.BoundaryKindHub),
+			projectID:      "",
+			wantBoundary:   TokenBoundary{Kind: BoundaryKindHub, ProjectID: ""},
+			wantProjectID:  "",
+			wantDecoration: decorationBoundary{Kind: "hub", ProjectID: ""},
+		},
+		{
+			name:           "project row",
+			boundaryKind:   string(permissions.BoundaryKindProject),
+			projectID:      projectID,
+			wantBoundary:   TokenBoundary{Kind: BoundaryKindProject, ProjectID: projectID},
+			wantProjectID:  projectID,
+			wantDecoration: decorationBoundary{Kind: "project", ProjectID: projectID},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			svc, tokenStore, _ := newTestValidateService()
+			token := seedTestToken(t, tokenStore, tid("user-1"), projectID, []string{"agent:read"})
+			tokenStore.mutate(t, token.stored.ID, func(stored *store.UserAccessToken) {
+				stored.BoundaryKind = c.boundaryKind
+				stored.ProjectID = c.projectID
+			})
 
-	// Create 3 tokens
-	for i := 0; i < 3; i++ {
-		_, _, err := svc.CreateToken(ctx, tid("user-1"), "token-"+string(rune('a'+i)), tid("project-1"),
-			[]string{"agent:read"}, nil)
-		if err != nil {
-			t.Fatalf("failed to create token: %v", err)
-		}
-	}
+			identity, err := svc.ValidateToken(context.Background(), token.plaintext)
+			if err != nil {
+				t.Fatalf("ValidateToken: %v", err)
+			}
+			if got := identity.Boundary(); got != c.wantBoundary {
+				t.Errorf("identity.Boundary() = %+v, want %+v", got, c.wantBoundary)
+			}
+			if got := identity.Boundary().ProjectID; got != c.wantProjectID {
+				t.Errorf("identity.Boundary().ProjectID = %q, want %q", got, c.wantProjectID)
+			}
 
-	tokens, err := svc.ListTokens(ctx, tid("user-1"))
-	if err != nil {
-		t.Fatalf("failed to list tokens: %v", err)
-	}
-	if len(tokens) != 3 {
-		t.Errorf("expected 3 tokens, got %d", len(tokens))
-	}
+			cc := credentialContextForIdentity(identity)
+			if cc.Kind != CredentialKindUAT {
+				t.Errorf("CredentialContext.Kind = %q, want %q", cc.Kind, CredentialKindUAT)
+			}
+			if cc.Boundary == nil {
+				t.Fatalf("CredentialContext.Boundary is nil for a UAT identity")
+			}
+			if *cc.Boundary != c.wantBoundary {
+				t.Errorf("CredentialContext.Boundary = %+v, want %+v", *cc.Boundary, c.wantBoundary)
+			}
+			if cc.ProjectID != c.wantProjectID {
+				t.Errorf("CredentialContext.ProjectID = %q, want %q", cc.ProjectID, c.wantProjectID)
+			}
 
-	// Different user should see no tokens
-	tokens, err = svc.ListTokens(ctx, "user-2")
-	if err != nil {
-		t.Fatalf("failed to list tokens: %v", err)
+			decoration := identity.Decoration()
+			if decoration == nil {
+				t.Fatalf("identity.Decoration() is nil for a UAT identity")
+			}
+			if decoration.Boundary != c.wantDecoration {
+				t.Errorf("identity.Decoration().Boundary = %+v, want %+v", decoration.Boundary, c.wantDecoration)
+			}
+		})
 	}
-	if len(tokens) != 0 {
-		t.Errorf("expected 0 tokens for other user, got %d", len(tokens))
+}
+
+// TestCredentialContextForIdentity_BoundaryOnlyForUAT pins that
+// CredentialContext.Boundary is nil for every identity that is not a
+// non-nil UAT identity: each non-UAT arm of credentialContextForIdentity, a
+// typed-nil *ScopedUserIdentity, and a nil Identity.
+func TestCredentialContextForIdentity_BoundaryOnlyForUAT(t *testing.T) {
+	var typedNilUAT *ScopedUserIdentity
+	cases := []struct {
+		name     string
+		identity Identity
+	}{
+		{"nil identity", nil},
+		{"typed-nil UAT identity", typedNilUAT},
+		{"interactive user", &AuthenticatedUser{}},
+		{"dev user", &DevUser{}},
+		{"agent JWT identity", &agentIdentityWrapper{}},
+		{"stored agent identity", &storedAgentIdentity{}},
+		{"peer agent identity", &peerAgentIdentity{}},
+		{"explain agent identity", &explainAgentIdentity{}},
+		{"federated user", &FederatedUserIdentity{}},
+		{"federated agent", &FederatedAgentIdentity{}},
+		{"federated service", &FederatedServiceIdentity{}},
+		{"broker", &brokerIdentityImpl{}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if cc := credentialContextForIdentity(c.identity); cc.Boundary != nil {
+				t.Errorf("CredentialContext.Boundary = %+v, want nil", *cc.Boundary)
+			}
+		})
 	}
 }
 
 func TestExpandScopes(t *testing.T) {
+	skillManageCount := len(permissions.UATManageScopesFor(permissions.ResourceSkill))
+	templateManageCount := len(permissions.UATManageScopesFor(permissions.ResourceTemplate))
+	harnessConfigManageCount := len(permissions.UATManageScopesFor(permissions.ResourceHarnessConfig))
+	groupManageCount := len(permissions.UATManageScopesFor(permissions.ResourceGroup))
+
 	tests := []struct {
 		name     string
 		input    []string
@@ -448,6 +487,14 @@ func TestExpandScopes(t *testing.T) {
 		{"manage with extra", []string{"agent:manage", "project:read"}, len(store.UATManageScopes) + 1},
 		{"dedup", []string{"agent:read", "agent:read"}, 1},
 		{"manage dedup with explicit", []string{"agent:manage", "agent:read"}, len(store.UATManageScopes)},
+		{"skill:manage alias", []string{"skill:manage"}, skillManageCount},
+		{"template:manage alias", []string{"template:manage"}, templateManageCount},
+		{"harness_config:manage alias", []string{"harness_config:manage"}, harnessConfigManageCount},
+		{"group:manage alias", []string{"group:manage"}, groupManageCount},
+		{"skill:manage with extra", []string{"skill:manage", "agent:read"}, skillManageCount + 1},
+		{"skill:manage dedup with explicit", []string{"skill:manage", "skill:read"}, skillManageCount},
+		{"multiple manage aliases", []string{"agent:manage", "skill:manage"}, len(store.UATManageScopes) + skillManageCount},
+		{"group:manage with extra and dedup", []string{"group:manage", "group:read", "project:read"}, groupManageCount + 1},
 	}
 
 	for _, tc := range tests {
@@ -460,9 +507,26 @@ func TestExpandScopes(t *testing.T) {
 	}
 }
 
+func TestExpandScopes_ManageAliasesExpandToCorrectResource(t *testing.T) {
+	for alias, resource := range permissions.UATManageAliases {
+		t.Run(alias, func(t *testing.T) {
+			result := expandScopes([]string{alias})
+			if len(result) == 0 {
+				t.Fatalf("%s expanded to zero scopes", alias)
+			}
+			prefix := resource + ":"
+			for _, scope := range result {
+				if !strings.HasPrefix(scope, prefix) {
+					t.Errorf("%s expanded to non-%s scope %q", alias, resource, scope)
+				}
+			}
+		})
+	}
+}
+
 func TestScopedUserIdentity(t *testing.T) {
 	base := NewAuthenticatedUser(tid("user-1"), "test@example.com", "Test", "member", "api")
-	scoped := NewScopedUserIdentity(base, tid("project-1"), []string{"agent:dispatch", "agent:read"})
+	scoped := NewScopedUserIdentity(base, tid("project-1"), []string{"agent:attach", "agent:read"})
 
 	if scoped.ID() != tid("user-1") {
 		t.Errorf("expected ID 'user-1', got %q", scoped.ID())
@@ -470,11 +534,11 @@ func TestScopedUserIdentity(t *testing.T) {
 	if scoped.Email() != "test@example.com" {
 		t.Errorf("expected email 'test@example.com', got %q", scoped.Email())
 	}
-	if scoped.ScopedProjectID() != tid("project-1") {
-		t.Errorf("expected project 'project-1', got %q", scoped.ScopedProjectID())
+	if scoped.Boundary().ProjectID != tid("project-1") {
+		t.Errorf("expected project 'project-1', got %q", scoped.Boundary().ProjectID)
 	}
-	if !scoped.HasScope("agent:dispatch") {
-		t.Error("expected HasScope('agent:dispatch') to be true")
+	if !scoped.HasScope("agent:attach") {
+		t.Error("expected HasScope('agent:attach') to be true")
 	}
 	if scoped.HasScope("agent:delete") {
 		t.Error("expected HasScope('agent:delete') to be false")

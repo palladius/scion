@@ -60,10 +60,11 @@ while IFS= read -r harness_step; do
 done < <(emit_harness_steps)
 ALL_STEP_IDS+=(
   scion-hub
+  scion-omni
 )
 
 # All known target names. Used by the orchestrator's --help and --target
-# validation.
+# validation. Includes both group targets and individual step IDs.
 # shellcheck disable=SC2034 # sourced library; ALL_TARGETS is read by build-images.sh
 ALL_TARGETS=(
   core-base
@@ -71,10 +72,26 @@ ALL_TARGETS=(
   scion-base
   harnesses
   hub
+  omni
   common
   all
   thick
 )
+# Append individual step IDs that are not already group targets, so they
+# appear in --help and in the error message for unknown targets.
+for _step_id in "${ALL_STEP_IDS[@]}"; do
+  _already="false"
+  for _t in "${ALL_TARGETS[@]}"; do
+    if [[ "${_step_id}" == "${_t}" ]]; then
+      _already="true"
+      break
+    fi
+  done
+  if [[ "${_already}" == "false" ]]; then
+    ALL_TARGETS+=("${_step_id}")
+  fi
+done
+unset _step_id _already _t
 
 # resolve_targets <target>
 #
@@ -93,6 +110,9 @@ resolve_targets() {
       ;;
     hub)
       echo scion-hub
+      ;;
+    omni)
+      printf '%s\n' "${_OMNI_CHAIN[@]}"
       ;;
     common)
       printf '%s\n' scion-base
@@ -113,6 +133,14 @@ resolve_targets() {
       printf '%s\n' scion-hub
       ;;
     *)
+      # Allow individual step IDs (e.g. scion-claude, scion-hub) as targets.
+      local _id
+      for _id in "${ALL_STEP_IDS[@]}"; do
+        if [[ "$1" == "${_id}" ]]; then
+          echo "$1"
+          return 0
+        fi
+      done
       return 1
       ;;
   esac
@@ -133,6 +161,7 @@ step_dockerfile() {
     thick-prep)    echo "${IMAGE_BUILD_DIR}/thick-prep/Dockerfile" ;;
     scion-base)    echo "${IMAGE_BUILD_DIR}/scion-base/Dockerfile" ;;
     scion-hub)     echo "${IMAGE_BUILD_DIR}/hub/Dockerfile" ;;
+    scion-omni)    echo "${IMAGE_BUILD_DIR}/omni/Dockerfile" ;;
     *)
       if is_harness_step "$1"; then
         echo "${REPO_ROOT}/harnesses/${1#scion-}/Dockerfile"
@@ -146,14 +175,19 @@ step_dockerfile() {
 # step_context_dir <step_id>
 #
 # Echoes the absolute path to the build context for the step. scion-base
-# uses the repo root because it copies go source; everything else uses its
-# own image-build subdirectory.
+# uses the repo root because it copies go source; core-base and thick-prep use
+# image-build/ itself so both can COPY the shared lib/ scripts they run
+# (install-core-toolchain.sh, verify-base-contract.sh) -- docker cannot COPY
+# from outside the context, and duplicating those scripts per-directory is
+# exactly the drift they exist to prevent. Everything else uses its own
+# image-build subdirectory.
 step_context_dir() {
   case "$1" in
-    core-base)     echo "${IMAGE_BUILD_DIR}/core-base" ;;
-    thick-prep)    echo "${IMAGE_BUILD_DIR}/thick-prep" ;;
+    core-base)     echo "${IMAGE_BUILD_DIR}" ;;
+    thick-prep)    echo "${IMAGE_BUILD_DIR}" ;;
     scion-base)    echo "${REPO_ROOT}" ;;
     scion-hub)     echo "${IMAGE_BUILD_DIR}/hub" ;;
+    scion-omni)    echo "${REPO_ROOT}" ;;
     *)
       if is_harness_step "$1"; then
         echo "${REPO_ROOT}/harnesses/${1#scion-}"
@@ -164,10 +198,39 @@ step_context_dir() {
   esac
 }
 
+# Omni chain order — single source for the harness subset included in the
+# single-node omni image. resolve_targets (above) and step_build_args (below)
+# both consume this array. cloudbuild-omni.yaml has a static copy that must
+# be kept in sync manually.
+# When OMNI_BUILD is true, harnesses chain to each other instead of all
+# branching from scion-base:
+#   scion-base -> claude -> codex -> opencode -> antigravity -> grok-build -> omni
+_OMNI_CHAIN=(scion-claude scion-codex scion-opencode scion-antigravity scion-grok-build scion-omni)
+
+# _omni_chain_parent <step_id>
+#
+# Returns the parent step for the given step in the omni chain, or empty if
+# the step is not in the chain. The first element chains from scion-base;
+# each subsequent element chains from the previous one.
+_omni_chain_parent() {
+  local step="$1"
+  local prev="scion-base"
+  local s
+  for s in "${_OMNI_CHAIN[@]}"; do
+    if [[ "${s}" == "${step}" ]]; then
+      echo "${prev}"
+      return 0
+    fi
+    prev="${s}"
+  done
+  return 1
+}
+
 # step_build_args <step_id>
 #
 # Emits one KEY=VALUE line per build-arg on stdout. Reads orchestrator
-# state from environment: REGISTRY, TAG, SHORT_SHA, COMMIT_SHA, BASE_TAG.
+# state from environment: REGISTRY, TAG, SHORT_SHA, COMMIT_SHA, VERSION,
+# BUILD_TIME, BASE_TAG.
 # BASE_TAG is the tag (sha or mutable) the orchestrator chose for this
 # step's parent image. When REGISTRY is empty (local-only build), BASE_IMAGE
 # is emitted with a bare image name (e.g. core-base:latest) so it matches
@@ -179,10 +242,28 @@ step_build_args() {
   fi
   case "$1" in
     core-base)
-      # No build-args.
+      # Optional npm mirror passthrough (see core-base/Dockerfile). Unset =
+      # public registry, i.e. no build-arg emitted and default behaviour.
+      if [[ -n "${NPM_REGISTRY:-}" ]]; then
+        echo "NPM_REGISTRY=${NPM_REGISTRY}"
+      fi
+      # Same for the Python package index.
+      if [[ -n "${PIP_INDEX_URL:-}" ]]; then
+        echo "PIP_INDEX_URL=${PIP_INDEX_URL}"
+      fi
       ;;
     thick-prep)
-      # No build-args — BASE_IMAGE default is in the Dockerfile ARG.
+      # BASE_IMAGE default is in the Dockerfile ARG. The mirror passthroughs are
+      # the same as core-base's and must be emitted here too: thick-prep now
+      # runs the same npm install as core-base, and a build behind a corporate
+      # proxy that worked on one chain failing on the other is the exact drift
+      # image-build/lib/ exists to eliminate.
+      if [[ -n "${NPM_REGISTRY:-}" ]]; then
+        echo "NPM_REGISTRY=${NPM_REGISTRY}"
+      fi
+      if [[ -n "${PIP_INDEX_URL:-}" ]]; then
+        echo "PIP_INDEX_URL=${PIP_INDEX_URL}"
+      fi
       ;;
     scion-base)
       if [[ "${THICK_BUILD:-}" == "true" ]]; then
@@ -193,13 +274,47 @@ step_build_args() {
       if [[ -n "${COMMIT_SHA:-}" ]]; then
         echo "GIT_COMMIT=${COMMIT_SHA}"
       fi
+      if [[ -n "${VERSION:-}" ]]; then
+        echo "VERSION=${VERSION}"
+      fi
+      # Commit time (build-images.sh); the Dockerfile falls back to the
+      # build host clock when it is empty.
+      if [[ -n "${BUILD_TIME:-}" ]]; then
+        echo "BUILD_TIME=${BUILD_TIME}"
+      fi
       ;;
     scion-hub)
       echo "BASE_IMAGE=${prefix}scion-base:${BASE_TAG}"
       ;;
+    scion-omni)
+      if [[ "${OMNI_BUILD:-}" == "true" ]]; then
+        local parent
+        parent="$(_omni_chain_parent "scion-omni")"
+        echo "BASE_IMAGE=${prefix}${parent}:${BASE_TAG}"
+      else
+        echo "BASE_IMAGE=${prefix}scion-base:${BASE_TAG}"
+      fi
+      if [[ -n "${COMMIT_SHA:-}" ]]; then
+        echo "GIT_COMMIT=${COMMIT_SHA}"
+      fi
+      if [[ -n "${VERSION:-}" ]]; then
+        echo "VERSION=${VERSION}"
+      fi
+      # Commit time (build-images.sh); the Dockerfile falls back to the
+      # build host clock when it is empty.
+      if [[ -n "${BUILD_TIME:-}" ]]; then
+        echo "BUILD_TIME=${BUILD_TIME}"
+      fi
+      ;;
     *)
       if is_harness_step "$1"; then
-        echo "BASE_IMAGE=${prefix}scion-base:${BASE_TAG}"
+        if [[ "${OMNI_BUILD:-}" == "true" ]] && _omni_chain_parent "$1" >/dev/null 2>&1; then
+          local parent
+          parent="$(_omni_chain_parent "$1")"
+          echo "BASE_IMAGE=${prefix}${parent}:${BASE_TAG}"
+        else
+          echo "BASE_IMAGE=${prefix}scion-base:${BASE_TAG}"
+        fi
       else
         return 1
       fi
@@ -224,9 +339,20 @@ step_parent() {
       fi
       ;;
     scion-hub)     echo "scion-base" ;;
+    scion-omni)
+      if [[ "${OMNI_BUILD:-}" == "true" ]]; then
+        _omni_chain_parent "scion-omni"
+      else
+        echo "scion-base"
+      fi
+      ;;
     *)
       if is_harness_step "$1"; then
-        echo "scion-base"
+        if [[ "${OMNI_BUILD:-}" == "true" ]] && _omni_chain_parent "$1" >/dev/null 2>&1; then
+          _omni_chain_parent "$1"
+        else
+          echo "scion-base"
+        fi
       else
         return 1
       fi

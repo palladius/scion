@@ -1,0 +1,2504 @@
+//go:build unix
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package runtime
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/api"
+	"github.com/GoogleCloudPlatform/scion/pkg/config"
+	"github.com/GoogleCloudPlatform/scion/pkg/projectkeys"
+)
+
+// -----------------------------------------------------------------------
+// Basic identity tests (from P1)
+// -----------------------------------------------------------------------
+
+func TestCloudRunSandboxRuntime_Name(t *testing.T) {
+	rt := NewCloudRunSandboxRuntime(nil)
+	if rt.Name() != "cloudrun-sandbox" {
+		t.Errorf("Name() = %q, want %q", rt.Name(), "cloudrun-sandbox")
+	}
+}
+
+func TestCloudRunSandboxRuntime_ExecUser(t *testing.T) {
+	rt := NewCloudRunSandboxRuntime(nil)
+	if rt.ExecUser() != "scion" {
+		t.Errorf("ExecUser() = %q, want %q", rt.ExecUser(), "scion")
+	}
+}
+
+// -----------------------------------------------------------------------
+// Stubs that remain not-yet-implemented (P4 scope)
+// -----------------------------------------------------------------------
+
+func TestCloudRunSandboxRuntime_P4Methods(t *testing.T) {
+	rt := NewCloudRunSandboxRuntime(nil)
+	ctx := context.Background()
+
+	// P4 methods are implemented but require the sandbox binary to run.
+	// In unit tests without the sandbox binary, they return an exec error
+	// (not "not yet implemented"). Verify they attempt to exec the right
+	// command rather than returning a stub error.
+
+	t.Run("Attach_NotFoundInState", func(t *testing.T) {
+		err := rt.Attach(ctx, "nonexistent-sandbox")
+		if err == nil {
+			t.Errorf("Attach() expected error for nonexistent sandbox, got nil")
+		}
+		if !strings.Contains(err.Error(), "not found") {
+			t.Errorf("Attach() error = %v, want 'not found' error", err)
+		}
+	})
+
+	t.Run("GetLogs_NoSandboxBinary", func(t *testing.T) {
+		_, err := rt.GetLogs(ctx, "x")
+		// Without the sandbox binary, this fails with an exec error.
+		if err == nil {
+			t.Errorf("GetLogs() expected error without sandbox binary, got nil")
+		}
+		// Should NOT contain "not yet implemented" — the stub is gone.
+		if strings.Contains(err.Error(), "not yet implemented") {
+			t.Errorf("GetLogs() still returns stub error: %v", err)
+		}
+	})
+
+	t.Run("Exec_NoSandboxBinary", func(t *testing.T) {
+		_, err := rt.Exec(ctx, "x", []string{"/bin/ls"})
+		if err == nil {
+			t.Errorf("Exec() expected error without sandbox binary, got nil")
+		}
+		if strings.Contains(err.Error(), "not yet implemented") {
+			t.Errorf("Exec() still returns stub error: %v", err)
+		}
+	})
+}
+
+// -----------------------------------------------------------------------
+// Image methods (no-op, from P1)
+// -----------------------------------------------------------------------
+
+func TestCloudRunSandboxRuntime_ImageMethodsNoOp(t *testing.T) {
+	rt := NewCloudRunSandboxRuntime(nil)
+	ctx := context.Background()
+
+	t.Run("ImageExists", func(t *testing.T) {
+		exists, err := rt.ImageExists(ctx, "any-image")
+		if err != nil {
+			t.Errorf("ImageExists() error = %v, want nil", err)
+		}
+		if !exists {
+			t.Errorf("ImageExists() = %v, want true (omni-image)", exists)
+		}
+	})
+
+	t.Run("ImageID", func(t *testing.T) {
+		id, err := rt.ImageID(ctx, "any-image")
+		if err != nil {
+			t.Errorf("ImageID() error = %v, want nil", err)
+		}
+		if id != "omni-image" {
+			t.Errorf("ImageID() = %q, want %q", id, "omni-image")
+		}
+	})
+
+	t.Run("RemoveImage", func(t *testing.T) {
+		err := rt.RemoveImage(ctx, "any-image")
+		if err != nil {
+			t.Errorf("RemoveImage() error = %v, want nil (no-op)", err)
+		}
+	})
+
+	t.Run("PullImage", func(t *testing.T) {
+		err := rt.PullImage(ctx, "any-image")
+		if err != nil {
+			t.Errorf("PullImage() error = %v, want nil (no-op)", err)
+		}
+	})
+}
+
+// -----------------------------------------------------------------------
+// Sync (no-op)
+// -----------------------------------------------------------------------
+
+func TestCloudRunSandboxRuntime_Sync_NoOp(t *testing.T) {
+	rt := NewCloudRunSandboxRuntime(nil)
+	ctx := context.Background()
+
+	err := rt.Sync(ctx, "test-sandbox", SyncTo)
+	if err != nil {
+		t.Errorf("Sync() error = %v, want nil (no-op, filesystem shared via bind mounts)", err)
+	}
+}
+
+// -----------------------------------------------------------------------
+// SandboxLauncherAvailable
+// -----------------------------------------------------------------------
+
+func TestSandboxLauncherAvailable(t *testing.T) {
+	// The default sandbox binary path should not exist in the test environment
+	if SandboxLauncherAvailable() {
+		t.Skip("sandbox binary found at default path; cannot test absence")
+	}
+
+	t.Run("absent", func(t *testing.T) {
+		if SandboxLauncherAvailable() {
+			t.Error("SandboxLauncherAvailable() = true, want false (no binary at default path)")
+		}
+	})
+}
+
+// -----------------------------------------------------------------------
+// Factory integration
+// -----------------------------------------------------------------------
+
+func TestGetRuntime_CloudRunSandbox_DirectProfileName(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	globalDir := filepath.Join(tmpHome, ".scion")
+	if err := os.MkdirAll(globalDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWd, _ := os.Getwd()
+	tmpWd := t.TempDir()
+	if err := os.Chdir(tmpWd); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+
+	r := GetRuntime("", "cloudrun-sandbox")
+	if _, ok := r.(*CloudRunSandboxRuntime); !ok {
+		t.Fatalf("expected *CloudRunSandboxRuntime from direct profile name, got %T", r)
+	}
+}
+
+func TestGetRuntime_CloudRunSandbox_SettingsBased(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	globalDir := filepath.Join(tmpHome, ".scion")
+	if err := os.MkdirAll(globalDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	settings := `{
+		"schema_version": "1",
+		"active_profile": "sandbox",
+		"runtimes": {
+			"crs": {
+				"type": "cloudrun-sandbox"
+			}
+		},
+		"profiles": {
+			"sandbox": {
+				"runtime": "crs"
+			}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(globalDir, "settings.json"), []byte(settings), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWd, _ := os.Getwd()
+	tmpWd := t.TempDir()
+	if err := os.Chdir(tmpWd); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+
+	r := GetRuntime("", "")
+	if _, ok := r.(*CloudRunSandboxRuntime); !ok {
+		t.Fatalf("expected *CloudRunSandboxRuntime from settings, got %T", r)
+	}
+}
+
+func TestGetRuntime_CloudRunInstance_Precedence_Over_Docker(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Cloud Run Instance detection only applies on Linux")
+	}
+
+	t.Setenv("PATH", "")
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("CLOUD_RUN_INSTANCE", "instance-1")
+	t.Setenv("K_SERVICE", "")
+
+	oldWd, _ := os.Getwd()
+	tmpWd := t.TempDir()
+	if err := os.Chdir(tmpWd); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+
+	// CLOUD_RUN_INSTANCE is set but the sandbox binary is not at the default
+	// path, so the factory should pick cloudrun-instances (CloudRunRuntime).
+	r := GetRuntime("", "")
+	if _, ok := r.(*CloudRunRuntime); !ok {
+		t.Errorf("expected *CloudRunRuntime (cloudrun-instances) when CLOUD_RUN_INSTANCE is set without sandbox binary, got %T", r)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Constructor with config
+// -----------------------------------------------------------------------
+
+func TestNewCloudRunSandboxRuntime_WithConfig(t *testing.T) {
+	cfg := &config.V1CloudRunSandboxConfig{
+		SandboxBin: "/usr/bin/test-sandbox",
+	}
+	rt := NewCloudRunSandboxRuntime(cfg)
+	if rt.bin != "/usr/bin/test-sandbox" {
+		t.Errorf("bin = %q, want %q", rt.bin, "/usr/bin/test-sandbox")
+	}
+}
+
+func TestNewCloudRunSandboxRuntime_NilConfig(t *testing.T) {
+	rt := NewCloudRunSandboxRuntime(nil)
+	if rt.bin != DefaultSandboxBin {
+		t.Errorf("bin = %q, want default %q", rt.bin, DefaultSandboxBin)
+	}
+}
+
+// -----------------------------------------------------------------------
+// State store tests
+// -----------------------------------------------------------------------
+
+func TestSandboxStateStore_AddGetRemove(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	ss := newSandboxStateStore(stateFile)
+
+	entry := &sandboxStateEntry{
+		SandboxName: "test-sandbox",
+		AgentID:     "test-agent",
+		Project:     "test-project",
+		ProjectID:   "proj-123",
+		CreatedAt:   time.Now(),
+		AgentHome:   "/scion/agents/test-agent/home",
+		Workspace:   "/scion/agents/test-agent/workspace",
+	}
+
+	// Add
+	ss.add(entry)
+	got := ss.get("test-sandbox")
+	if got == nil {
+		t.Fatal("get() returned nil after add()")
+	}
+	if got.AgentID != "test-agent" {
+		t.Errorf("AgentID = %q, want %q", got.AgentID, "test-agent")
+	}
+
+	// List
+	all := ss.list()
+	if len(all) != 1 {
+		t.Fatalf("list() returned %d entries, want 1", len(all))
+	}
+
+	// Remove
+	ss.remove("test-sandbox")
+	got = ss.get("test-sandbox")
+	if got != nil {
+		t.Errorf("get() returned non-nil after remove()")
+	}
+}
+
+func TestSandboxStateStore_MarkStopped(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	ss := newSandboxStateStore(stateFile)
+
+	entry := &sandboxStateEntry{
+		SandboxName: "sb1",
+		AgentID:     "agent1",
+		CreatedAt:   time.Now(),
+	}
+	ss.add(entry)
+
+	now := time.Now()
+	code := 137
+	ss.markStopped("sb1", &code, &now)
+
+	got := ss.get("sb1")
+	if got == nil {
+		t.Fatal("get() returned nil")
+	}
+	if !got.Stopped {
+		t.Error("Stopped = false, want true")
+	}
+	if got.ExitCode == nil || *got.ExitCode != 137 {
+		t.Errorf("ExitCode = %v, want 137", got.ExitCode)
+	}
+	if got.StoppedAt == nil {
+		t.Error("StoppedAt = nil, want non-nil")
+	}
+}
+
+func TestSandboxStateStore_MarkStopped_NilExitCode(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	ss := newSandboxStateStore(stateFile)
+
+	entry := &sandboxStateEntry{
+		SandboxName: "sb1",
+		AgentID:     "agent1",
+	}
+	ss.add(entry)
+
+	now := time.Now()
+	ss.markStopped("sb1", nil, &now)
+
+	got := ss.get("sb1")
+	if got == nil {
+		t.Fatal("get() returned nil")
+	}
+	if !got.Stopped {
+		t.Error("Stopped = false, want true")
+	}
+	if got.ExitCode != nil {
+		t.Errorf("ExitCode = %v, want nil (C5: nil means unknown)", got.ExitCode)
+	}
+}
+
+func TestSandboxStateStore_Persistence(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+
+	// Write with one store instance.
+	ss1 := newSandboxStateStore(stateFile)
+	ss1.add(&sandboxStateEntry{
+		SandboxName: "persist-test",
+		AgentID:     "agent-persist",
+		Project:     "proj",
+	})
+
+	// Read with a new store instance.
+	ss2 := newSandboxStateStore(stateFile)
+	got := ss2.get("persist-test")
+	if got == nil {
+		t.Fatal("persisted entry not found after reload")
+	}
+	if got.AgentID != "agent-persist" {
+		t.Errorf("AgentID = %q, want %q", got.AgentID, "agent-persist")
+	}
+}
+
+func TestSandboxStateStore_List_Snapshot(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	ss := newSandboxStateStore(stateFile)
+
+	ss.add(&sandboxStateEntry{SandboxName: "a", AgentID: "agent-a"})
+	ss.add(&sandboxStateEntry{SandboxName: "b", AgentID: "agent-b"})
+
+	list := ss.list()
+	if len(list) != 2 {
+		t.Fatalf("list() returned %d entries, want 2", len(list))
+	}
+
+	// Mutating the returned entries should not affect the store.
+	list[0].AgentID = "mutated"
+	original := ss.get("a")
+	if original.AgentID == "mutated" {
+		t.Error("list() returned live references instead of copies")
+	}
+}
+
+// -----------------------------------------------------------------------
+// sanitizeSandboxName tests
+// -----------------------------------------------------------------------
+
+func TestSanitizeSandboxName(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"my-agent", "my-agent"},
+		{"My_Agent.1", "my-agent-1"},
+		{"UPPERCASE", "uppercase"},
+		{"a/b/c", "a-b-c"},
+		{"---leading---", "leading"},
+		{"", "sandbox"},
+		{strings.Repeat("a", 100), strings.Repeat("a", 63)},
+		{"hello world!", "hello-world"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := sanitizeSandboxName(tt.input)
+			if got != tt.want {
+				t.Errorf("sanitizeSandboxName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSanitizeSandboxName_TrailingHyphenAfterTruncation(t *testing.T) {
+	// 63rd character is a hyphen after sanitization — trim must happen AFTER truncation.
+	input := strings.Repeat("a", 62) + "!" // '!' -> '-', producing 63 chars ending in '-'
+	got := sanitizeSandboxName(input)
+	if strings.HasSuffix(got, "-") {
+		t.Errorf("sanitizeSandboxName(%q) = %q, ends with trailing hyphen", input, got)
+	}
+	want := strings.Repeat("a", 62)
+	if got != want {
+		t.Errorf("sanitizeSandboxName(%q) = %q, want %q", input, got, want)
+	}
+}
+
+// -----------------------------------------------------------------------
+// mountsFor tests
+// -----------------------------------------------------------------------
+
+func TestMountsFor_BasicPaths(t *testing.T) {
+	paths := scionPaths{
+		root:      "/scion",
+		agentHome: "/scion/agents/test-agent/home",
+		workspace: "/scion/agents/test-agent/workspace",
+	}
+
+	mounts := mountsFor(paths, nil)
+	// No tmux mount: AF_UNIX can't cross gVisor boundary (§4.4a).
+	if len(mounts) != 2 {
+		t.Fatalf("mountsFor() returned %d mounts, want 2", len(mounts))
+	}
+
+	wantMounts := []string{
+		"type=bind,source=/scion/agents/test-agent/home,destination=/home/scion",
+		"type=bind,source=/scion/agents/test-agent/workspace,destination=/workspace",
+	}
+	for i, want := range wantMounts {
+		if mounts[i] != want {
+			t.Errorf("mounts[%d] = %q, want %q", i, mounts[i], want)
+		}
+	}
+}
+
+// TestMountsFor_WorkspaceMountedAtStandardPath verifies the workspace is
+// mounted at /workspace inside the sandbox (not at the host-side
+// /scion/agents/<slug>/workspace path). This is the fix for #43: without
+// this remapping, sciontool init tried to git-clone into /workspace on the
+// read-only rootfs, killing every git-linked agent on arrival.
+func TestMountsFor_WorkspaceMountedAtStandardPath(t *testing.T) {
+	paths := scionPaths{
+		root:      "/scion",
+		agentHome: "/scion/agents/slug/home",
+		workspace: "/scion/agents/slug/workspace",
+	}
+	mounts := mountsFor(paths, nil)
+
+	// Find the workspace mount.
+	var wsMount string
+	for _, m := range mounts {
+		if strings.Contains(m, "workspace") {
+			wsMount = m
+			break
+		}
+	}
+	if wsMount == "" {
+		t.Fatal("no workspace mount found")
+	}
+
+	// Destination must be /workspace, NOT the host-side path.
+	wantDest := "destination=/workspace"
+	if !strings.Contains(wsMount, wantDest) {
+		t.Errorf("workspace mount destination wrong:\n  got:  %s\n  want: ...%s", wsMount, wantDest)
+	}
+
+	// Source must be the host-side path.
+	wantSrc := "source=/scion/agents/slug/workspace"
+	if !strings.Contains(wsMount, wantSrc) {
+		t.Errorf("workspace mount source wrong:\n  got:  %s\n  want: ...%s", wsMount, wantSrc)
+	}
+}
+
+func TestMountsFor_WithSharedDirs(t *testing.T) {
+	paths := scionPaths{
+		root:      "/scion",
+		agentHome: "/scion/agents/test-agent/home",
+		workspace: "/scion/agents/test-agent/workspace",
+	}
+	sharedDirs := []api.SharedDir{
+		{Name: "build-cache"},
+		{Name: "artifacts"},
+	}
+
+	mounts := mountsFor(paths, sharedDirs)
+	// 2 agent mounts (home, workspace) + 2 shared dirs = 4. No tmux mount (§4.4a).
+	if len(mounts) != 4 {
+		t.Fatalf("mountsFor() returned %d mounts, want 4 (2 agent + 2 shared)", len(mounts))
+	}
+
+	// Shared dirs should be at indices 2 and 3 with /scion-volumes/<name> destination.
+	wantBuildCache := "type=bind,source=/scion/shared/build-cache,destination=/scion-volumes/build-cache"
+	if mounts[2] != wantBuildCache {
+		t.Errorf("mounts[2] = %q, want %q", mounts[2], wantBuildCache)
+	}
+	wantArtifacts := "type=bind,source=/scion/shared/artifacts,destination=/scion-volumes/artifacts"
+	if mounts[3] != wantArtifacts {
+		t.Errorf("mounts[3] = %q, want %q", mounts[3], wantArtifacts)
+	}
+}
+
+// TestMountsFor_SharedDir_InWorkspace verifies that shared dirs with
+// InWorkspace=true are mounted at <workspace>/.scion-volumes/<name>
+// instead of /scion-volumes/<name>.
+func TestMountsFor_SharedDir_InWorkspace(t *testing.T) {
+	paths := scionPaths{
+		root:      "/scion",
+		agentHome: "/scion/agents/test-agent/home",
+		workspace: "/scion/agents/test-agent/workspace",
+	}
+	sharedDirs := []api.SharedDir{
+		{Name: "data", InWorkspace: true},
+	}
+
+	mounts := mountsFor(paths, sharedDirs)
+	if len(mounts) != 3 {
+		t.Fatalf("mountsFor() returned %d mounts, want 3 (2 agent + 1 shared)", len(mounts))
+	}
+
+	want := "type=bind,source=/scion/shared/data,destination=/workspace/.scion-volumes/data"
+	if mounts[2] != want {
+		t.Errorf("mounts[2] = %q, want %q", mounts[2], want)
+	}
+}
+
+// TestMountsFor_SharedDir_ReadOnly verifies that shared dirs with
+// ReadOnly=true get the ,readonly suffix on the mount spec.
+func TestMountsFor_SharedDir_ReadOnly(t *testing.T) {
+	paths := scionPaths{
+		root:      "/scion",
+		agentHome: "/scion/agents/test-agent/home",
+		workspace: "/scion/agents/test-agent/workspace",
+	}
+	sharedDirs := []api.SharedDir{
+		{Name: "ref-data", ReadOnly: true},
+	}
+
+	mounts := mountsFor(paths, sharedDirs)
+	if len(mounts) != 3 {
+		t.Fatalf("mountsFor() returned %d mounts, want 3 (2 agent + 1 shared)", len(mounts))
+	}
+
+	want := "type=bind,source=/scion/shared/ref-data,destination=/scion-volumes/ref-data,readonly"
+	if mounts[2] != want {
+		t.Errorf("mounts[2] = %q, want %q", mounts[2], want)
+	}
+}
+
+// TestMountsFor_SharedDir_InWorkspaceAndReadOnly verifies that both
+// InWorkspace and ReadOnly flags are respected simultaneously.
+func TestMountsFor_SharedDir_InWorkspaceAndReadOnly(t *testing.T) {
+	paths := scionPaths{
+		root:      "/scion",
+		agentHome: "/scion/agents/test-agent/home",
+		workspace: "/scion/agents/test-agent/workspace",
+	}
+	sharedDirs := []api.SharedDir{
+		{Name: "configs", InWorkspace: true, ReadOnly: true},
+	}
+
+	mounts := mountsFor(paths, sharedDirs)
+	if len(mounts) != 3 {
+		t.Fatalf("mountsFor() returned %d mounts, want 3 (2 agent + 1 shared)", len(mounts))
+	}
+
+	want := "type=bind,source=/scion/shared/configs,destination=/workspace/.scion-volumes/configs,readonly"
+	if mounts[2] != want {
+		t.Errorf("mounts[2] = %q, want %q", mounts[2], want)
+	}
+}
+
+// -----------------------------------------------------------------------
+// envFor tests
+// -----------------------------------------------------------------------
+
+func TestEnvFor_BasicEnv(t *testing.T) {
+	cfg := RunConfig{
+		Env:       []string{"KEY1=VAL1", "KEY2=VAL2"},
+		Project:   "my-project",
+		ProjectID: "proj-123",
+	}
+	paths := scionPaths{}
+
+	env := envFor(cfg, paths)
+
+	// Check broker-provided env.
+	if env["KEY1"] != "VAL1" {
+		t.Errorf("KEY1 = %q, want %q", env["KEY1"], "VAL1")
+	}
+	if env["KEY2"] != "VAL2" {
+		t.Errorf("KEY2 = %q, want %q", env["KEY2"], "VAL2")
+	}
+
+	// TMUX_TMPDIR should NOT be set (§4.4a: AF_UNIX can't cross gVisor).
+	if _, ok := env["TMUX_TMPDIR"]; ok {
+		t.Errorf("TMUX_TMPDIR should not be set (§4.4a), got %q", env["TMUX_TMPDIR"])
+	}
+
+	// Check project identity.
+	if env["SCION_PROJECT"] != "my-project" {
+		t.Errorf("SCION_PROJECT = %q, want %q", env["SCION_PROJECT"], "my-project")
+	}
+	if env["SCION_PROJECT_ID"] != "proj-123" {
+		t.Errorf("SCION_PROJECT_ID = %q, want %q", env["SCION_PROJECT_ID"], "proj-123")
+	}
+	if _, ok := env["SCION_GROVE"]; ok {
+		t.Errorf("SCION_GROVE should not be set, got %q", env["SCION_GROVE"])
+	}
+	if _, ok := env["SCION_GROVE_ID"]; ok {
+		t.Errorf("SCION_GROVE_ID should not be set, got %q", env["SCION_GROVE_ID"])
+	}
+
+	// Check UID/GID are set to the scion user (non-root).
+	if env["SCION_HOST_UID"] == "" {
+		t.Error("SCION_HOST_UID not set")
+	}
+	if env["SCION_HOST_GID"] == "" {
+		t.Error("SCION_HOST_GID not set")
+	}
+	if env["SCION_HOST_UID"] != "0" {
+		t.Errorf("SCION_HOST_UID = %q, want %q (root — CAP_SETUID unavailable in gVisor)", env["SCION_HOST_UID"], "0")
+	}
+	if env["SCION_HOST_GID"] != "0" {
+		t.Errorf("SCION_HOST_GID = %q, want %q (root — CAP_SETGID unavailable in gVisor)", env["SCION_HOST_GID"], "0")
+	}
+}
+
+func TestEnvFor_PATH(t *testing.T) {
+	cfg := RunConfig{}
+	paths := scionPaths{}
+
+	env := envFor(cfg, paths)
+	if env["PATH"] == "" {
+		t.Error("PATH not set; sandbox has no PATH by default (AC-0 retest finding)")
+	}
+	if !strings.Contains(env["PATH"], "/usr/bin") {
+		t.Errorf("PATH = %q, expected to contain /usr/bin", env["PATH"])
+	}
+}
+
+func TestEnvFor_PATH_OverridableByHarness(t *testing.T) {
+	cfg := RunConfig{
+		Harness: &mockHarness{
+			env: map[string]string{"PATH": "/custom/bin"},
+		},
+	}
+	paths := scionPaths{}
+
+	env := envFor(cfg, paths)
+	if env["PATH"] != "/custom/bin" {
+		t.Errorf("PATH = %q, want harness override %q", env["PATH"], "/custom/bin")
+	}
+}
+
+func TestEnvFor_WorkspacePath(t *testing.T) {
+	cfg := RunConfig{}
+	paths := scionPaths{}
+
+	env := envFor(cfg, paths)
+
+	// SCION_WORKSPACE_PATH must be set to /workspace so sciontool init
+	// resolves the writable bind mount (not the read-only rootfs). This
+	// is the sandbox equivalent of Docker's --workdir /workspace (#43).
+	if env["SCION_WORKSPACE_PATH"] != sandboxWorkspace {
+		t.Errorf("SCION_WORKSPACE_PATH = %q, want %q", env["SCION_WORKSPACE_PATH"], sandboxWorkspace)
+	}
+}
+
+func TestEnvFor_WorkspaceBackend(t *testing.T) {
+	cfg := RunConfig{
+		WorkspaceBackendName: "nfs",
+	}
+	paths := scionPaths{}
+
+	env := envFor(cfg, paths)
+	if env["SCION_WORKSPACE_BACKEND"] != "nfs" {
+		t.Errorf("SCION_WORKSPACE_BACKEND = %q, want %q", env["SCION_WORKSPACE_BACKEND"], "nfs")
+	}
+}
+
+// TestEnvFor_RootUID verifies that SCION_HOST_UID and SCION_HOST_GID
+// are set to 0 (root). Cloud Run's gVisor sandbox does not grant
+// CAP_SETUID or CAP_SETGID, making runtime privilege drops impossible.
+// Until the sandbox CLI supports --user, the sandbox process must run
+// as root.
+func TestEnvFor_RootUID(t *testing.T) {
+	cfg := RunConfig{}
+	paths := scionPaths{}
+
+	env := envFor(cfg, paths)
+
+	// Must use UID 0 (root) — CAP_SETUID is absent in gVisor.
+	if env["SCION_HOST_UID"] != "0" {
+		t.Errorf("SCION_HOST_UID = %q, want %q; sandbox must run as root (gVisor lacks CAP_SETUID)",
+			env["SCION_HOST_UID"], "0")
+	}
+	if env["SCION_HOST_GID"] != "0" {
+		t.Errorf("SCION_HOST_GID = %q, want %q; sandbox must run as root (gVisor lacks CAP_SETGID)",
+			env["SCION_HOST_GID"], "0")
+	}
+
+	// Verify the constants match the expected root UID.
+	if sandboxUID != 0 {
+		t.Errorf("sandboxUID = %d, want 0 (root — gVisor lacks CAP_SETUID)", sandboxUID)
+	}
+	if sandboxGID != 0 {
+		t.Errorf("sandboxGID = %d, want 0 (root — gVisor lacks CAP_SETGID)", sandboxGID)
+	}
+}
+
+func TestEnvArgs_Sorted(t *testing.T) {
+	env := map[string]string{
+		"C_KEY": "c",
+		"A_KEY": "a",
+		"B_KEY": "b",
+	}
+
+	args := envArgs(env)
+	if len(args) != 3 {
+		t.Fatalf("envArgs() returned %d entries, want 3", len(args))
+	}
+	if args[0] != "A_KEY=a" {
+		t.Errorf("args[0] = %q, want %q", args[0], "A_KEY=a")
+	}
+	if args[1] != "B_KEY=b" {
+		t.Errorf("args[1] = %q, want %q", args[1], "B_KEY=b")
+	}
+	if args[2] != "C_KEY=c" {
+		t.Errorf("args[2] = %q, want %q", args[2], "C_KEY=c")
+	}
+}
+
+// -----------------------------------------------------------------------
+// ResolvedAuth application tests
+// -----------------------------------------------------------------------
+
+// TestCloudRunSandboxRuntime_Run_AppliesResolvedAuth verifies that the
+// sandbox runtime applies resolved auth env vars to the sandbox environment.
+// Without this, auth env vars like GOOGLE_CLOUD_PROJECT and
+// GOOGLE_CLOUD_LOCATION do not reach the sandbox process (the Docker
+// runtime applies them via applyResolvedAuth at common.go:289-290).
+func TestCloudRunSandboxRuntime_Run_AppliesResolvedAuth(t *testing.T) {
+	tmpDir := t.TempDir()
+	rootDir := filepath.Join(tmpDir, "scion")
+	argsFile := filepath.Join(tmpDir, "sandbox-args")
+
+	// Create a mock sandbox binary that records its args.
+	mockBin := filepath.Join(tmpDir, "sandbox")
+	script := "#!/bin/sh\nif [ \"$1\" = \"run\" ]; then\n  printf '%s\\n' \"$@\" > " + argsFile + "\nfi\necho sandbox-ok\n"
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	homeDir := filepath.Join(tmpDir, "agent-home")
+	if err := os.MkdirAll(homeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	stateFile := filepath.Join(tmpDir, "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          mockBin,
+		state:        newSandboxStateStore(stateFile),
+		rootDir:      rootDir,
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+	stopWatchersOnCleanup(t, stateFile, rt)
+
+	cfg := RunConfig{
+		Name:      "auth-agent",
+		HomeDir:   homeDir,
+		Workspace: filepath.Join(tmpDir, "workspace"),
+		Image:     "omni-image",
+		Harness: &mockHarness{
+			command: []string{"gemini"},
+			env:     map[string]string{},
+		},
+		ResolvedAuth: &api.ResolvedAuth{
+			Method: "vertex-ai",
+			EnvVars: map[string]string{
+				"GOOGLE_CLOUD_PROJECT":  "test-project",
+				"GOOGLE_CLOUD_REGION":   "us-central1",
+				"GOOGLE_CLOUD_LOCATION": "us-central1",
+			},
+		},
+	}
+
+	_ = os.MkdirAll(cfg.Workspace, 0755)
+
+	_, err := rt.Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// Read the recorded args and verify auth env vars are present.
+	argsData, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("failed to read mock binary args: %v", err)
+	}
+	args := string(argsData)
+
+	for _, wantEnv := range []string{
+		"GOOGLE_CLOUD_PROJECT=test-project",
+		"GOOGLE_CLOUD_REGION=us-central1",
+		"GOOGLE_CLOUD_LOCATION=us-central1",
+	} {
+		if !strings.Contains(args, wantEnv) {
+			t.Errorf("sandbox args missing resolved auth env %q\nfull args:\n%s", wantEnv, args)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------
+// P3a behaviour-identity test (#127)
+//
+// P3a adds env classifications alongside the env map but changes nothing
+// the sandbox sees. This test pins that claim: given a canonical set of
+// broker-provided env vars (every key from the env-writer inventory),
+// envFor() + envArgs() produce the exact same sorted argv as before P3a.
+//
+// envFor() only reads cfg.Env ([]string) and adds its own fixed keys
+// (PATH, HOME, etc.). The classification map lives on a separate struct
+// that envFor() never sees. This test ensures no accidental cross-wiring
+// was introduced.
+// -----------------------------------------------------------------------
+
+// TestP3a_EnvForBehaviourIdentity verifies that envFor() + envArgs()
+// produce byte-identical output for a canonical broker env, proving P3a
+// changes nothing the sandbox sees.
+func TestP3a_EnvForBehaviourIdentity(t *testing.T) {
+	// Canonical env: every classified key from the env-writer inventory.
+	// These are the KEY=VALUE strings the broker passes via RunConfig.Env.
+	// The test uses sentinels for secrets, real-looking values for plain.
+	brokerEnv := []string{
+		// Hub-side plain (H1-H4, H9, H11-H13, H15-audience/expiry/mode)
+		"SCION_MODEL=claude-4",
+		"SCION_THINKING_LEVEL=high",
+		"SCION_HUB_NAME=test-hub",
+		"SCION_USER_GITHUB_TOKEN=1",
+		"SCION_GITHUB_APP_ENABLED=true",
+		"SCION_GITHUB_TOKEN_EXPIRY=2026-08-29T12:00:00Z",
+		"SCION_GITHUB_TOKEN_PATH=/tmp/gh-token",
+		"SCION_TRANSPORT_AUDIENCE=https://test.example.com",
+		"SCION_TRANSPORT_TOKEN_EXPIRY=2026-08-29T12:00:00Z",
+		"SCION_TRANSPORT_MODE=direct",
+		// Hub-side secret-fetchable (H5-H8)
+		"GEMINI_API_KEY=FAKE-KEY-SENTINEL-not-a-real-credential",
+		// Hub-side secret-injected (H10, H14, H15-token)
+		"GITHUB_TOKEN=FAKE-KEY-SENTINEL-not-a-real-credential",
+		"SCION_DEV_TOKEN=FAKE-KEY-SENTINEL-not-a-real-credential",
+		"SCION_TRANSPORT_TOKEN=FAKE-AUTH-SENTINEL-not-a-real-credential",
+		// Broker-side plain (B1-B22 plain subset)
+		"SCION_AGENT_ID=agent-001",
+		// Note: SCION_PROJECT_ID is set by envFor() from cfg.ProjectID,
+		// overwriting any broker-env value. It appears in envForOwnKeys
+		// below, not here.
+		//   "SCION_PROJECT_ID" → cfg.ProjectID
+		"SCION_AGENT_SLUG=test-agent",
+		"SCION_HUB_ENDPOINT=https://hub.example.com",
+		"SCION_WORKSPACE_MODE=clone-per-agent",
+		"SCION_WORKSPACE_GIT=true",
+		"SCION_METADATA_MODE=gce",
+		"SCION_METADATA_SA_EMAIL=sa@proj.iam.gserviceaccount.com",
+		"SCION_METADATA_PROJECT_ID=proj-001",
+		"SCION_BROKER_ID=broker-001",
+		"SCION_CREATOR=user@example.com",
+		// Broker-side secret-injected (B-auth, B-clone)
+		"SCION_AUTH_TOKEN=FAKE-AUTH-SENTINEL-not-a-real-credential",
+		"SCION_GIT_CLONE_URL=https://FAKE-KEY-SENTINEL-not-a-real-credential@github.com/org/repo.git",
+	}
+
+	cfg := RunConfig{
+		Env:       brokerEnv,
+		Project:   "test-project",
+		ProjectID: "proj-123",
+	}
+
+	env := envFor(cfg, scionPaths{})
+	argv := envArgs(env)
+
+	// Verify every broker-provided key passes through unchanged.
+	for _, entry := range brokerEnv {
+		parts := strings.SplitN(entry, "=", 2)
+		key, val := parts[0], parts[1]
+		if got, ok := env[key]; !ok {
+			t.Errorf("broker key %q missing from envFor() output", key)
+		} else if got != val {
+			t.Errorf("broker key %q: got %q, want %q", key, got, val)
+		}
+	}
+
+	// Verify envFor()-added keys are present (these are fixed by envFor,
+	// not by the broker, and must not disappear due to P3a).
+	envForOwnKeys := []string{
+		"PATH", "HOME", "USER", "LOGNAME",
+		"SCION_PROJECT",
+		"SCION_PROJECT_ID",
+		"SCION_HOST_UID", "SCION_HOST_GID",
+		"SCION_WORKSPACE_PATH",
+	}
+	for _, key := range envForOwnKeys {
+		if _, ok := env[key]; !ok {
+			t.Errorf("envFor() own key %q missing from output", key)
+		}
+	}
+	for _, key := range []string{"SCION_GROVE", "SCION_GROVE_ID"} {
+		if _, ok := env[key]; ok {
+			t.Errorf("envFor() output should not contain legacy key %q", key)
+		}
+	}
+
+	// Verify argv is sorted and deterministic (run twice, same result).
+	argv2 := envArgs(envFor(cfg, scionPaths{}))
+	if len(argv) != len(argv2) {
+		t.Fatalf("envArgs() length changed: %d vs %d", len(argv), len(argv2))
+	}
+	for i := range argv {
+		if argv[i] != argv2[i] {
+			t.Errorf("envArgs()[%d] not deterministic: %q vs %q", i, argv[i], argv2[i])
+		}
+	}
+
+	// Pin the total key count: broker keys + envFor-added keys.
+	// If a future change adds or removes env vars, this count must be updated.
+	// This catches accidental env writes from classification code.
+	expectedKeyCount := len(brokerEnv) + len(envForOwnKeys)
+	if len(env) != expectedKeyCount {
+		// List unexpected keys for diagnosis.
+		expected := make(map[string]bool)
+		for _, entry := range brokerEnv {
+			parts := strings.SplitN(entry, "=", 2)
+			expected[parts[0]] = true
+		}
+		for _, k := range envForOwnKeys {
+			expected[k] = true
+		}
+		for k := range env {
+			if !expected[k] {
+				t.Errorf("unexpected extra key in envFor() output: %q=%q", k, env[k])
+			}
+		}
+		t.Errorf("envFor() produced %d keys, want %d", len(env), expectedKeyCount)
+	}
+}
+
+// -----------------------------------------------------------------------
+// buildEntrypoint tests
+// -----------------------------------------------------------------------
+
+func TestBuildEntrypoint_WithHarness(t *testing.T) {
+	cfg := RunConfig{
+		Harness: &mockHarness{
+			command: []string{"claude", "--agent"},
+		},
+	}
+	entrypoint, err := buildEntrypoint(cfg)
+	if err != nil {
+		t.Fatalf("buildEntrypoint() error = %v", err)
+	}
+
+	// Should start with /bin/sh -c. argv[0] MUST be an absolute path —
+	// the sandbox launcher resolves it
+	// before PATH is set (see envFor), so bare "sh" silently fails.
+	if len(entrypoint) < 3 {
+		t.Fatalf("entrypoint too short: %v", entrypoint)
+	}
+	if entrypoint[0] != "/bin/sh" || entrypoint[1] != "-c" {
+		t.Errorf("entrypoint[0:2] = %v, want [/bin/sh -c]", entrypoint[:2])
+	}
+	if !strings.HasPrefix(entrypoint[0], "/") {
+		t.Errorf("entrypoint argv[0] must be an absolute path, got %q", entrypoint[0])
+	}
+
+	// The command should contain sciontool init and the tmux poll loop.
+	// No symlink chain: agent home is mounted at /home/scion by mountsFor().
+	cmd := entrypoint[2]
+	for _, pattern := range []string{
+		"sciontool init",
+		"tmux new-session -d -s scion -n agent",
+		"new-window -t scion -n shell",
+		"select-window -t scion:agent",
+		"while tmux has-session -t scion",
+		"claude",
+		"echo $? >",
+		// #22 entrypoint output capture preserved (log only; no .rc file).
+		entrypointLogFile,
+	} {
+		if !strings.Contains(cmd, pattern) {
+			t.Errorf("entrypoint command missing pattern %q\nfull: %s", pattern, cmd)
+		}
+	}
+	// Must NOT contain the old symlink chain (rootfs is read-only) or
+	// attach-session (no TTY in sandbox).
+	for _, absent := range []string{
+		"rm -rf /home/scion",
+		"ln -sfn",
+		"attach-session -t scion",
+	} {
+		if strings.Contains(cmd, absent) {
+			t.Errorf("entrypoint command should NOT contain %q\nfull: %s", absent, cmd)
+		}
+	}
+}
+
+func TestBuildEntrypoint_NoHarness(t *testing.T) {
+	cfg := RunConfig{}
+	_, err := buildEntrypoint(cfg)
+	if err == nil {
+		t.Error("buildEntrypoint() with no harness should return error")
+	}
+}
+
+func TestBuildEntrypoint_NoAuth(t *testing.T) {
+	cfg := RunConfig{
+		NoAuth:        true,
+		NoAuthMessage: "Please configure auth",
+	}
+	entrypoint, err := buildEntrypoint(cfg)
+	if err != nil {
+		t.Fatalf("buildEntrypoint() error = %v", err)
+	}
+
+	// argv[0] must be an absolute path (sandbox PATH resolution).
+	if !strings.HasPrefix(entrypoint[0], "/") {
+		t.Errorf("entrypoint argv[0] must be an absolute path, got %q", entrypoint[0])
+	}
+
+	cmd := entrypoint[2]
+	if !strings.Contains(cmd, "Please configure auth") {
+		t.Error("entrypoint command should contain no-auth message")
+	}
+	// No symlink chain: agent home is mounted at /home/scion by mountsFor().
+	if strings.Contains(cmd, "ln -sfn") {
+		t.Error("entrypoint command should NOT contain symlink setup (rootfs is read-only)")
+	}
+}
+
+// -----------------------------------------------------------------------
+// prepareScionLayout tests
+// -----------------------------------------------------------------------
+
+func TestPrepareScionLayout_CreatesDirectories(t *testing.T) {
+	rootDir := t.TempDir()
+	cfg := RunConfig{
+		SharedDirs: []api.SharedDir{
+			{Name: "build-cache"},
+			{Name: "artifacts"},
+		},
+	}
+
+	paths, err := prepareScionLayout(context.Background(), rootDir, "test-agent", cfg)
+	if err != nil {
+		t.Fatalf("prepareScionLayout() error = %v", err)
+	}
+
+	// Verify paths exist.
+	for _, dir := range []string{paths.agentHome, paths.workspace} {
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			t.Errorf("directory not created: %s", dir)
+		}
+	}
+
+	// Verify shared dirs exist.
+	for _, name := range []string{"build-cache", "artifacts"} {
+		sdPath := filepath.Join(rootDir, "shared", name)
+		if _, err := os.Stat(sdPath); os.IsNotExist(err) {
+			t.Errorf("shared dir not created: %s", sdPath)
+		}
+	}
+}
+
+// TestPrepareScionLayout_CreatesInWorkspaceSharedDirs verifies that
+// prepareScionLayout creates .scion-volumes/<name> subdirectories under
+// the workspace for shared dirs with InWorkspace=true, so that the bind
+// mount destination exists when the sandbox starts.
+func TestPrepareScionLayout_CreatesInWorkspaceSharedDirs(t *testing.T) {
+	rootDir := t.TempDir()
+	cfg := RunConfig{
+		SharedDirs: []api.SharedDir{
+			{Name: "scratchpad", InWorkspace: true},
+			{Name: "ref-data"},
+		},
+	}
+
+	paths, err := prepareScionLayout(context.Background(), rootDir, "test-agent", cfg)
+	if err != nil {
+		t.Fatalf("prepareScionLayout() error = %v", err)
+	}
+
+	// InWorkspace shared dir should have a directory under workspace.
+	iwPath := filepath.Join(paths.workspace, ".scion-volumes", "scratchpad")
+	if _, err := os.Stat(iwPath); os.IsNotExist(err) {
+		t.Errorf("in-workspace shared dir not created: %s", iwPath)
+	}
+
+	// Non-InWorkspace shared dir should NOT have a directory under workspace.
+	noIWPath := filepath.Join(paths.workspace, ".scion-volumes", "ref-data")
+	if _, err := os.Stat(noIWPath); !os.IsNotExist(err) {
+		t.Errorf("non-InWorkspace shared dir should not be created under workspace: %s", noIWPath)
+	}
+
+	// Both should still have host-side dirs under /scion/shared/.
+	for _, name := range []string{"scratchpad", "ref-data"} {
+		sdPath := filepath.Join(rootDir, "shared", name)
+		if _, err := os.Stat(sdPath); os.IsNotExist(err) {
+			t.Errorf("shared dir not created: %s", sdPath)
+		}
+	}
+}
+
+// TestPrepareScionLayout_ChownsDirectories verifies that prepareScionLayout
+// recursively chowns agent home and workspace to sandboxUID:sandboxGID,
+// including files created during relocation and workspace copy.
+// This test only runs as root (like on Cloud Run) because chown requires
+// CAP_CHOWN.
+func TestPrepareScionLayout_ChownsDirectories(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("chown test requires root; skipping in non-root test environment")
+	}
+	if runtime.GOOS != "linux" {
+		t.Skip("chown ownership check uses syscall.Stat_t (Linux only)")
+	}
+
+	rootDir := t.TempDir()
+
+	// Create a HomeDir with nested content to verify recursive chown.
+	homeDir := t.TempDir()
+	subDir := filepath.Join(homeDir, "subdir")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(homeDir, "agent-info.json"), []byte(`{}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subDir, "nested.txt"), []byte("nested"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := RunConfig{HomeDir: homeDir}
+	paths, err := prepareScionLayout(context.Background(), rootDir, "chown-agent", cfg)
+	if err != nil {
+		t.Fatalf("prepareScionLayout() error = %v", err)
+	}
+
+	// Verify recursive chown: check the directory, a top-level file,
+	// and a nested file are all owned by sandboxUID:sandboxGID.
+	checkPaths := []string{
+		paths.agentHome,
+		filepath.Join(paths.agentHome, "agent-info.json"),
+		filepath.Join(paths.agentHome, "subdir"),
+		filepath.Join(paths.agentHome, "subdir", "nested.txt"),
+		paths.workspace,
+	}
+	for _, p := range checkPaths {
+		info, statErr := os.Lstat(p)
+		if statErr != nil {
+			t.Fatalf("lstat %s: %v", p, statErr)
+		}
+		stat := info.Sys().(*syscall.Stat_t)
+		if int(stat.Uid) != sandboxUID {
+			t.Errorf("path %s owned by UID %d, want %d", p, stat.Uid, sandboxUID)
+		}
+		if int(stat.Gid) != sandboxGID {
+			t.Errorf("path %s owned by GID %d, want %d", p, stat.Gid, sandboxGID)
+		}
+	}
+}
+
+// TestPrepareScionLayout_SkipsChownNonRoot verifies that prepareScionLayout
+// does NOT call os.Chown when not running as root, preventing EPERM errors
+// in non-root environments (local dev, CI).
+func TestPrepareScionLayout_SkipsChownNonRoot(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("this test verifies non-root behavior; skipping when running as root")
+	}
+
+	rootDir := t.TempDir()
+	paths, err := prepareScionLayout(context.Background(), rootDir, "nonroot-agent", RunConfig{})
+	if err != nil {
+		t.Fatalf("prepareScionLayout() error = %v", err)
+	}
+
+	// In non-root mode, directories should still be created successfully.
+	// The test passes if no EPERM error was returned (chown was skipped).
+	for _, dir := range []string{paths.agentHome, paths.workspace} {
+		if _, statErr := os.Stat(dir); os.IsNotExist(statErr) {
+			t.Errorf("directory not created: %s", dir)
+		}
+	}
+}
+
+func TestPrepareScionLayout_PathStructure(t *testing.T) {
+	rootDir := t.TempDir()
+	paths, err := prepareScionLayout(context.Background(), rootDir, "my-agent", RunConfig{})
+	if err != nil {
+		t.Fatalf("prepareScionLayout() error = %v", err)
+	}
+
+	wantHome := filepath.Join(rootDir, "agents", "my-agent", "home")
+	wantWs := filepath.Join(rootDir, "agents", "my-agent", "workspace")
+
+	if paths.agentHome != wantHome {
+		t.Errorf("agentHome = %q, want %q", paths.agentHome, wantHome)
+	}
+	if paths.workspace != wantWs {
+		t.Errorf("workspace = %q, want %q", paths.workspace, wantWs)
+	}
+}
+
+func TestPrepareScionLayout_RelocatesHomeDir(t *testing.T) {
+	rootDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	// Create a file in the original home dir.
+	if err := os.WriteFile(filepath.Join(homeDir, "agent-info.json"), []byte(`{"test": true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := RunConfig{HomeDir: homeDir}
+	paths, err := prepareScionLayout(context.Background(), rootDir, "test-agent", cfg)
+	if err != nil {
+		t.Fatalf("prepareScionLayout() error = %v", err)
+	}
+
+	// The file should now be at the /scion path.
+	data, err := os.ReadFile(filepath.Join(paths.agentHome, "agent-info.json"))
+	if err != nil {
+		t.Fatalf("agent-info.json not found at scion path: %v", err)
+	}
+	if string(data) != `{"test": true}` {
+		t.Errorf("agent-info.json content = %q, want %q", string(data), `{"test": true}`)
+	}
+
+	// The original homeDir should be a symlink to the /scion path.
+	link, err := os.Readlink(homeDir)
+	if err != nil {
+		t.Fatalf("original homeDir is not a symlink: %v", err)
+	}
+	if link != paths.agentHome {
+		t.Errorf("symlink target = %q, want %q", link, paths.agentHome)
+	}
+}
+
+// TestPrepareScionLayout_SecondLaunchPreservesHomeContent covers a second
+// launch of the same sandbox agent: by then, cfg.HomeDir (unchanged from
+// the caller's perspective) is the symlink the first launch's relocation
+// created, pointing at this agent's own /scion home. relocateToScion must
+// still receive that original, still-symlinked path, not its resolved
+// form, so its own already-a-symlink check recognizes the restart and
+// leaves the home directory alone. Relocating the resolved path instead
+// would operate on the agent's real /scion home as both source and
+// destination, losing its contents and leaving a self-referential symlink
+// in their place.
+func TestPrepareScionLayout_SecondLaunchPreservesHomeContent(t *testing.T) {
+	rootDir := t.TempDir()
+	homeDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(homeDir, "agent-info.json"), []byte(`{"test": true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := RunConfig{HomeDir: homeDir}
+
+	paths1, err := prepareScionLayout(context.Background(), rootDir, "test-agent", cfg)
+	if err != nil {
+		t.Fatalf("first prepareScionLayout() error = %v", err)
+	}
+
+	// Second launch of the same agent: cfg is unchanged, but homeDir (and
+	// so cfg.HomeDir) is now the symlink the first launch created.
+	paths2, err := prepareScionLayout(context.Background(), rootDir, "test-agent", cfg)
+	if err != nil {
+		t.Fatalf("second prepareScionLayout() error = %v", err)
+	}
+	if paths2.agentHome != paths1.agentHome {
+		t.Fatalf("agentHome changed between launches: %q vs %q", paths1.agentHome, paths2.agentHome)
+	}
+
+	data, err := os.ReadFile(filepath.Join(paths2.agentHome, "agent-info.json"))
+	if err != nil {
+		t.Fatalf("agent-info.json missing after second launch (home content lost): %v", err)
+	}
+	if string(data) != `{"test": true}` {
+		t.Errorf("agent-info.json content = %q, want %q", string(data), `{"test": true}`)
+	}
+
+	link, err := os.Readlink(homeDir)
+	if err != nil {
+		t.Fatalf("homeDir is not a symlink after second launch: %v", err)
+	}
+	if link != paths2.agentHome {
+		t.Errorf("symlink target = %q, want %q", link, paths2.agentHome)
+	}
+
+	// A self-referential symlink at paths2.agentHome (the bug this guards
+	// against) makes any stat through homeDir fail with ELOOP.
+	if _, err := os.Stat(homeDir); err != nil {
+		t.Errorf("os.Stat(%q) failed, possible symlink loop at %q: %v", homeDir, paths2.agentHome, err)
+	}
+}
+
+// TestPrepareScionLayout_SkipsRelocationWhenHomeDirResolvesUnderRootDir
+// covers a HomeDir whose OWN Lstat is an ordinary real directory -- not a
+// symlink itself, so relocateToScion's own already-a-symlink check cannot
+// catch it on the original path alone -- but which resolves, through a
+// symlinked ANCESTOR directory, to this agent's own /scion home. Only the
+// resolved-path skip (comparing what ValidateAgentHomeSource resolved to,
+// not the original path's own Lstat) protects this case.
+func TestPrepareScionLayout_SkipsRelocationWhenHomeDirResolvesUnderRootDir(t *testing.T) {
+	rootDir := t.TempDir()
+
+	seedHomeDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(seedHomeDir, "agent-info.json"), []byte(`{"test": true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	paths1, err := prepareScionLayout(context.Background(), rootDir, "test-agent", RunConfig{HomeDir: seedHomeDir})
+	if err != nil {
+		t.Fatalf("first prepareScionLayout() error = %v", err)
+	}
+
+	// ancestorLink is a symlink to agentHome's own parent directory.
+	// Joining "home" onto it reaches the same real /scion home as
+	// paths1.agentHome, but os.Lstat on the joined path sees an ordinary
+	// directory: Lstat only leaves its own final path component
+	// unresolved, and that component (the ancestor symlink) is not it.
+	ancestorLink := filepath.Join(t.TempDir(), "ancestor-link")
+	if err := os.Symlink(filepath.Dir(paths1.agentHome), ancestorLink); err != nil {
+		t.Fatal(err)
+	}
+	homeDirThroughAncestor := filepath.Join(ancestorLink, filepath.Base(paths1.agentHome))
+
+	if info, err := os.Lstat(homeDirThroughAncestor); err != nil {
+		t.Fatalf("fixture check: homeDirThroughAncestor Lstat failed: %v", err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("fixture check: homeDirThroughAncestor must not itself be a symlink")
+	}
+
+	paths2, err := prepareScionLayout(context.Background(), rootDir, "test-agent", RunConfig{HomeDir: homeDirThroughAncestor})
+	if err != nil {
+		t.Fatalf("second prepareScionLayout() error = %v", err)
+	}
+	if paths2.agentHome != paths1.agentHome {
+		t.Fatalf("agentHome changed: %q vs %q", paths1.agentHome, paths2.agentHome)
+	}
+
+	data, err := os.ReadFile(filepath.Join(paths2.agentHome, "agent-info.json"))
+	if err != nil {
+		t.Fatalf("agent-info.json missing (home content lost): %v", err)
+	}
+	if string(data) != `{"test": true}` {
+		t.Errorf("agent-info.json content = %q, want %q", string(data), `{"test": true}`)
+	}
+
+	info, err := os.Lstat(paths2.agentHome)
+	if err != nil {
+		t.Fatalf("agentHome missing: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Errorf("agentHome became a symlink (self-reference); expected a plain directory")
+	}
+}
+
+// TestPrepareScionLayout_LeavesPreExistingHomeSymlinkUntouched covers a
+// HomeDir that is already a symlink to some other real directory entirely
+// outside rootDir -- not one relocateToScion itself created, just an
+// ordinary symlinked home. relocateToScion's own Lstat check, given the
+// original HomeDir, recognizes the symlink and does nothing, leaving the
+// real directory it points to exactly as it was. Passing the validator's
+// resolved form instead would hand relocateToScion the real directory
+// itself (Lstat on it never reports a symlink), so it would relocate that
+// unrelated directory's content into this agent's /scion home and replace
+// it with a symlink -- neither skip condition catches this, since the
+// resolved path is neither this agent's own /scion home nor under rootDir.
+func TestPrepareScionLayout_LeavesPreExistingHomeSymlinkUntouched(t *testing.T) {
+	rootDir := t.TempDir()
+	realTarget := t.TempDir()
+	if err := os.WriteFile(filepath.Join(realTarget, "agent-info.json"), []byte(`{"test": true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	homeDir := filepath.Join(t.TempDir(), "home")
+	if err := os.Symlink(realTarget, homeDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := prepareScionLayout(context.Background(), rootDir, "test-agent", RunConfig{HomeDir: homeDir}); err != nil {
+		t.Fatalf("prepareScionLayout() error = %v", err)
+	}
+
+	info, err := os.Lstat(realTarget)
+	if err != nil {
+		t.Fatalf("realTarget missing: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("realTarget was replaced with a symlink; expected it to be left untouched")
+	}
+	if _, err := os.Stat(filepath.Join(realTarget, "agent-info.json")); err != nil {
+		t.Errorf("realTarget content missing: %v", err)
+	}
+
+	link, err := os.Readlink(homeDir)
+	if err != nil {
+		t.Fatalf("homeDir is no longer a symlink: %v", err)
+	}
+	if link != realTarget {
+		t.Errorf("homeDir symlink target changed: got %q, want %q", link, realTarget)
+	}
+}
+
+// TestPrepareScionLayout_RejectsUnsafeWorkspaceSource is the fail-closed
+// regression test for the workspace-copy site: cfg.Workspace already went
+// through pkg/agent Start()'s validation to reach this RunConfig, but this
+// call site should not depend on that alone. An unsafe value must be
+// refused before copyDirContents ever reads from it, not just logged.
+func TestPrepareScionLayout_RejectsUnsafeWorkspaceSource(t *testing.T) {
+	rootDir := t.TempDir()
+	cfg := RunConfig{Workspace: "/"}
+
+	paths, err := prepareScionLayout(context.Background(), rootDir, "test-agent", cfg)
+	if err == nil {
+		t.Fatal("expected prepareScionLayout to fail for a workspace source of '/'")
+	}
+	if !strings.Contains(err.Error(), "is not an allowed workspace path") {
+		t.Errorf("expected the rejection to come from workspace source validation, got: %v", err)
+	}
+
+	// The workspace directory itself is created unconditionally (mkdir, not
+	// copy), so "nothing was copied" means it exists but is empty -- proving
+	// the rejected source was never actually read from.
+	entries, readErr := os.ReadDir(paths.workspace)
+	if readErr != nil {
+		t.Fatalf("ReadDir(%q): %v", paths.workspace, readErr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected no files copied into %q after rejection, found: %v", paths.workspace, entries)
+	}
+}
+
+// TestPrepareScionLayout_CopiesLegitimateScionHomeWorkspace is the positive
+// acceptance-set counterpart: this call site has no per-project root (same
+// reasoning as buildCommonRunArgs and the k8s runtime's Run()), so it
+// depends entirely on the validator's named ~/.scion allow list to still
+// admit and copy from a real workspace under ~/.scion.
+func TestPrepareScionLayout_CopiesLegitimateScionHomeWorkspace(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	workspace := filepath.Join(tmpHome, ".scion", "projects", "my-project", "workspace")
+	if err := os.MkdirAll(workspace, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "hello.txt"), []byte("hi"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rootDir := t.TempDir()
+	cfg := RunConfig{Workspace: workspace}
+
+	paths, err := prepareScionLayout(context.Background(), rootDir, "test-agent", cfg)
+	if err != nil {
+		t.Fatalf("expected %q to be accepted by workspace source validation, got error: %v", workspace, err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(paths.workspace, "hello.txt"))
+	if err != nil {
+		t.Fatalf("hello.txt not found at scion workspace path: %v", err)
+	}
+	if string(data) != "hi" {
+		t.Errorf("hello.txt content = %q, want %q", string(data), "hi")
+	}
+}
+
+// TestPrepareScionLayout_RejectsUnsafeHomeDir is
+// TestPrepareScionLayout_RejectsUnsafeWorkspaceSource's counterpart for
+// cfg.HomeDir: an unsafe value must be refused before relocateToScion ever
+// reads from it.
+func TestPrepareScionLayout_RejectsUnsafeHomeDir(t *testing.T) {
+	rootDir := t.TempDir()
+	cfg := RunConfig{HomeDir: "/"}
+
+	_, err := prepareScionLayout(context.Background(), rootDir, "test-agent", cfg)
+	if err == nil {
+		t.Fatal("expected prepareScionLayout to fail for a home directory of '/'")
+	}
+	if !strings.Contains(err.Error(), "is not an allowed agent home path") {
+		t.Errorf("expected the rejection to come from agent home source validation, got: %v", err)
+	}
+}
+
+// TestPrepareScionLayout_AcceptsRealAgentHomes covers the positive
+// acceptance set for cfg.HomeDir: the three real shapes
+// config.GetAgentHomePath produces under ~/.scion, each relocated to the
+// sandbox's own /scion path the same way
+// TestPrepareScionLayout_RelocatesHomeDir already proves for a plain
+// directory.
+func TestPrepareScionLayout_AcceptsRealAgentHomes(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	tests := []struct {
+		name    string
+		relPath []string
+	}{
+		{name: "global project agent home", relPath: []string{".scion", "agents", "a", "home"}},
+		{name: "hub-managed project agent home", relPath: []string{".scion", "projects", "p", ".scion", "agents", "a", "home"}},
+		{name: "externalized git project agent home", relPath: []string{".scion", "project-configs", "d__1", ".scion", "agents", "a", "home"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parts := append([]string{tmpHome}, tt.relPath...)
+			homeDir := filepath.Join(parts...)
+			if err := os.MkdirAll(homeDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(homeDir, "agent-info.json"), []byte(`{"test": true}`), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			rootDir := t.TempDir()
+			cfg := RunConfig{HomeDir: homeDir}
+			paths, err := prepareScionLayout(context.Background(), rootDir, "test-agent", cfg)
+			if err != nil {
+				t.Fatalf("expected %q to be accepted, got error: %v", homeDir, err)
+			}
+
+			data, err := os.ReadFile(filepath.Join(paths.agentHome, "agent-info.json"))
+			if err != nil {
+				t.Fatalf("agent-info.json not found at scion path: %v", err)
+			}
+			if string(data) != `{"test": true}` {
+				t.Errorf("agent-info.json content = %q, want %q", string(data), `{"test": true}`)
+			}
+		})
+	}
+}
+
+// -----------------------------------------------------------------------
+// List tests
+// -----------------------------------------------------------------------
+
+func TestCloudRunSandboxRuntime_List_ReturnsStateEntries(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          "/nonexistent",
+		state:        newSandboxStateStore(stateFile),
+		rootDir:      t.TempDir(),
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+
+	rt.state.add(&sandboxStateEntry{
+		SandboxName: "sb-1",
+		AgentID:     "agent-one",
+		Project:     "test-proj",
+		ProjectID:   "proj-1",
+		Template:    "default",
+		Image:       "omni-image",
+		Labels:      map[string]string{"scion.name": "agent-one"},
+	})
+	rt.state.add(&sandboxStateEntry{
+		SandboxName: "sb-2",
+		AgentID:     "agent-two",
+		Project:     "test-proj",
+		ProjectID:   "proj-1",
+		Image:       "omni-image",
+		Stopped:     true,
+	})
+
+	agents, err := rt.List(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(agents) != 2 {
+		t.Fatalf("List() returned %d agents, want 2", len(agents))
+	}
+
+	// Find running agent.
+	var running, stopped *api.AgentInfo
+	for i := range agents {
+		if agents[i].ContainerID == "sb-1" {
+			running = &agents[i]
+		}
+		if agents[i].ContainerID == "sb-2" {
+			stopped = &agents[i]
+		}
+	}
+
+	if running == nil {
+		t.Fatal("running agent (sb-1) not found in list")
+	}
+	if running.Phase != "running" || running.ContainerStatus != "running" {
+		t.Errorf("running agent: phase=%q status=%q, want running/running", running.Phase, running.ContainerStatus)
+	}
+	if running.Runtime != "cloudrun-sandbox" {
+		t.Errorf("runtime = %q, want %q", running.Runtime, "cloudrun-sandbox")
+	}
+
+	if stopped == nil {
+		t.Fatal("stopped agent (sb-2) not found in list")
+	}
+	if stopped.Phase != "stopped" || stopped.ContainerStatus != "stopped" {
+		t.Errorf("stopped agent: phase=%q status=%q, want stopped/stopped", stopped.Phase, stopped.ContainerStatus)
+	}
+
+	// §9.1b stopgap: ExitCode should not be set on AgentInfo (field doesn't exist yet).
+	// When #1260 merges, this test should be updated.
+}
+
+// TestCloudRunSandboxRuntime_List_NameIsAgentSlug: List reports the agent
+// slug (the scion.name label) as Name, as the Docker and substrate runtimes
+// do, not AgentID, which Run records as the project-prefixed container name;
+// an entry without the label falls back to AgentID (ptone/scion#5156).
+func TestCloudRunSandboxRuntime_List_NameIsAgentSlug(t *testing.T) {
+	rt := NewCloudRunSandboxRuntimeForTest("/nonexistent", filepath.Join(t.TempDir(), "state.json"), t.TempDir())
+	rt.state.add(&sandboxStateEntry{
+		SandboxName: "proj-b--dev",
+		AgentID:     "proj-b--dev",
+		Labels:      map[string]string{"scion.name": "dev"},
+	})
+	rt.state.add(&sandboxStateEntry{
+		SandboxName: "proj-b--old",
+		AgentID:     "proj-b--old",
+	})
+
+	agents, err := rt.List(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	names := make(map[string]string)
+	for _, a := range agents {
+		names[a.ContainerID] = a.Name
+	}
+	if got := names["proj-b--dev"]; got != "dev" {
+		t.Errorf("Name of labelled entry = %q, want the scion.name label %q", got, "dev")
+	}
+	if got := names["proj-b--old"]; got != "proj-b--old" {
+		t.Errorf("Name of entry without scion.name = %q, want AgentID %q", got, "proj-b--old")
+	}
+}
+
+func TestCloudRunSandboxRuntime_List_LabelFilter(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          "/nonexistent",
+		state:        newSandboxStateStore(stateFile),
+		rootDir:      t.TempDir(),
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+
+	rt.state.add(&sandboxStateEntry{
+		SandboxName: "sb-1",
+		AgentID:     "agent-one",
+		Project:     "proj-a",
+		Labels:      map[string]string{"env": "prod"},
+	})
+	rt.state.add(&sandboxStateEntry{
+		SandboxName: "sb-2",
+		AgentID:     "agent-two",
+		Project:     "proj-b",
+		Labels:      map[string]string{"env": "staging"},
+	})
+
+	// Filter by label.
+	agents, err := rt.List(context.Background(), map[string]string{"env": "prod"})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("List() with filter returned %d agents, want 1", len(agents))
+	}
+	if agents[0].ContainerID != "sb-1" {
+		t.Errorf("filtered agent = %q, want %q", agents[0].ContainerID, "sb-1")
+	}
+}
+
+// TestCloudRunSandboxRuntime_List_ProjectPathResolved verifies that List
+// compares scion.project_path as a resolved path (as the Docker, Podman and
+// Apple runtimes do through LabelsMatchFilter), so a trailing slash or a
+// symlinked spelling of the same directory still matches (ptone/scion#3020).
+func TestCloudRunSandboxRuntime_List_ProjectPathResolved(t *testing.T) {
+	projectDir := t.TempDir()
+	otherDir := t.TempDir()
+	linkDir := filepath.Join(t.TempDir(), "project-link")
+	if err := os.Symlink(projectDir, linkDir); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          "/nonexistent",
+		state:        newSandboxStateStore(stateFile),
+		rootDir:      t.TempDir(),
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+	rt.state.add(&sandboxStateEntry{
+		SandboxName: "sb-trailing",
+		AgentID:     "agent-trailing",
+		Labels:      map[string]string{projectkeys.LabelProjectPath: projectDir + "/"},
+	})
+	rt.state.add(&sandboxStateEntry{
+		SandboxName: "sb-link",
+		AgentID:     "agent-link",
+		Labels:      map[string]string{projectkeys.LabelProjectPath: linkDir},
+	})
+	rt.state.add(&sandboxStateEntry{
+		SandboxName: "sb-other",
+		AgentID:     "agent-other",
+		Labels:      map[string]string{projectkeys.LabelProjectPath: otherDir},
+	})
+
+	agents, err := rt.List(context.Background(), map[string]string{projectkeys.LabelProjectPath: projectDir})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	got := make(map[string]bool)
+	for _, a := range agents {
+		got[a.ContainerID] = true
+	}
+	if len(agents) != 2 || !got["sb-trailing"] || !got["sb-link"] {
+		t.Errorf("List() by project path = %v, want sb-trailing and sb-link", got)
+	}
+}
+
+// -----------------------------------------------------------------------
+// GetWorkspacePath tests
+// -----------------------------------------------------------------------
+
+func TestCloudRunSandboxRuntime_GetWorkspacePath(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          "/nonexistent",
+		state:        newSandboxStateStore(stateFile),
+		rootDir:      t.TempDir(),
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+
+	rt.state.add(&sandboxStateEntry{
+		SandboxName: "sb-1",
+		AgentID:     "agent-one",
+		Workspace:   "/scion/agents/agent-one/workspace",
+	})
+
+	path, err := rt.GetWorkspacePath(context.Background(), "sb-1")
+	if err != nil {
+		t.Fatalf("GetWorkspacePath() error = %v", err)
+	}
+	if path != "/scion/agents/agent-one/workspace" {
+		t.Errorf("GetWorkspacePath() = %q, want %q", path, "/scion/agents/agent-one/workspace")
+	}
+}
+
+func TestCloudRunSandboxRuntime_GetWorkspacePath_NotFound(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          "/nonexistent",
+		state:        newSandboxStateStore(stateFile),
+		rootDir:      t.TempDir(),
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+
+	_, err := rt.GetWorkspacePath(context.Background(), "nonexistent")
+	if err == nil {
+		t.Error("GetWorkspacePath() for nonexistent sandbox should return error")
+	}
+}
+
+// -----------------------------------------------------------------------
+// Run tests (with mock binary)
+// -----------------------------------------------------------------------
+
+func TestCloudRunSandboxRuntime_Run_BuildsCommand(t *testing.T) {
+	tmpDir := t.TempDir()
+	rootDir := filepath.Join(tmpDir, "scion")
+	argsFile := filepath.Join(tmpDir, "sandbox-args")
+
+	// Create a mock sandbox binary that records its args.
+	// Only record args for the "run" subcommand (not for subsequent
+	// liveness probe "exec" calls). All calls succeed (rc=0).
+	mockBin := filepath.Join(tmpDir, "sandbox")
+	script := "#!/bin/sh\nif [ \"$1\" = \"run\" ]; then\n  printf '%s\\n' \"$@\" > " + argsFile + "\nfi\necho sandbox-ok\n"
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	homeDir := filepath.Join(tmpDir, "agent-home")
+	if err := os.MkdirAll(homeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	stateFile := filepath.Join(tmpDir, "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          mockBin,
+		state:        newSandboxStateStore(stateFile),
+		rootDir:      rootDir,
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+	stopWatchersOnCleanup(t, stateFile, rt)
+
+	cfg := RunConfig{
+		Name:      "test-agent",
+		HomeDir:   homeDir,
+		Workspace: filepath.Join(tmpDir, "workspace"),
+		Image:     "omni-image",
+		Project:   "my-project",
+		ProjectID: "proj-123",
+		Harness: &mockHarness{
+			command: []string{"claude", "--agent"},
+			env:     map[string]string{"HARNESS_KEY": "harness-val"},
+		},
+		Labels: map[string]string{"scion.name": "test-agent"},
+	}
+
+	// Create workspace dir so copy doesn't error.
+	_ = os.MkdirAll(cfg.Workspace, 0755)
+
+	id, err := rt.Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if id != "test-agent" {
+		t.Errorf("Run() returned id = %q, want %q", id, "test-agent")
+	}
+
+	// Read recorded args.
+	argsData, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("failed to read mock binary args: %v", err)
+	}
+	args := string(argsData)
+
+	// Verify key args are present.
+	for _, pattern := range []string{
+		"run",
+		"test-agent",
+		"--detach",
+		"--rootfs",
+		"--write",
+		"--allow-egress",
+		"--mount",
+		// Per-agent mounts: agent home mounted at /home/scion, workspace
+		// at /workspace. No tmux mount (§4.4a: AF_UNIX can't cross gVisor
+		// boundary). Workspace destination must be /workspace (not the
+		// host-side path) so sciontool init's git clone writes to the
+		// writable bind mount instead of the read-only rootfs (#43).
+		"type=bind,source=" + rootDir + "/agents/test-agent/home,destination=/home/scion",
+		"type=bind,source=" + rootDir + "/agents/test-agent/workspace,destination=/workspace",
+		// Env vars via --env flags (FIX 2), not /usr/bin/env.
+		"--env",
+		"sciontool",
+		"init",
+	} {
+		if !strings.Contains(args, pattern) {
+			t.Errorf("sandbox command missing pattern %q\nfull args:\n%s", pattern, args)
+		}
+	}
+
+	// /usr/bin/env should NOT be in args (FIX 2).
+	if strings.Contains(args, "/usr/bin/env") {
+		t.Errorf("sandbox command should not contain /usr/bin/env\nfull args:\n%s", args)
+	}
+
+	// Verify state store has the entry.
+	entry := rt.state.get("test-agent")
+	if entry == nil {
+		t.Fatal("state store entry not found after Run()")
+	}
+	if entry.AgentID != "test-agent" {
+		t.Errorf("state entry AgentID = %q, want %q", entry.AgentID, "test-agent")
+	}
+	if entry.Project != "my-project" {
+		t.Errorf("state entry Project = %q, want %q", entry.Project, "my-project")
+	}
+}
+
+// TestCloudRunSandboxRuntime_Run_DeadOnArrival tests that Run() returns an
+// error when the sandbox dies immediately after `sandbox run --detach`
+// returns rc=0. This catches the "dead on arrival" scenario where the
+// sandbox binary cannot resolve PATH (Finding #10) or fails for any other
+// reason invisible to the run command's exit code.
+func TestCloudRunSandboxRuntime_Run_DeadOnArrival(t *testing.T) {
+	tmpDir := t.TempDir()
+	rootDir := filepath.Join(tmpDir, "scion")
+
+	// Mock binary: "run" succeeds, "exec" always fails (sandbox is dead),
+	// "delete" succeeds (cleanup).
+	mockBin := filepath.Join(tmpDir, "sandbox")
+	script := `#!/bin/sh
+case "$1" in
+  run)    echo sandbox-ok; exit 0 ;;
+  exec)   echo "sandbox not running"; exit 1 ;;
+  delete) exit 0 ;;
+  *)      exit 1 ;;
+esac
+`
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	homeDir := filepath.Join(tmpDir, "agent-home")
+	if err := os.MkdirAll(homeDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	stateFile := filepath.Join(tmpDir, "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          mockBin,
+		state:        newSandboxStateStore(stateFile),
+		rootDir:      rootDir,
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+
+	cfg := RunConfig{
+		Name:      "dead-agent",
+		HomeDir:   homeDir,
+		Workspace: filepath.Join(tmpDir, "workspace"),
+		Image:     "omni-image",
+		Project:   "my-project",
+		ProjectID: "proj-123",
+		Harness: &mockHarness{
+			command: []string{"claude", "--agent"},
+			env:     map[string]string{},
+		},
+		Labels: map[string]string{"scion.name": "dead-agent"},
+	}
+
+	_ = os.MkdirAll(cfg.Workspace, 0755)
+
+	_, err := rt.Run(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("Run() should return error for dead-on-arrival sandbox")
+	}
+
+	if !strings.Contains(err.Error(), "dead on arrival") {
+		t.Errorf("Run() error should mention 'dead on arrival', got: %v", err)
+	}
+
+	// State store should NOT have an entry (sandbox was DOA).
+	entry := rt.state.get("dead-agent")
+	if entry != nil {
+		t.Error("state store should not have entry for dead-on-arrival sandbox")
+	}
+}
+
+// TestCloudRunSandboxRuntime_BuildEntrypoint_AbsolutePaths verifies that
+// buildEntrypoint uses absolute paths for shell binaries (Finding #10).
+func TestCloudRunSandboxRuntime_BuildEntrypoint_AbsolutePaths(t *testing.T) {
+	cfg := RunConfig{
+		Harness: &mockHarness{
+			command: []string{"claude", "--agent"},
+			env:     map[string]string{},
+		},
+	}
+	entrypoint, err := buildEntrypoint(cfg)
+	if err != nil {
+		t.Fatalf("buildEntrypoint() error = %v", err)
+	}
+	// The first element must be an absolute path.
+	if !strings.HasPrefix(entrypoint[0], "/") {
+		t.Errorf("buildEntrypoint()[0] = %q, want absolute path (must start with /)", entrypoint[0])
+	}
+	// The entrypoint must not use bare 'sh' anywhere in the command.
+	cmd := strings.Join(entrypoint, " ")
+	// Check for bare 'sh' that is not preceded by '/' (would match 'sh -c' but not '/bin/sh -c')
+	if strings.Contains(cmd, " sh -c ") && !strings.Contains(cmd, "/sh -c") {
+		t.Errorf("buildEntrypoint() uses bare 'sh' instead of an absolute path:\n%s", cmd)
+	}
+}
+
+// -----------------------------------------------------------------------
+// Delete tests (with mock binary)
+// -----------------------------------------------------------------------
+
+func TestCloudRunSandboxRuntime_Delete(t *testing.T) {
+	tmpDir := t.TempDir()
+	argsFile := filepath.Join(tmpDir, "delete-args")
+
+	// Mock binary that records its args and succeeds.
+	mockBin := filepath.Join(tmpDir, "sandbox")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argsFile + "\nexit 0\n"
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	stateFile := filepath.Join(tmpDir, "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          mockBin,
+		state:        newSandboxStateStore(stateFile),
+		rootDir:      filepath.Join(tmpDir, "scion"),
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+
+	rt.state.add(&sandboxStateEntry{SandboxName: "sb-del", AgentID: "agent-del"})
+
+	err := rt.Delete(context.Background(), RunRef{ID: "sb-del"})
+	if err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+
+	if entry := rt.state.get("sb-del"); entry != nil {
+		t.Error("state entry still present after Delete()")
+	}
+
+	// Verify --force is used (FIX 4).
+	argsData, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("failed to read mock args: %v", err)
+	}
+	if !strings.Contains(string(argsData), "--force") {
+		t.Errorf("Delete() should use --force; args: %s", argsData)
+	}
+}
+
+func TestCloudRunSandboxRuntime_Stop(t *testing.T) {
+	tmpDir := t.TempDir()
+	argsFile := filepath.Join(tmpDir, "stop-args")
+
+	// Mock binary that records its args and succeeds.
+	mockBin := filepath.Join(tmpDir, "sandbox")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argsFile + "\nexit 0\n"
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	stateFile := filepath.Join(tmpDir, "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          mockBin,
+		state:        newSandboxStateStore(stateFile),
+		rootDir:      filepath.Join(tmpDir, "scion"),
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+
+	rt.state.add(&sandboxStateEntry{SandboxName: "sb-stop", AgentID: "agent-stop"})
+
+	err := rt.Stop(context.Background(), RunRef{ID: "sb-stop"})
+	if err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	if entry := rt.state.get("sb-stop"); entry != nil {
+		t.Error("state entry still present after Stop()")
+	}
+
+	// Verify --force is used (FIX 4).
+	argsData, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("failed to read mock args: %v", err)
+	}
+	if !strings.Contains(string(argsData), "--force") {
+		t.Errorf("Stop() should use --force; args: %s", argsData)
+	}
+}
+
+// -----------------------------------------------------------------------
+// relocateToScion tests
+// -----------------------------------------------------------------------
+
+func TestRelocateToScion_MovesContent(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "src")
+	dst := filepath.Join(t.TempDir(), "dst")
+	_ = os.MkdirAll(src, 0755)
+	_ = os.MkdirAll(dst, 0755)
+
+	_ = os.WriteFile(filepath.Join(src, "file.txt"), []byte("hello"), 0644)
+
+	if err := relocateToScion(src, dst); err != nil {
+		t.Fatalf("relocateToScion() error = %v", err)
+	}
+
+	// File should be at dst.
+	data, err := os.ReadFile(filepath.Join(dst, "file.txt"))
+	if err != nil {
+		t.Fatalf("file not found at dst: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Errorf("file content = %q, want %q", string(data), "hello")
+	}
+
+	// src should be a symlink to dst.
+	link, err := os.Readlink(src)
+	if err != nil {
+		t.Fatalf("src is not a symlink: %v", err)
+	}
+	if link != dst {
+		t.Errorf("symlink target = %q, want %q", link, dst)
+	}
+}
+
+func TestRelocateToScion_NonexistentSrc(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "nonexistent")
+	dst := filepath.Join(t.TempDir(), "dst")
+	_ = os.MkdirAll(dst, 0755)
+
+	err := relocateToScion(src, dst)
+	if err != nil {
+		t.Errorf("relocateToScion() with nonexistent src should be no-op, got error = %v", err)
+	}
+}
+
+func TestRelocateToScion_AlreadySymlink(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "target")
+	_ = os.MkdirAll(target, 0755)
+
+	src := filepath.Join(t.TempDir(), "src-link")
+	_ = os.Symlink(target, src)
+
+	dst := filepath.Join(t.TempDir(), "dst")
+	_ = os.MkdirAll(dst, 0755)
+
+	err := relocateToScion(src, dst)
+	if err != nil {
+		t.Errorf("relocateToScion() with symlink src should be no-op, got error = %v", err)
+	}
+
+	// Symlink should still point to original target, not dst.
+	link, _ := os.Readlink(src)
+	if link != target {
+		t.Errorf("symlink target changed to %q, want %q", link, target)
+	}
+}
+
+// -----------------------------------------------------------------------
+// waitForSandboxLiveness tests
+// -----------------------------------------------------------------------
+
+func TestWaitForSandboxLiveness_CancelledContext(t *testing.T) {
+	// A pre-cancelled context must exit immediately without calling the probe.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var probeCalls atomic.Int32
+	probe := func(ctx context.Context) error {
+		probeCalls.Add(1)
+		return nil
+	}
+
+	err := waitForSandboxLiveness(ctx, []time.Duration{time.Millisecond}, probe, "test")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("waitForSandboxLiveness() = %v, want context.Canceled", err)
+	}
+	if n := probeCalls.Load(); n != 0 {
+		t.Errorf("probe was called %d times, want 0 (context was already cancelled)", n)
+	}
+}
+
+func TestWaitForSandboxLiveness_CancelDuringSleep(t *testing.T) {
+	// Cancel the context during the delay; the probe should not run.
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var probeCalls atomic.Int32
+	probe := func(ctx context.Context) error {
+		probeCalls.Add(1)
+		return nil
+	}
+
+	// Use a long delay so we can cancel during it.
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+
+	err := waitForSandboxLiveness(ctx, []time.Duration{5 * time.Second}, probe, "test")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("waitForSandboxLiveness() = %v, want context.Canceled", err)
+	}
+	if n := probeCalls.Load(); n != 0 {
+		t.Errorf("probe was called %d times, want 0 (cancelled before probe)", n)
+	}
+}
+
+func TestWaitForSandboxLiveness_Success(t *testing.T) {
+	ctx := context.Background()
+
+	probe := func(ctx context.Context) error {
+		return nil
+	}
+
+	err := waitForSandboxLiveness(ctx, []time.Duration{time.Millisecond}, probe, "test")
+	if err != nil {
+		t.Errorf("waitForSandboxLiveness() = %v, want nil", err)
+	}
+}
+
+func TestWaitForSandboxLiveness_RetriesThenSucceeds(t *testing.T) {
+	ctx := context.Background()
+
+	var probeCalls atomic.Int32
+	probe := func(ctx context.Context) error {
+		n := probeCalls.Add(1)
+		if n < 3 {
+			return errors.New("not ready")
+		}
+		return nil
+	}
+
+	delays := []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	err := waitForSandboxLiveness(ctx, delays, probe, "test")
+	if err != nil {
+		t.Errorf("waitForSandboxLiveness() = %v, want nil", err)
+	}
+	if n := probeCalls.Load(); n != 3 {
+		t.Errorf("probe was called %d times, want 3", n)
+	}
+}
+
+func TestWaitForSandboxLiveness_AllFail(t *testing.T) {
+	ctx := context.Background()
+	probeErr := errors.New("sandbox dead")
+
+	probe := func(ctx context.Context) error {
+		return probeErr
+	}
+
+	delays := []time.Duration{time.Millisecond, time.Millisecond}
+	err := waitForSandboxLiveness(ctx, delays, probe, "test")
+	if !errors.Is(err, probeErr) {
+		t.Errorf("waitForSandboxLiveness() = %v, want %v", err, probeErr)
+	}
+}
+
+// -----------------------------------------------------------------------
+// GetLogs fallback tests (#122)
+//
+// The mutation that must go red: deleting the readEntrypointLogFromState
+// call from GetLogs. These tests exercise GetLogs (the call site), not
+// readEntrypointLogFromState (the helper).
+// -----------------------------------------------------------------------
+
+// TestCloudRunSandboxRuntime_GetLogs_FallbackServesDeadAgent tests the
+// core requirement: a dead agent's entrypoint log is served through
+// GetLogs when tmux is unreachable.
+//
+// MUTATION TEST: delete the `r.readEntrypointLogFromState(id)` call from
+// GetLogs. This test goes red — GetLogs returns the tmux exec error
+// instead of the entrypoint log content.
+func TestCloudRunSandboxRuntime_GetLogs_FallbackServesDeadAgent(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Set up a mock sandbox binary that always fails (simulates dead sandbox).
+	mockBin := filepath.Join(tmpDir, "sandbox")
+	script := "#!/bin/sh\nexit 1\n"
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create the agent home with an entrypoint log.
+	agentHome := filepath.Join(tmpDir, "agents", "dead-agent", "home")
+	if err := os.MkdirAll(agentHome, 0755); err != nil {
+		t.Fatal(err)
+	}
+	logContent := "sciontool init: provisioning agent...\nERROR: /usr/bin/claude not found (exit code 127)\n"
+	if err := os.WriteFile(filepath.Join(agentHome, entrypointLogFile), []byte(logContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stateFile := filepath.Join(tmpDir, "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          mockBin,
+		state:        newSandboxStateStore(stateFile),
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+
+	// Add a stopped entry to the state store with the correct AgentHome.
+	stopped := true
+	exitCode := 127
+	now := time.Now()
+	rt.state.add(&sandboxStateEntry{
+		SandboxName: "dead-agent",
+		AgentID:     "dead-agent",
+		AgentHome:   agentHome,
+		Stopped:     stopped,
+		ExitCode:    &exitCode,
+		StoppedAt:   &now,
+	})
+
+	// GetLogs through the public API — this is the call site test.
+	logs, err := rt.GetLogs(context.Background(), "dead-agent")
+	if err != nil {
+		t.Fatalf("GetLogs() returned error for dead agent: %v", err)
+	}
+
+	// The entrypoint log content must be served.
+	if !strings.Contains(logs, "exit code 127") {
+		t.Errorf("GetLogs() did not return entrypoint log content.\ngot: %q\nwant: contains 'exit code 127'", logs)
+	}
+	if !strings.Contains(logs, "sciontool init") {
+		t.Errorf("GetLogs() missing init output.\ngot: %q", logs)
+	}
+
+	// Source label must be present so the operator knows this is
+	// startup output, not live terminal content. For a dead sandbox
+	// the reason must say "tmux exec failed", not "pane was empty."
+	if !strings.Contains(logs, "[source: entrypoint log (startup)") {
+		t.Errorf("GetLogs() fallback output missing source label.\ngot: %q", logs)
+	}
+	if !strings.Contains(logs, "sandbox was not reachable via tmux") {
+		t.Errorf("GetLogs() source label should say 'sandbox was not reachable via tmux' for dead sandbox.\ngot: %q", logs)
+	}
+}
+
+// TestCloudRunSandboxRuntime_GetLogs_NoLogFileReportsPath tests requirement 3:
+// if the entrypoint log does not exist, GetLogs says where it looked.
+func TestCloudRunSandboxRuntime_GetLogs_NoLogFileReportsPath(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	mockBin := filepath.Join(tmpDir, "sandbox")
+	if err := os.WriteFile(mockBin, []byte("#!/bin/sh\nexit 1\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Agent home exists but no entrypoint log file.
+	agentHome := filepath.Join(tmpDir, "agents", "ghost", "home")
+	if err := os.MkdirAll(agentHome, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	stateFile := filepath.Join(tmpDir, "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          mockBin,
+		state:        newSandboxStateStore(stateFile),
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+	rt.state.add(&sandboxStateEntry{
+		SandboxName: "ghost",
+		AgentID:     "ghost",
+		AgentHome:   agentHome,
+	})
+
+	logs, err := rt.GetLogs(context.Background(), "ghost")
+	if err != nil {
+		t.Fatalf("GetLogs() returned error: %v", err)
+	}
+
+	// Must state the observation: where it looked, not "no output".
+	expectedPath := filepath.Join(agentHome, entrypointLogFile)
+	if !strings.Contains(logs, expectedPath) {
+		t.Errorf("GetLogs() for missing log did not state the path.\ngot: %q\nwant: contains %q", logs, expectedPath)
+	}
+	if !strings.Contains(logs, "no entrypoint log") {
+		t.Errorf("GetLogs() for missing log did not state the observation.\ngot: %q", logs)
+	}
+}
+
+// TestCloudRunSandboxRuntime_GetLogs_NotInStateStore tests that GetLogs
+// returns an error when the sandbox is not in the state store at all
+// (e.g. after explicit Delete which calls state.remove).
+func TestCloudRunSandboxRuntime_GetLogs_NotInStateStore(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	mockBin := filepath.Join(tmpDir, "sandbox")
+	if err := os.WriteFile(mockBin, []byte("#!/bin/sh\nexit 1\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	stateFile := filepath.Join(tmpDir, "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          mockBin,
+		state:        newSandboxStateStore(stateFile),
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+
+	// No state entry — simulates after Delete.
+	_, err := rt.GetLogs(context.Background(), "deleted-agent")
+	if err == nil {
+		t.Fatal("GetLogs() expected error for agent not in state store, got nil")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("GetLogs() error = %q, want to contain 'not found'", err.Error())
+	}
+}
+
+// TestCloudRunSandboxRuntime_GetLogs_EmptyTmuxFallsThrough tests that a
+// live sandbox whose tmux pane has no output falls through to the
+// entrypoint log rather than returning an empty tab.
+//
+// This matters because a live agent that has not yet printed anything
+// would otherwise render as "no logs" — indistinguishable from a broken
+// agent. The entrypoint log (labelled as startup output) is strictly
+// better than nothing.
+func TestCloudRunSandboxRuntime_GetLogs_EmptyTmuxFallsThrough(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Mock binary that succeeds but prints nothing (empty tmux pane).
+	mockBin := filepath.Join(tmpDir, "sandbox")
+	// "exec" subcommand exits 0 with no stdout — simulates an empty pane.
+	script := "#!/bin/sh\nexit 0\n"
+	if err := os.WriteFile(mockBin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create agent home with an entrypoint log.
+	agentHome := filepath.Join(tmpDir, "agents", "silent-agent", "home")
+	if err := os.MkdirAll(agentHome, 0755); err != nil {
+		t.Fatal(err)
+	}
+	logContent := "sciontool init: provisioning agent...\nagent ready, handing off to tmux\n"
+	if err := os.WriteFile(filepath.Join(agentHome, entrypointLogFile), []byte(logContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	stateFile := filepath.Join(tmpDir, "state.json")
+	rt := &CloudRunSandboxRuntime{
+		bin:          mockBin,
+		state:        newSandboxStateStore(stateFile),
+		watchCancels: make(map[string]context.CancelFunc),
+	}
+
+	rt.state.add(&sandboxStateEntry{
+		SandboxName: "silent-agent",
+		AgentID:     "silent-agent",
+		AgentHome:   agentHome,
+	})
+
+	logs, err := rt.GetLogs(context.Background(), "silent-agent")
+	if err != nil {
+		t.Fatalf("GetLogs() returned error: %v", err)
+	}
+
+	// Must serve the entrypoint log, not an empty string.
+	if !strings.Contains(logs, "sciontool init") {
+		t.Errorf("GetLogs() with empty tmux did not fall through to entrypoint log.\ngot: %q", logs)
+	}
+
+	// Source label must be present — the operator must know this is
+	// startup output, not the live terminal being empty.
+	if !strings.Contains(logs, "[source: entrypoint log (startup)") {
+		t.Errorf("GetLogs() fallback output missing source label.\ngot: %q", logs)
+	}
+
+	// The label must say "tmux returned no terminal output" (observation),
+	// NOT "sandbox was not reachable via tmux" — the sandbox IS reachable,
+	// the pane is just empty. Using the unreachable label here would
+	// mislead an operator into concluding the agent is dead.
+	if !strings.Contains(logs, "tmux returned no terminal output") {
+		t.Errorf("GetLogs() empty-pane label should say 'tmux returned no terminal output'.\ngot: %q", logs)
+	}
+	if strings.Contains(logs, "not reachable via tmux") {
+		t.Errorf("GetLogs() empty-pane case must NOT use the unreachable label.\ngot: %q", logs)
+	}
+}

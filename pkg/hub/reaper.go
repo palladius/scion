@@ -18,6 +18,8 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
 )
 
 // Staleness thresholds for the broker-affinity reaper (B5-1, design §7.1).
@@ -34,6 +36,67 @@ const (
 	dispatchStuckAge   = 3 * dispatchRollingTimeout   // 270s
 	dispatchMaxRetries = 3
 )
+
+// brokerHeartbeatTimeoutHandler returns a recurring handler that marks brokers
+// as offline when their last heartbeat exceeds a 5-minute threshold. It publishes
+// status events for each affected broker so SSE subscribers are informed. The
+// hub's own stateless co-located broker is refreshed first, so it is never
+// swept (see refreshStatelessEmbeddedBrokerHeartbeat).
+func (s *Server) brokerHeartbeatTimeoutHandler() func(ctx context.Context) {
+	return func(ctx context.Context) {
+		// Tight timeout: fail fast if DB connections are saturated rather than
+		// holding a connection while waiting, which worsens the thundering herd.
+		ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+
+		s.refreshStatelessEmbeddedBrokerHeartbeat(ctx)
+
+		threshold := time.Now().Add(-5 * time.Minute)
+
+		ids, err := s.store.MarkStaleBrokersOffline(ctx, threshold)
+		if err != nil {
+			slog.Error("Scheduler: broker heartbeat timeout check failed", "error", err)
+			return
+		}
+
+		for _, id := range ids {
+			providers, err := s.store.GetBrokerProjects(ctx, id)
+			if err != nil {
+				slog.Error("Scheduler: failed to get broker projects for event publishing", "brokerID", id, "error", err)
+				continue
+			}
+			projectIDs := make([]string, len(providers))
+			for i, p := range providers {
+				projectIDs[i] = p.ProjectID
+			}
+			s.events.PublishBrokerDisconnected(ctx, id, projectIDs)
+		}
+
+		if len(ids) > 0 {
+			slog.Info("Scheduler: marked stale brokers as offline",
+				"count", len(ids), "threshold", threshold)
+		}
+	}
+}
+
+// refreshStatelessEmbeddedBrokerHeartbeat marks the hub's own stateless
+// co-located broker online with a fresh heartbeat. That broker has no
+// heartbeat of its own: the runtime-broker heartbeat and the co-located
+// heartbeat loop are both off for it, because it is available whenever a hub
+// replica is running. Refreshing it here, in the same tick and just before the
+// stale-broker sweep, keeps the sweep from marking it offline after a restart,
+// and gives the first boot (heartbeat unset) and a restart the same result.
+// A failure is logged and does not stop the sweep.
+func (s *Server) refreshStatelessEmbeddedBrokerHeartbeat(ctx context.Context) {
+	id := s.GetStatelessEmbeddedBrokerID()
+	if id == "" {
+		return
+	}
+	if err := s.store.UpdateRuntimeBrokerHeartbeat(ctx, id, store.BrokerStatusOnline); err != nil {
+		slog.Error("Scheduler: failed to refresh stateless co-located broker heartbeat",
+			"brokerID", id, "error", err)
+	}
+}
 
 // brokerAffinityReapHandler returns a recurring handler that clears stale broker
 // affinity and re-drives (or fails) stuck dispatches. Registered as a singleton

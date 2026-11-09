@@ -8,6 +8,10 @@ Before making changes, review the relevant design documentation:
 
 - **[Web Frontend Design](../.design/hosted/web-frontend-design.md)** - Architecture, technology stack, component patterns
 
+## Experimental features
+
+New experimental user-facing features must be launched behind a registered experiment (`pkg/experiments/registry.go`); see `docs-site/src/content/docs/reference/experiments.md`. Browser-side flag values are user-editable and only affect presentation; if an experiment changes hub behaviour, register it with the server layer and check it in the hub (`requireExperiment` / `experimentEnabled`). Do not add ad-hoc `scion:feature:` string literals or new booleans to `/api/v1/settings/public`.
+
 ## Architecture Overview
 
 The web frontend is a **client-side SPA** built with Lit web components. There is no Node.js server at runtime. The Go `scion` binary serves the compiled client assets and handles all server-side concerns (OAuth, sessions, SSE real-time events, API routing) via `pkg/hub/web.go` and `pkg/hub/events.go`.
@@ -49,10 +53,12 @@ Note: The Vite dev server only serves client assets. API calls and SSE require t
 | `npm run dev` | Start Vite dev server with hot reload |
 | `npm run build` | Build client assets for production |
 | `npm run build:dev` | Build client assets in development mode |
+| `npm run test:move-sourcemaps` | Test `scripts/move-sourcemaps.mjs`, which the builds run to move source maps from `dist/client` (embedded and served) to `dist/sourcemaps` (not served) |
 | `npm run lint` | Check for linting errors |
 | `npm run lint:fix` | Auto-fix linting errors |
 | `npm run format` | Format code with Prettier |
 | `npm run typecheck` | Run TypeScript type checking |
+| `npm run test` | Run Vitest test suite |
 
 ### Verifying Changes
 
@@ -60,7 +66,8 @@ After making changes, verify:
 
 1. **Type checking passes:** `npm run typecheck`
 2. **Linting passes:** `npm run lint`
-3. **Client builds:** `npm run build`
+3. **Tests pass:** `npm run test`
+4. **Client builds:** `npm run build`
 
 ## Project Structure
 
@@ -112,6 +119,10 @@ web/
 - **Routing:** Client-side via History API (click interception in `main.ts`)
 - **Terminal:** xterm.js for terminal sessions
 - **Server:** Go (`scion` binary with `--enable-web`)
+
+### Shoelace component registration
+
+Shoelace components, themes and icons ship in the client bundle; the SPA shell loads nothing from a CDN. Every `sl-*` component the app renders must be registered by an import in `src/client/main.ts` (`import '@shoelace-style/shoelace/dist/components/<name>/<name>.js';`). An unregistered tag renders as an unknown, unstyled element, in dev and production alike. `src/client/shoelace-registration.test.ts` fails when a tag used in `src/` has no such import.
 
 ## Icon Reference
 
@@ -258,7 +269,7 @@ When working in a containerized or sandboxed agent environment (e.g., scion agen
 
 ### Tool pitfalls in sandboxed environments
 
-- **No `test` script.** There is no `npm test` script. Do not run `npm test` — it will fail. Use the specific verification commands listed in [Common Commands](#common-commands) (`npm run typecheck`, `npm run lint`, `npm run build`).
+- **Testing with Vitest.** Run `npm run test` to execute the Vitest test suite. Use the specific verification commands listed in [Common Commands](#common-commands) (`npm run typecheck`, `npm run lint`, `npm run test`) for full verification.
 - **Never use `npx tsc`.** There is a completely unrelated npm package called `tsc` (v2.x) that `npx` will download and run instead of TypeScript's compiler. Always use `npm run typecheck` which invokes the correct local TypeScript binary via the project's package.json script.
 - **TypeScript may not be installed globally.** Do not assume `tsc` or `./node_modules/.bin/tsc` are available. The project's `npm run typecheck` script is the only reliable way to type-check.
 - **For CSS-only changes**, if `npm run typecheck` is unavailable, `npm run build` is the next best verification — Vite will surface any import or syntax errors during bundling.
@@ -327,9 +338,9 @@ When using the Chrome DevTools MCP tools (`take_screenshot`, `take_snapshot`, `c
    ss -tlnp | grep 8080  # verify it's listening
    ```
 
-3. **Capture the dev token** from the server startup output. It appears as:
-   ```
-   Dev token: scion_dev_<hex>
+3. **Load the dev token from its file.** Startup output shows the dev token file path instead of its value, as a command you can run:
+   ```bash
+   export SCION_DEV_TOKEN=$(cat '/home/user/.scion/dev-token')
    ```
 
 4. **Build assets before starting the server**: Run `npm install && npm run build` in `web/` first. The server serves from `web/dist/client`.

@@ -1,0 +1,1339 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package messaging
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/messages"
+)
+
+// ---------- MapLegacyType ----------
+
+func TestMapLegacyType_AllOldTypes(t *testing.T) {
+	tests := []struct {
+		name           string
+		oldType        string
+		systemCategory string
+		hasAddressee   bool
+		wantKind       MessageKind
+		wantIntent     *TextIntent
+		wantEventType  *EventType // nil if no event expected
+	}{
+		{
+			name:       "instruction → text/request",
+			oldType:    messages.TypeInstruction,
+			wantKind:   KindText,
+			wantIntent: ptrIntent(IntentRequest),
+		},
+		{
+			name:       "chat → text/inform",
+			oldType:    messages.TypeChat,
+			wantKind:   KindText,
+			wantIntent: ptrIntent(IntentInform),
+		},
+		{
+			name:       "assistant-reply → text/inform",
+			oldType:    messages.TypeAssistantReply,
+			wantKind:   KindText,
+			wantIntent: ptrIntent(IntentInform),
+		},
+		{
+			name:          "input-needed (addressed) → text/question",
+			oldType:       messages.TypeInputNeeded,
+			hasAddressee:  true,
+			wantKind:      KindText,
+			wantIntent:    ptrIntent(IntentQuestion),
+			wantEventType: nil,
+		},
+		{
+			name:          "input-needed (broadcast) → event/agent.input-needed",
+			oldType:       messages.TypeInputNeeded,
+			hasAddressee:  false,
+			wantKind:      KindEvent,
+			wantIntent:    nil,
+			wantEventType: ptrEventType(EventAgentInputNeeded),
+		},
+		{
+			name:          "state-change → event/agent.state-changed",
+			oldType:       messages.TypeStateChange,
+			wantKind:      KindEvent,
+			wantEventType: ptrEventType(EventAgentStateChanged),
+		},
+		{
+			name:           "system (scheduler) → event/schedule.fired",
+			oldType:        messages.TypeSystem,
+			systemCategory: messages.SystemCategoryScheduler,
+			wantKind:       KindEvent,
+			wantEventType:  ptrEventType(EventScheduleFired),
+		},
+		{
+			name:           "system (port-forward) → event/port.exposed",
+			oldType:        messages.TypeSystem,
+			systemCategory: messages.SystemCategoryPortForward,
+			wantKind:       KindEvent,
+			wantEventType:  ptrEventType(EventPortExposed),
+		},
+		{
+			name:           "system (artifact-review) → event/artifact.review",
+			oldType:        messages.TypeSystem,
+			systemCategory: messages.SystemCategoryArtifactReview,
+			wantKind:       KindEvent,
+			wantEventType:  ptrEventType(EventArtifactReview),
+		},
+		{
+			name:           "system (delivery-failed) → event/delivery.failed",
+			oldType:        messages.TypeSystem,
+			systemCategory: messages.SystemCategoryDeliveryFailed,
+			wantKind:       KindEvent,
+			wantEventType:  ptrEventType(EventDeliveryFailed),
+		},
+		{
+			name:           "system (unknown category) → event/agent.state-changed",
+			oldType:        messages.TypeSystem,
+			systemCategory: "unknown-category",
+			wantKind:       KindEvent,
+			wantEventType:  ptrEventType(EventAgentStateChanged),
+		},
+		{
+			name:       "mention → text/request (delivery artifact)",
+			oldType:    messages.TypeMention,
+			wantKind:   KindText,
+			wantIntent: ptrIntent(IntentRequest),
+		},
+		{
+			name:       "group-set → text/request (delivery artifact)",
+			oldType:    messages.TypeGroupSet,
+			wantKind:   KindText,
+			wantIntent: ptrIntent(IntentRequest),
+		},
+		{
+			name:       "reply → text/request",
+			oldType:    messages.TypeReply,
+			wantKind:   KindText,
+			wantIntent: ptrIntent(IntentRequest),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			kind, intent, event := MapLegacyType(tc.oldType, tc.systemCategory, tc.hasAddressee)
+
+			if kind != tc.wantKind {
+				t.Errorf("kind: got %q, want %q", kind, tc.wantKind)
+			}
+
+			if tc.wantIntent == nil {
+				if intent != nil {
+					t.Errorf("intent: got %q, want nil", *intent)
+				}
+			} else {
+				if intent == nil {
+					t.Fatalf("intent: got nil, want %q", *tc.wantIntent)
+				}
+				if *intent != *tc.wantIntent {
+					t.Errorf("intent: got %q, want %q", *intent, *tc.wantIntent)
+				}
+			}
+
+			if tc.wantEventType == nil {
+				if event != nil {
+					t.Errorf("event: got %+v, want nil", event)
+				}
+			} else {
+				if event == nil {
+					t.Fatalf("event: got nil, want type %q", *tc.wantEventType)
+				}
+				if event.Type != *tc.wantEventType {
+					t.Errorf("event.Type: got %q, want %q", event.Type, *tc.wantEventType)
+				}
+			}
+		})
+	}
+}
+
+func TestMapLegacyType_UnknownType(t *testing.T) {
+	kind, intent, event := MapLegacyType("totally-unknown", "", false)
+	if kind != KindText {
+		t.Errorf("unknown type kind: got %q, want text", kind)
+	}
+	if intent == nil || *intent != IntentInform {
+		t.Errorf("unknown type intent: got %v, want inform", intent)
+	}
+	if event != nil {
+		t.Errorf("unknown type event: got %v, want nil", event)
+	}
+}
+
+// ---------- MapLegacyDeliveryArtifact ----------
+
+func TestMapLegacyDeliveryArtifact(t *testing.T) {
+	tests := []struct {
+		oldType string
+		wantVia *AddressedVia
+	}{
+		{messages.TypeMention, ptrVia(ViaBodyMention)},
+		{messages.TypeGroupSet, ptrVia(ViaExplicit)},
+		{messages.TypeInstruction, nil},
+		{messages.TypeChat, nil},
+		{messages.TypeStateChange, nil},
+		{messages.TypeSystem, nil},
+		{messages.TypeInputNeeded, nil},
+		{messages.TypeAssistantReply, nil},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.oldType, func(t *testing.T) {
+			got := MapLegacyDeliveryArtifact(tc.oldType)
+			if tc.wantVia == nil {
+				if got != nil {
+					t.Errorf("got %q, want nil", *got)
+				}
+			} else {
+				if got == nil {
+					t.Fatalf("got nil, want %q", *tc.wantVia)
+				}
+				if *got != *tc.wantVia {
+					t.Errorf("got %q, want %q", *got, *tc.wantVia)
+				}
+			}
+		})
+	}
+}
+
+// ---------- MapLegacyEnvelope ----------
+
+func TestMapLegacyEnvelope_NilInput(t *testing.T) {
+	_, _, err := MapLegacyEnvelope(nil, PersistedIdentity{})
+	if err == nil {
+		t.Fatal("expected error for nil input")
+	}
+}
+
+func TestMapLegacyEnvelope_Instruction(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		SenderID:  "user:alice",
+		Recipient: "agent:builder",
+		Msg:       "Build the feature",
+		Type:      messages.TypeInstruction,
+	}
+
+	msg, addrs, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.Kind != KindText {
+		t.Errorf("kind: got %q, want text", msg.Kind)
+	}
+	if msg.Intent == nil || *msg.Intent != IntentRequest {
+		t.Errorf("intent: got %v, want request", msg.Intent)
+	}
+	if msg.From != "user:alice" {
+		t.Errorf("from: got %q, want user:alice", msg.From)
+	}
+	if msg.Body != "Build the feature" {
+		t.Errorf("body: got %q, want 'Build the feature'", msg.Body)
+	}
+	if len(addrs) != 1 {
+		t.Fatalf("addressees: got %d, want 1", len(addrs))
+	}
+	if addrs[0].PrincipalKind != "agent" || addrs[0].PrincipalID != "builder" {
+		t.Errorf("addressee: got %s:%s, want agent:builder", addrs[0].PrincipalKind, addrs[0].PrincipalID)
+	}
+}
+
+func TestMapLegacyEnvelope_StateChange(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "agent:builder",
+		SenderID:  "agent:builder",
+		Recipient: "user:alice",
+		Msg:       "Agent state changed to COMPLETED",
+		Type:      messages.TypeStateChange,
+		Status:    "COMPLETED",
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.Kind != KindEvent {
+		t.Errorf("kind: got %q, want event", msg.Kind)
+	}
+	if msg.Event == nil {
+		t.Fatal("event body should not be nil")
+	}
+	if msg.Event.Type != EventAgentStateChanged {
+		t.Errorf("event.type: got %q, want agent.state-changed", msg.Event.Type)
+	}
+	if msg.Event.Status != "COMPLETED" {
+		t.Errorf("event.status: got %q, want COMPLETED", msg.Event.Status)
+	}
+}
+
+func TestMapLegacyEnvelope_SystemScheduler(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "system:scheduler",
+		Recipient: "agent:worker",
+		Msg:       "Schedule fired",
+		Type:      messages.TypeSystem,
+		Metadata:  map[string]string{"system_category": messages.SystemCategoryScheduler},
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.Kind != KindEvent {
+		t.Errorf("kind: got %q, want event", msg.Kind)
+	}
+	if msg.Event == nil || msg.Event.Type != EventScheduleFired {
+		t.Errorf("event.type: got %v, want schedule.fired", msg.Event)
+	}
+}
+
+func TestMapLegacyEnvelope_MetadataPassThrough(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		SenderID:  "user:alice",
+		Recipient: "agent:builder",
+		Msg:       "Replying to your message",
+		Type:      messages.TypeReply,
+		Metadata: map[string]string{
+			"RE-to":           "original message preview...",
+			"system_category": "scheduler",
+			"__attachments":   "internal-data",
+		},
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// RE-to should pass through.
+	if msg.Metadata == nil {
+		t.Fatal("metadata is nil, want non-nil")
+	}
+	if got, ok := msg.Metadata["RE-to"]; !ok || got != "original message preview..." {
+		t.Errorf("metadata[RE-to] = %q, want %q", got, "original message preview...")
+	}
+
+	// Internal keys must be filtered out.
+	if _, ok := msg.Metadata["system_category"]; ok {
+		t.Error("metadata contains system_category, want filtered out")
+	}
+	if _, ok := msg.Metadata["__attachments"]; ok {
+		t.Error("metadata contains __attachments, want filtered out")
+	}
+}
+
+func TestMapLegacyEnvelope_MetadataEmpty(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		SenderID:  "user:alice",
+		Recipient: "agent:builder",
+		Msg:       "No metadata",
+		Type:      messages.TypeInstruction,
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.Metadata != nil {
+		t.Errorf("metadata = %v, want nil", msg.Metadata)
+	}
+}
+
+func TestMapLegacyEnvelope_MetadataOnlyInternalKeys(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		SenderID:  "user:alice",
+		Recipient: "agent:builder",
+		Msg:       "Only internal metadata",
+		Type:      messages.TypeInstruction,
+		Metadata: map[string]string{
+			"system_category": "scheduler",
+			"__attachments":   "internal-data",
+		},
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// When only internal keys exist, Metadata should be nil (not empty map).
+	if msg.Metadata != nil {
+		t.Errorf("metadata = %v, want nil (all keys filtered)", msg.Metadata)
+	}
+}
+
+func TestMapLegacyEnvelope_InputNeeded_Addressed(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:     1,
+		Timestamp:   "2026-08-27T10:00:00Z",
+		Sender:      "agent:worker",
+		SenderID:    "agent:worker",
+		Recipient:   "user:alice",
+		RecipientID: "user:alice",
+		Msg:         "I need input",
+		Type:        messages.TypeInputNeeded,
+		Broadcasted: false,
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.Kind != KindText {
+		t.Errorf("kind: got %q, want text", msg.Kind)
+	}
+	if msg.Intent == nil || *msg.Intent != IntentQuestion {
+		t.Errorf("intent: got %v, want question", msg.Intent)
+	}
+}
+
+func TestMapLegacyEnvelope_InputNeeded_Broadcast(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:     1,
+		Timestamp:   "2026-08-27T10:00:00Z",
+		Sender:      "agent:worker",
+		SenderID:    "agent:worker",
+		Recipient:   "user:alice",
+		RecipientID: "user:alice",
+		Msg:         "Agent needs input",
+		Type:        messages.TypeInputNeeded,
+		Broadcasted: true,
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.Kind != KindEvent {
+		t.Errorf("kind: got %q, want event", msg.Kind)
+	}
+	if msg.Event == nil || msg.Event.Type != EventAgentInputNeeded {
+		t.Errorf("event.type: got %v, want agent.input-needed", msg.Event)
+	}
+}
+
+func TestMapLegacyEnvelope_Mention(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		Recipient: "agent:reviewer",
+		Msg:       "Hey @reviewer look at this",
+		Type:      messages.TypeMention,
+		Metadata:  map[string]string{"mention_source": "agent:builder", "mention_position": "body"},
+	}
+
+	msg, addrs, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.Kind != KindText {
+		t.Errorf("kind: got %q, want text", msg.Kind)
+	}
+	if msg.Intent == nil || *msg.Intent != IntentRequest {
+		t.Errorf("intent: got %v, want request", msg.Intent)
+	}
+	if len(addrs) != 1 {
+		t.Fatalf("addressees: got %d, want 1", len(addrs))
+	}
+	if addrs[0].Via != ViaBodyMention {
+		t.Errorf("addressee.via: got %q, want body-mention", addrs[0].Via)
+	}
+}
+
+func TestMapLegacyEnvelope_GroupSet(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		Recipient: "agent:builder",
+		Msg:       "Build this for the group",
+		Type:      messages.TypeGroupSet,
+	}
+
+	msg, addrs, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.Kind != KindText {
+		t.Errorf("kind: got %q, want text", msg.Kind)
+	}
+	if msg.Intent == nil || *msg.Intent != IntentRequest {
+		t.Errorf("intent: got %v, want request", msg.Intent)
+	}
+	if len(addrs) != 1 {
+		t.Fatalf("addressees: got %d, want 1", len(addrs))
+	}
+	if addrs[0].Via != ViaExplicit {
+		t.Errorf("addressee.via: got %q, want explicit", addrs[0].Via)
+	}
+}
+
+func TestMapLegacyEnvelope_Attachments(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:     1,
+		Timestamp:   "2026-08-27T10:00:00Z",
+		Sender:      "user:alice",
+		Recipient:   "agent:builder",
+		Msg:         "Here are the files",
+		Type:        messages.TypeInstruction,
+		Attachments: []string{"/tmp/file1.go", "/tmp/file2.go"},
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(msg.Attachments) != 2 {
+		t.Fatalf("attachments: got %d, want 2", len(msg.Attachments))
+	}
+	if msg.Attachments[0].Path != "/tmp/file1.go" {
+		t.Errorf("attachment[0].Path: got %q, want /tmp/file1.go", msg.Attachments[0].Path)
+	}
+}
+
+// ---------- Urgent mapping (OQ-1b) ----------
+
+// TestMapLegacyEnvelope_UrgentMapped verifies that old.Urgent is mapped to
+// Message.Urgent. This pins the urgent semantics that were previously
+// silently discarded by the conversion (noted in DEF-103 footnote).
+func TestMapLegacyEnvelope_UrgentMapped(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		SenderID:  "user:alice",
+		Recipient: "agent:builder",
+		Msg:       "Urgent task",
+		Type:      messages.TypeInstruction,
+		Urgent:    true,
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !msg.Urgent {
+		t.Error("msg.Urgent = false, want true; old.Urgent must be mapped")
+	}
+}
+
+// TestMapLegacyEnvelope_NotUrgent verifies that non-urgent messages produce
+// Urgent=false on the new Message.
+func TestMapLegacyEnvelope_NotUrgent(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		SenderID:  "user:alice",
+		Recipient: "agent:builder",
+		Msg:       "Normal task",
+		Type:      messages.TypeInstruction,
+		Urgent:    false,
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.Urgent {
+		t.Error("msg.Urgent = true, want false; non-urgent message should not be marked urgent")
+	}
+}
+
+// ---------- PersistedIdentity / DEF-103 ----------
+
+// TestMapLegacyEnvelope_ThreadedMessage_NoReplyTo (DEF-103, AC-9-12) verifies
+// that a message with a ThreadID does NOT produce a reply_to field. A thread
+// ID is not a message ID, and reply_to must point at a real message or be absent.
+func TestMapLegacyEnvelope_ThreadedMessage_NoReplyTo(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		SenderID:  "user:alice",
+		Recipient: "agent:builder",
+		Msg:       "Build it",
+		Type:      messages.TypeInstruction,
+		Channel:   "dev",
+		ThreadID:  "thread-42",
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.ReplyToID != nil {
+		t.Errorf("reply_to should be nil when no real reply target exists, got %q", *msg.ReplyToID)
+	}
+}
+
+// TestMapLegacyEnvelope_NoFabricatedMessageID (DEF-103, AC-9-13) verifies
+// that when no persisted identity is provided, the message ID is empty
+// rather than a fabricated "legacy-<timestamp>" string.
+func TestMapLegacyEnvelope_NoFabricatedMessageID(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		SenderID:  "user:alice",
+		Recipient: "agent:builder",
+		Msg:       "Hello",
+		Type:      messages.TypeInstruction,
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.ID != "" {
+		t.Errorf("message ID should be empty when no persisted identity, got %q", msg.ID)
+	}
+	if strings.HasPrefix(msg.ID, "legacy-") {
+		t.Errorf("fabricated legacy- message ID must not be produced, got %q", msg.ID)
+	}
+}
+
+// TestMapLegacyEnvelope_RealPersistedIdentity (DEF-103) verifies that real
+// persisted identifiers are used in the output when provided.
+func TestMapLegacyEnvelope_RealPersistedIdentity(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		SenderID:  "user:alice",
+		Recipient: "agent:builder",
+		Msg:       "Hello",
+		Type:      messages.TypeInstruction,
+		ThreadID:  "thread-42",
+		Channel:   "dev",
+	}
+
+	ident := PersistedIdentity{
+		MessageID: "real-msg-uuid-001",
+		ReplyToID: "real-reply-uuid-002",
+	}
+
+	msg, addrs, err := MapLegacyEnvelope(old, ident)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.ID != "real-msg-uuid-001" {
+		t.Errorf("message ID = %q, want %q", msg.ID, "real-msg-uuid-001")
+	}
+	if msg.ReplyToID == nil || *msg.ReplyToID != "real-reply-uuid-002" {
+		t.Errorf("reply_to = %v, want %q", msg.ReplyToID, "real-reply-uuid-002")
+	}
+	// Addressee message IDs must match the real persisted ID.
+	for i, a := range addrs {
+		if a.MessageID != "real-msg-uuid-001" {
+			t.Errorf("addrs[%d].MessageID = %q, want %q", i, a.MessageID, "real-msg-uuid-001")
+		}
+	}
+}
+
+// TestMapLegacyEnvelope_EmptyReplyToID_Omitted verifies that an empty
+// ReplyToID in PersistedIdentity results in a nil ReplyToID on the Message,
+// even when the legacy message has a ThreadID set.
+func TestMapLegacyEnvelope_EmptyReplyToID_Omitted(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		SenderID:  "user:alice",
+		Recipient: "agent:builder",
+		Msg:       "Hello",
+		Type:      messages.TypeInstruction,
+		ThreadID:  "thread-42",
+		Channel:   "dev",
+	}
+
+	ident := PersistedIdentity{
+		MessageID: "real-msg-uuid-001",
+		ReplyToID: "", // explicitly absent
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, ident)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.ReplyToID != nil {
+		t.Errorf("reply_to should be nil when ReplyToID is empty, got %q", *msg.ReplyToID)
+	}
+}
+
+// ---------- NewEnvelopeToLegacy ----------
+
+func TestNewEnvelopeToLegacy_NilInput(t *testing.T) {
+	result := NewEnvelopeToLegacy(nil, nil)
+	if result != nil {
+		t.Fatal("expected nil for nil input")
+	}
+}
+
+func TestNewEnvelopeToLegacy_TextRequest(t *testing.T) {
+	intent := IntentRequest
+	msg := &Message{
+		ID:        "msg-1",
+		From:      "user:alice",
+		Kind:      KindText,
+		Intent:    &intent,
+		Body:      "Build the feature",
+		CreatedAt: time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC),
+	}
+	addrs := []Addressee{{
+		MessageID:     "msg-1",
+		PrincipalKind: "agent",
+		PrincipalID:   "builder",
+		Via:           ViaExplicit,
+		DeliveryState: DeliveryPending,
+	}}
+
+	old := NewEnvelopeToLegacy(msg, addrs)
+	if old.Type != messages.TypeInstruction {
+		t.Errorf("type: got %q, want instruction", old.Type)
+	}
+	if old.Sender != "user:alice" {
+		t.Errorf("sender: got %q, want user:alice", old.Sender)
+	}
+	if old.Recipient != "agent:builder" {
+		t.Errorf("recipient: got %q, want agent:builder", old.Recipient)
+	}
+	if old.Msg != "Build the feature" {
+		t.Errorf("msg: got %q, want 'Build the feature'", old.Msg)
+	}
+}
+
+func TestNewEnvelopeToLegacy_TextInform_Agent(t *testing.T) {
+	intent := IntentInform
+	msg := &Message{
+		ID:        "msg-1",
+		From:      "agent:builder",
+		Kind:      KindText,
+		Intent:    &intent,
+		Body:      "Task completed",
+		CreatedAt: time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC),
+	}
+	addrs := []Addressee{{
+		MessageID:     "msg-1",
+		PrincipalKind: "user",
+		PrincipalID:   "alice",
+		Via:           ViaDirect,
+		DeliveryState: DeliveryDelivered,
+	}}
+
+	old := NewEnvelopeToLegacy(msg, addrs)
+	// The retired assistant-reply type is never emitted, even for agents.
+	if old.Type != messages.TypeChat {
+		t.Errorf("type: got %q, want chat", old.Type)
+	}
+}
+
+func TestNewEnvelopeToLegacy_TextInform_User(t *testing.T) {
+	intent := IntentInform
+	msg := &Message{
+		ID:        "msg-1",
+		From:      "user:bob",
+		Kind:      KindText,
+		Intent:    &intent,
+		Body:      "Hey",
+		CreatedAt: time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC),
+	}
+
+	old := NewEnvelopeToLegacy(msg, nil)
+	if old.Type != messages.TypeChat {
+		t.Errorf("type: got %q, want chat", old.Type)
+	}
+}
+
+func TestNewEnvelopeToLegacy_TextQuestion(t *testing.T) {
+	intent := IntentQuestion
+	msg := &Message{
+		ID:        "msg-1",
+		From:      "agent:worker",
+		Kind:      KindText,
+		Intent:    &intent,
+		Body:      "What should I do?",
+		CreatedAt: time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC),
+	}
+
+	old := NewEnvelopeToLegacy(msg, nil)
+	if old.Type != messages.TypeInputNeeded {
+		t.Errorf("type: got %q, want input-needed", old.Type)
+	}
+}
+
+func TestNewEnvelopeToLegacy_EventStateChanged(t *testing.T) {
+	msg := &Message{
+		ID:   "msg-1",
+		From: "agent:builder",
+		Kind: KindEvent,
+		Event: &EventBody{
+			Type:   EventAgentStateChanged,
+			Status: "COMPLETED",
+		},
+		Body:      "Agent completed",
+		CreatedAt: time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC),
+	}
+
+	old := NewEnvelopeToLegacy(msg, nil)
+	if old.Type != messages.TypeStateChange {
+		t.Errorf("type: got %q, want state-change", old.Type)
+	}
+	if old.Status != "COMPLETED" {
+		t.Errorf("status: got %q, want COMPLETED", old.Status)
+	}
+}
+
+func TestNewEnvelopeToLegacy_EventSystem(t *testing.T) {
+	tests := []struct {
+		name       string
+		eventType  EventType
+		status     string
+		wantCat    string
+		wantStatus string
+	}{
+		{"schedule.fired", EventScheduleFired, "", messages.SystemCategoryScheduler, ""},
+		{"port.exposed", EventPortExposed, "", messages.SystemCategoryPortForward, ""},
+		{"artifact.review", EventArtifactReview, "", messages.SystemCategoryArtifactReview, ""},
+		{"delivery.failed", EventDeliveryFailed, "", messages.SystemCategoryDeliveryFailed, ""},
+		// O-c (p2a-r2 review): the deferred notice (design agent-reincarnate
+		// §3.7) reuses EventDeliveryFailed's type with a distinct Status —
+		// the round trip must recover SystemCategoryDeliveryDeferred, not
+		// collapse back to SystemCategoryDeliveryFailed.
+		{"delivery.failed/deferred", EventDeliveryFailed, "DELIVERY_DEFERRED", messages.SystemCategoryDeliveryDeferred, "DELIVERY_DEFERRED"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := &Message{
+				ID:        "msg-1",
+				From:      "system:scheduler",
+				Kind:      KindEvent,
+				Event:     &EventBody{Type: tc.eventType, Status: tc.status},
+				Body:      "System event",
+				CreatedAt: time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC),
+			}
+
+			old := NewEnvelopeToLegacy(msg, nil)
+			if old.Type != messages.TypeSystem {
+				t.Errorf("type: got %q, want system", old.Type)
+			}
+			if old.Metadata["system_category"] != tc.wantCat {
+				t.Errorf("system_category: got %q, want %q", old.Metadata["system_category"], tc.wantCat)
+			}
+			if old.Status != tc.wantStatus {
+				t.Errorf("status: got %q, want %q", old.Status, tc.wantStatus)
+			}
+		})
+	}
+}
+
+// TestMapSystemCategory_DeliveryDeferred is the forward-direction half of
+// O-c (p2a-r2 review): messages.SystemCategoryDeliveryDeferred must not fall
+// to mapSystemCategory's default branch (which would log a WARN and
+// silently reclassify the notice as agent.state-changed).
+func TestMapSystemCategory_DeliveryDeferred(t *testing.T) {
+	body := mapSystemCategory(messages.SystemCategoryDeliveryDeferred)
+	if body == nil {
+		t.Fatal("mapSystemCategory returned nil")
+	}
+	if body.Type != EventDeliveryFailed {
+		t.Errorf("type: got %v, want EventDeliveryFailed", body.Type)
+	}
+	if body.Status != "DELIVERY_DEFERRED" {
+		t.Errorf("status: got %q, want DELIVERY_DEFERRED", body.Status)
+	}
+}
+
+func TestNewEnvelopeToLegacy_EventInputNeeded(t *testing.T) {
+	msg := &Message{
+		ID:        "msg-1",
+		From:      "agent:worker",
+		Kind:      KindEvent,
+		Event:     &EventBody{Type: EventAgentInputNeeded},
+		Body:      "Agent needs input",
+		CreatedAt: time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC),
+	}
+
+	old := NewEnvelopeToLegacy(msg, nil)
+	if old.Type != messages.TypeInputNeeded {
+		t.Errorf("type: got %q, want input-needed", old.Type)
+	}
+}
+
+func TestNewEnvelopeToLegacy_MentionVia(t *testing.T) {
+	intent := IntentRequest
+	msg := &Message{
+		ID:        "msg-1",
+		From:      "user:alice",
+		Kind:      KindText,
+		Intent:    &intent,
+		Body:      "Hey @reviewer",
+		CreatedAt: time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC),
+	}
+	addrs := []Addressee{{
+		MessageID:     "msg-1",
+		PrincipalKind: "agent",
+		PrincipalID:   "reviewer",
+		Via:           ViaBodyMention,
+		DeliveryState: DeliveryPending,
+	}}
+
+	old := NewEnvelopeToLegacy(msg, addrs)
+	if old.Type != messages.TypeMention {
+		t.Errorf("type: got %q, want mention", old.Type)
+	}
+	if old.Metadata["mention_source"] != "user:alice" {
+		t.Errorf("mention_source: got %q, want user:alice", old.Metadata["mention_source"])
+	}
+}
+
+func TestNewEnvelopeToLegacy_Attachments(t *testing.T) {
+	intent := IntentRequest
+	msg := &Message{
+		ID:     "msg-1",
+		From:   "user:alice",
+		Kind:   KindText,
+		Intent: &intent,
+		Body:   "Files",
+		Attachments: []AttachmentRef{
+			{Path: "/tmp/a.go"},
+			{Path: "/tmp/b.go", Name: "b.go"},
+		},
+		CreatedAt: time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC),
+	}
+
+	old := NewEnvelopeToLegacy(msg, nil)
+	if len(old.Attachments) != 2 {
+		t.Fatalf("attachments: got %d, want 2", len(old.Attachments))
+	}
+	if old.Attachments[0] != "/tmp/a.go" {
+		t.Errorf("attachment[0]: got %q, want /tmp/a.go", old.Attachments[0])
+	}
+}
+
+// ---------- Round-trip tests ----------
+
+func TestRoundTrip_OldToNewToOld(t *testing.T) {
+	tests := []struct {
+		name string
+		old  *messages.StructuredMessage
+		// expectedType is the type we expect after round-tripping. Some mappings
+		// are lossy; when the round-trip produces a different but semantically
+		// equivalent type, we accept it here.
+		expectedType string
+	}{
+		{
+			name: "instruction",
+			old: &messages.StructuredMessage{
+				Version:   1,
+				Timestamp: "2026-08-27T10:00:00Z",
+				Sender:    "user:alice",
+				SenderID:  "user:alice",
+				Recipient: "agent:builder",
+				Msg:       "Build it",
+				Type:      messages.TypeInstruction,
+			},
+			expectedType: messages.TypeInstruction,
+		},
+		{
+			name: "chat",
+			old: &messages.StructuredMessage{
+				Version:   1,
+				Timestamp: "2026-08-27T10:00:00Z",
+				Sender:    "user:alice",
+				SenderID:  "user:alice",
+				Recipient: "user:bob",
+				Msg:       "Hey",
+				Type:      messages.TypeChat,
+			},
+			expectedType: messages.TypeChat,
+		},
+		{
+			// A historical assistant-reply row reads back as chat: the
+			// retired type is never emitted again.
+			name: "assistant-reply (historical)",
+			old: &messages.StructuredMessage{
+				Version:   1,
+				Timestamp: "2026-08-27T10:00:00Z",
+				Sender:    "agent:builder",
+				SenderID:  "agent:builder",
+				Recipient: "user:alice",
+				Msg:       "Done",
+				Type:      messages.TypeAssistantReply,
+			},
+			expectedType: messages.TypeChat,
+		},
+		{
+			name: "state-change",
+			old: &messages.StructuredMessage{
+				Version:   1,
+				Timestamp: "2026-08-27T10:00:00Z",
+				Sender:    "agent:builder",
+				SenderID:  "agent:builder",
+				Recipient: "user:alice",
+				Msg:       "State changed",
+				Type:      messages.TypeStateChange,
+				Status:    "COMPLETED",
+			},
+			expectedType: messages.TypeStateChange,
+		},
+		{
+			name: "system/scheduler",
+			old: &messages.StructuredMessage{
+				Version:   1,
+				Timestamp: "2026-08-27T10:00:00Z",
+				Sender:    "system:scheduler",
+				Recipient: "agent:worker",
+				Msg:       "Fired",
+				Type:      messages.TypeSystem,
+				Metadata:  map[string]string{"system_category": messages.SystemCategoryScheduler},
+			},
+			expectedType: messages.TypeSystem,
+		},
+		{
+			name: "input-needed (addressed)",
+			old: &messages.StructuredMessage{
+				Version:     1,
+				Timestamp:   "2026-08-27T10:00:00Z",
+				Sender:      "agent:worker",
+				SenderID:    "agent:worker",
+				Recipient:   "user:alice",
+				RecipientID: "user:alice",
+				Msg:         "Need input",
+				Type:        messages.TypeInputNeeded,
+				Broadcasted: false,
+			},
+			expectedType: messages.TypeInputNeeded,
+		},
+		{
+			name: "input-needed (broadcast)",
+			old: &messages.StructuredMessage{
+				Version:     1,
+				Timestamp:   "2026-08-27T10:00:00Z",
+				Sender:      "agent:worker",
+				SenderID:    "agent:worker",
+				Recipient:   "user:alice",
+				Msg:         "Need input",
+				Type:        messages.TypeInputNeeded,
+				Broadcasted: true,
+			},
+			expectedType: messages.TypeInputNeeded,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msg, addrs, err := MapLegacyEnvelope(tc.old, PersistedIdentity{})
+			if err != nil {
+				t.Fatalf("MapLegacyEnvelope failed: %v", err)
+			}
+
+			roundTripped := NewEnvelopeToLegacy(msg, addrs)
+
+			// Check that essential semantics are preserved.
+			if roundTripped.Type != tc.expectedType {
+				t.Errorf("type: got %q, want %q", roundTripped.Type, tc.expectedType)
+			}
+			if roundTripped.Msg != tc.old.Msg {
+				t.Errorf("msg: got %q, want %q", roundTripped.Msg, tc.old.Msg)
+			}
+			if roundTripped.Sender != tc.old.SenderID && roundTripped.Sender != tc.old.Sender {
+				t.Errorf("sender: got %q, want %q or %q", roundTripped.Sender, tc.old.Sender, tc.old.SenderID)
+			}
+		})
+	}
+}
+
+func TestRoundTrip_NewToOldToNew(t *testing.T) {
+	// Every Message field is populated non-zero so the round trip can
+	// detect a silent drop. A field left at its zero value survives even
+	// when the mapper omits it, hiding the bug.
+	intent := IntentRequest
+	replyTo := "reply-99"
+	original := &Message{
+		ID:             "msg-1",
+		ConversationID: "conv-123",
+		ReplyToID:      &replyTo,
+		From:           "user:alice",
+		Kind:           KindText,
+		Intent:         &intent,
+		Body:           "Build it",
+		Attachments:    []AttachmentRef{{Path: "/tmp/a.go", Name: "a.go"}},
+		Urgent:         true,
+		CreatedAt:      time.Date(2026, 8, 27, 10, 0, 0, 0, time.UTC),
+	}
+	originalAddrs := []Addressee{{
+		MessageID:     "msg-1",
+		PrincipalKind: "agent",
+		PrincipalID:   "builder",
+		Via:           ViaExplicit,
+		DeliveryState: DeliveryPending,
+	}}
+
+	// ---- new → old ----
+	legacy := NewEnvelopeToLegacy(original, originalAddrs)
+
+	// Verify the intermediate StructuredMessage carries the fields that
+	// have a direct legacy equivalent.
+	if !legacy.Urgent {
+		t.Error("new→old: Urgent not mapped to StructuredMessage")
+	}
+	if legacy.ConversationID != "conv-123" {
+		t.Errorf("new→old: ConversationID = %q, want %q", legacy.ConversationID, "conv-123")
+	}
+
+	// ---- old → new ----
+	restored, restoredAddrs, err := MapLegacyEnvelope(legacy, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("MapLegacyEnvelope failed: %v", err)
+	}
+
+	// Fields that survive the full round trip (new → old → new):
+	if restored.Kind != original.Kind {
+		t.Errorf("kind: got %q, want %q", restored.Kind, original.Kind)
+	}
+	if restored.Intent == nil || *restored.Intent != *original.Intent {
+		t.Errorf("intent: got %v, want %v", restored.Intent, original.Intent)
+	}
+	if restored.Body != original.Body {
+		t.Errorf("body: got %q, want %q", restored.Body, original.Body)
+	}
+	if len(restored.Attachments) != len(original.Attachments) {
+		t.Errorf("attachments count: got %d, want %d", len(restored.Attachments), len(original.Attachments))
+	}
+	if restored.Attachments[0].Path != original.Attachments[0].Path {
+		t.Errorf("attachment path: got %q, want %q", restored.Attachments[0].Path, original.Attachments[0].Path)
+	}
+	if restored.Urgent != original.Urgent {
+		t.Errorf("urgent: got %v, want %v", restored.Urgent, original.Urgent)
+	}
+	if len(restoredAddrs) != len(originalAddrs) {
+		t.Errorf("addressees count: got %d, want %d", len(restoredAddrs), len(originalAddrs))
+	}
+
+	// Fields with expected loss in the round trip — documented here so a
+	// future reader knows the omission is intentional, not overlooked.
+	//
+	// ID: StructuredMessage has no ID field. Restored msg.ID comes from
+	//     PersistedIdentity, which is empty in this test.
+	//
+	// ConversationID: NewEnvelopeToLegacy maps it to old.ConversationID,
+	//     but MapLegacyEnvelope does not read old.ConversationID back
+	//     (conversation context is handled separately via ConversationInfo).
+	//
+	// ReplyToID: no clean legacy equivalent. ThreadID is semantically
+	//     different (DEF-103); mapping would re-introduce fabrication.
+	//
+	// AttachmentRef.Name: old format carries only paths.
+}
+
+// ---------- buildPrincipalRef ----------
+
+func TestBuildPrincipalRef_PreferSlugOverUUID(t *testing.T) {
+	// When name is a valid PrincipalRef (kind:value), prefer it over the
+	// raw UUID in the id parameter. This keeps human-readable slugs and
+	// emails in the delivery envelope.
+	tests := []struct {
+		name string
+		n    string // name parameter
+		id   string // id parameter
+		want PrincipalRef
+	}{
+		{
+			name: "agent slug preferred over UUID",
+			n:    "agent:my-slug",
+			id:   "814b7c0b-1a15-43a2-a3f1-2aa3b1548c94",
+			want: "agent:my-slug",
+		},
+		{
+			name: "user email preferred over UUID",
+			n:    "user:alice@example.com",
+			id:   "be67fbc9-c869-5d43-b15d-c28ca3e8d355",
+			want: "user:alice@example.com",
+		},
+		{
+			name: "system ref preferred over UUID",
+			n:    "system:scheduler",
+			id:   "some-uuid",
+			want: "system:scheduler",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := buildPrincipalRef(tc.n, tc.id)
+			if ref != tc.want {
+				t.Errorf("got %q, want %q", ref, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildPrincipalRef_FallbackToID(t *testing.T) {
+	// When name is absent, empty, or not a valid PrincipalRef, fall back
+	// to constructing from the id parameter.
+	tests := []struct {
+		name string
+		n    string // name parameter
+		id   string // id parameter
+		want PrincipalRef
+	}{
+		{
+			name: "empty name falls back to kind from name (trailing colon)",
+			n:    "user:",
+			id:   "be67fbc9-c869-5d43-b15d-c28ca3e8d355",
+			want: "user:be67fbc9-c869-5d43-b15d-c28ca3e8d355",
+		},
+		{
+			name: "no name at all falls back to system",
+			n:    "",
+			id:   "some-uuid",
+			want: "system:some-uuid",
+		},
+		{
+			name: "name without colon falls back to system",
+			n:    "alice",
+			id:   "some-uuid",
+			want: "system:some-uuid",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := buildPrincipalRef(tc.n, tc.id)
+			if ref != tc.want {
+				t.Errorf("got %q, want %q", ref, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildPrincipalRef_PrefixedID(t *testing.T) {
+	// When name is absent and id already has a colon, use id directly.
+	ref := buildPrincipalRef("", "user:alice-uuid")
+	if ref != "user:alice-uuid" {
+		t.Fatalf("expected prefixed id used directly, got %q", ref)
+	}
+}
+
+func TestBuildPrincipalRef_NameOnlyNoID(t *testing.T) {
+	// When id is empty and name is a valid PrincipalRef, use name directly.
+	ref := buildPrincipalRef("agent:builder", "")
+	if ref != "agent:builder" {
+		t.Fatalf("expected name used directly, got %q", ref)
+	}
+}
+
+func TestBuildPrincipalRef_BothEmpty(t *testing.T) {
+	ref := buildPrincipalRef("", "")
+	if ref != "system:unknown" {
+		t.Fatalf("expected system:unknown, got %q", ref)
+	}
+}
+
+// ---------- Human-to-human reply intent override ----------
+
+func TestMapLegacyEnvelope_ReplyToHuman_IntentInform(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		SenderID:  "user:alice",
+		Recipient: "user:bob",
+		Msg:       "Replying to Bob",
+		Type:      messages.TypeReply,
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.Kind != KindText {
+		t.Errorf("kind: got %q, want text", msg.Kind)
+	}
+	// Human-to-human reply should be inform, not request.
+	if msg.Intent == nil || *msg.Intent != IntentInform {
+		t.Errorf("intent: got %v, want inform (human-to-human reply)", msg.Intent)
+	}
+}
+
+func TestMapLegacyEnvelope_ReplyToAgent_IntentRequest(t *testing.T) {
+	old := &messages.StructuredMessage{
+		Version:   1,
+		Timestamp: "2026-08-27T10:00:00Z",
+		Sender:    "user:alice",
+		SenderID:  "user:alice",
+		Recipient: "agent:builder",
+		Msg:       "Replying to agent",
+		Type:      messages.TypeReply,
+	}
+
+	msg, _, err := MapLegacyEnvelope(old, PersistedIdentity{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if msg.Kind != KindText {
+		t.Errorf("kind: got %q, want text", msg.Kind)
+	}
+	// Reply to agent should remain request.
+	if msg.Intent == nil || *msg.Intent != IntentRequest {
+		t.Errorf("intent: got %v, want request (reply to agent)", msg.Intent)
+	}
+}
+
+// ---------- helpers ----------
+
+func ptrIntent(i TextIntent) *TextIntent  { return &i }
+func ptrEventType(e EventType) *EventType { return &e }
+func ptrVia(v AddressedVia) *AddressedVia { return &v }

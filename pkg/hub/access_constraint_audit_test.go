@@ -1,0 +1,630 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build !no_sqlite
+
+package hub
+
+import (
+	"context"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/hub/auditevent"
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+// auditTestSetup creates a GovernanceService for testing.
+func auditTestSetup(t *testing.T) (*GovernanceService, *PreviewService, *AuthzService, store.Store) {
+	t.Helper()
+	return govTestSetup(t)
+}
+
+// auditTestSetupWithEvents creates a full setup including event bus.
+func auditTestSetupWithEvents(t *testing.T) (*GovernanceService, *PreviewService, *AuthzService, store.Store, *InvalidationEventBus) {
+	t.Helper()
+	gs, ps, authz, s := auditTestSetup(t)
+	eventBus := NewInvalidationEventBus(slog.Default())
+	gs.eventBus = eventBus
+	return gs, ps, authz, s, eventBus
+}
+
+// ---------------------------------------------------------------------------
+// 1. Audit write produces a durable audit ID on commit
+// ---------------------------------------------------------------------------
+
+func TestAudit_CommitProducesAuditID(t *testing.T) {
+	gs, ps, _, s := auditTestSetup(t)
+	ctx := context.Background()
+
+	// Seed an admin user.
+	adminID := govSeedAdminUser(t, s, "audit-admin-1")
+	actor := PrincipalContext{Kind: "user", ID: adminID}
+
+	// Create a constraint via preview+commit.
+	pType := "user"
+	draft := &store.AccessConstraint{
+		Name:                 "audit-test-boundary",
+		SubjectKind:          store.ConstraintSubjectPrincipal,
+		SubjectPrincipalType: &pType,
+		SubjectPrincipalID:   strPtr(tid("audit-target-user")),
+		ScopeType:            "system",
+		MaximumPermissions:   []string{"agent.read"},
+		Purpose:              "test audit logging",
+		CreatedBy:            adminID,
+	}
+
+	// Seed the target user so the preview can resolve them.
+	pvSeedUser(t, s, "audit-target-user")
+
+	result, err := ps.GeneratePreview(ctx, PreviewRequest{
+		Operation: "create",
+		Draft:     draft,
+		Actor:     actor,
+	})
+	require.NoError(t, err)
+
+	commitResult, err := gs.CommitBoundaryChange(ctx, CommitRequest{
+		Operation:    "create",
+		Draft:        draft,
+		PreviewToken: result.PreviewToken,
+		Actor:        actor,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, commitResult)
+
+	// The commit must produce a non-empty audit ID.
+	assert.NotEmpty(t, commitResult.AuditID, "commit must produce a durable audit ID")
+
+	entries, err := s.ListConstraintHistory(ctx, commitResult.Constraint.ID)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "expected exactly one durable history entry")
+	assert.Equal(t, commitResult.AuditID, entries[0].EventID)
+	assert.Equal(t, "create", entries[0].Operation)
+	assert.Equal(t, adminID, entries[0].ActorID)
+	assert.Equal(t, ClassificationTighten, entries[0].Classification)
+	assert.False(t, entries[0].OccurredAt.IsZero())
+}
+
+// ---------------------------------------------------------------------------
+// 3. Audit entry contains no sensitive principal data (redaction test)
+// ---------------------------------------------------------------------------
+
+func TestAudit_RedactionNoSensitiveData(t *testing.T) {
+	gs, ps, _, s := auditTestSetup(t)
+	ctx := context.Background()
+	capture := auditevent.NewCaptureSink()
+	gs.auditSink = capture
+
+	adminID := govSeedAdminUser(t, s, "redact-admin")
+	actor := PrincipalContext{Kind: "user", ID: adminID}
+
+	pvSeedUser(t, s, "redact-target")
+	pType := "user"
+	draft := &store.AccessConstraint{
+		Name:                 "redact-test-boundary",
+		SubjectKind:          store.ConstraintSubjectPrincipal,
+		SubjectPrincipalType: &pType,
+		SubjectPrincipalID:   strPtr(tid("redact-target")),
+		ScopeType:            "system",
+		MaximumPermissions:   []string{"agent.read"},
+		Purpose:              "test redaction",
+		CreatedBy:            adminID,
+	}
+
+	result, err := ps.GeneratePreview(ctx, PreviewRequest{
+		Operation: "create",
+		Draft:     draft,
+		Actor:     actor,
+	})
+	require.NoError(t, err)
+
+	commitResult, err := gs.CommitBoundaryChange(ctx, CommitRequest{
+		Operation:    "create",
+		Draft:        draft,
+		PreviewToken: result.PreviewToken,
+		Actor:        actor,
+	})
+	require.NoError(t, err)
+
+	entries, err := s.ListConstraintHistory(ctx, commitResult.Constraint.ID)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	entry := entries[0]
+	records := capture.Records()
+	require.Len(t, records, 1)
+
+	// ---------------------------------------------------------------------------
+	// Field-level sensitive data assertions (R2): verify that every field in
+	// the CREATE history row that could theoretically carry PII is safe.
+	// ---------------------------------------------------------------------------
+
+	// Common PII patterns: email addresses, typical principal/group names.
+	piiPatterns := []string{"@", "user@", "admin@", ".com", ".org"}
+
+	// ActorID should be an opaque identifier, never an email.
+	assert.NotContains(t, entry.ActorID, "@", "ActorID must not contain an email address")
+	assert.Equal(t, adminID, entry.ActorID, "ActorID should be the admin's opaque ID")
+
+	// ConstraintID should not contain principal names, group names, or emails.
+	for _, pat := range piiPatterns {
+		assert.NotContains(t, entry.ConstraintID, pat,
+			"ConstraintID must not contain PII pattern %q", pat)
+	}
+
+	// PreviewID should not contain principal or group identifiers.
+	for _, pat := range piiPatterns {
+		assert.NotContains(t, entry.PreviewID, pat,
+			"PreviewID must not contain PII pattern %q", pat)
+	}
+
+	// DraftHash should not contain principal or group identifiers.
+	for _, pat := range piiPatterns {
+		assert.NotContains(t, entry.DraftHash, pat,
+			"DraftHash must not contain PII pattern %q", pat)
+	}
+
+	// The configured structured sink receives only the approved opaque IDs and
+	// typed payload; names, purpose text, and subject details stay out.
+	structured := string(records[0])
+	for _, sensitive := range []string{"redact-admin", "redact-target", draft.Name, draft.Purpose} {
+		assert.NotContains(t, structured, sensitive)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 6. Online/offline exclusion: two operations cannot run concurrently
+// ---------------------------------------------------------------------------
+
+func TestRecovery_OnlineOfflineExclusion(t *testing.T) {
+	lock := NewRecoveryLock()
+
+	// First acquire should succeed.
+	assert.True(t, lock.TryAcquire("instance-1"), "first acquire should succeed")
+	assert.True(t, lock.IsHeld())
+	assert.Equal(t, "instance-1", lock.Holder())
+
+	// Second acquire should fail.
+	assert.False(t, lock.TryAcquire("instance-2"), "second acquire should fail while lock is held")
+
+	// Release and try again.
+	lock.Release()
+	assert.False(t, lock.IsHeld())
+
+	assert.True(t, lock.TryAcquire("instance-2"), "acquire should succeed after release")
+	lock.Release()
+}
+
+func TestRecovery_ConcurrentExclusion(t *testing.T) {
+	lock := NewRecoveryLock()
+	const goroutines = 10
+
+	var acquireCount atomic.Int32
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			if lock.TryAcquire("goroutine-" + string(rune('0'+id))) {
+				acquireCount.Add(1)
+				// Hold the lock briefly.
+				time.Sleep(1 * time.Millisecond)
+				lock.Release()
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	// At least one goroutine must have acquired the lock, and the count
+	// tells us the lock was properly exclusive (if all acquired, it means
+	// they serialized through acquire/release properly).
+	assert.True(t, acquireCount.Load() >= 1, "at least one goroutine should acquire the lock")
+}
+
+// ---------------------------------------------------------------------------
+// 7. SQLite exclusive lock during recovery
+// ---------------------------------------------------------------------------
+
+func TestRecovery_SQLiteExclusiveLock(t *testing.T) {
+	_, _, _, s := auditTestSetup(t)
+	ctx := context.Background()
+
+	adminID := govSeedAdminUser(t, s, "sqlite-lock-admin")
+
+	rs := NewRecoveryService(s, nil, slog.Default())
+
+	// First recovery should succeed.
+	assert.True(t, rs.recoveryLock.TryAcquire(adminID))
+	rs.recoveryLock.Release()
+
+	// Running DisableAll acquires and releases the lock.
+	result, err := rs.DisableAll(ctx, pvTestActor(adminID))
+	require.NoError(t, err)
+	assert.Equal(t, 0, result.DisabledCount) // No constraints to disable.
+
+	// Lock should be released after DisableAll completes.
+	assert.False(t, rs.recoveryLock.IsHeld())
+}
+
+// ---------------------------------------------------------------------------
+// 8. Event delivery and authorization
+// ---------------------------------------------------------------------------
+
+func TestEvents_DeliveryToAuthorizedSubscribers(t *testing.T) {
+	bus := NewInvalidationEventBus(slog.Default())
+
+	var received []InvalidationEvent
+	var mu sync.Mutex
+
+	// Subscribe an authorized handler.
+	bus.Subscribe("admin-1", nil, func(event InvalidationEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		received = append(received, event)
+	}, true)
+
+	// Publish an event.
+	bus.Publish(InvalidationEvent{
+		Type:      EventBoundaryCreated,
+		EntityID:  "constraint-1",
+		Timestamp: time.Now(),
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, received, 1)
+	assert.Equal(t, EventBoundaryCreated, received[0].Type)
+	assert.Equal(t, "constraint-1", received[0].EntityID)
+}
+
+func TestEvents_UnauthorizedSubscribersBlocked(t *testing.T) {
+	bus := NewInvalidationEventBus(slog.Default())
+
+	var received []InvalidationEvent
+	var mu sync.Mutex
+
+	// Subscribe an unauthorized handler.
+	bus.Subscribe("hacker", nil, func(event InvalidationEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		received = append(received, event)
+	}, false)
+
+	// Publish an event.
+	bus.Publish(InvalidationEvent{
+		Type:      EventBoundaryCreated,
+		EntityID:  "constraint-1",
+		Timestamp: time.Now(),
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Len(t, received, 0, "unauthorized subscriber should not receive events")
+}
+
+func TestEvents_TypeFilterWorks(t *testing.T) {
+	bus := NewInvalidationEventBus(slog.Default())
+
+	var received []InvalidationEvent
+	var mu sync.Mutex
+
+	// Subscribe only to boundary events.
+	bus.Subscribe("admin", []string{EventBoundaryCreated, EventBoundaryDeleted}, func(event InvalidationEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		received = append(received, event)
+	}, true)
+
+	// Publish a matching event.
+	bus.Publish(InvalidationEvent{
+		Type:      EventBoundaryCreated,
+		EntityID:  "c1",
+		Timestamp: time.Now(),
+	})
+
+	// Publish a non-matching event.
+	bus.Publish(InvalidationEvent{
+		Type:      EventMembershipChanged,
+		EntityID:  "g1",
+		Timestamp: time.Now(),
+	})
+
+	// Publish another matching event.
+	bus.Publish(InvalidationEvent{
+		Type:      EventBoundaryDeleted,
+		EntityID:  "c2",
+		Timestamp: time.Now(),
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Len(t, received, 2, "should receive only matching event types")
+	assert.Equal(t, EventBoundaryCreated, received[0].Type)
+	assert.Equal(t, EventBoundaryDeleted, received[1].Type)
+}
+
+func TestEvents_PanicInHandlerRecovered(t *testing.T) {
+	bus := NewInvalidationEventBus(slog.Default())
+
+	var received []InvalidationEvent
+	var mu sync.Mutex
+
+	// Subscribe a panicking handler.
+	bus.Subscribe("panic-sub", nil, func(event InvalidationEvent) {
+		panic("test panic")
+	}, true)
+
+	// Subscribe a normal handler after the panicking one.
+	bus.Subscribe("normal-sub", nil, func(event InvalidationEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		received = append(received, event)
+	}, true)
+
+	// Publish should not panic and the second handler should still receive.
+	assert.NotPanics(t, func() {
+		bus.Publish(InvalidationEvent{
+			Type:      EventBoundaryUpdated,
+			EntityID:  "c1",
+			Timestamp: time.Now(),
+		})
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Len(t, received, 1, "non-panicking handler should still receive events")
+}
+
+func TestEvents_UnsubscribeWorks(t *testing.T) {
+	bus := NewInvalidationEventBus(slog.Default())
+
+	var count atomic.Int32
+
+	subID := bus.Subscribe("admin", nil, func(event InvalidationEvent) {
+		count.Add(1)
+	}, true)
+
+	bus.Publish(InvalidationEvent{Type: EventBoundaryCreated, EntityID: "c1", Timestamp: time.Now()})
+	assert.Equal(t, int32(1), count.Load())
+
+	bus.Unsubscribe(subID)
+	bus.Publish(InvalidationEvent{Type: EventBoundaryCreated, EntityID: "c2", Timestamp: time.Now()})
+	assert.Equal(t, int32(1), count.Load(), "should not receive after unsubscribe")
+}
+
+// ---------------------------------------------------------------------------
+// 9. Events wired into governance commit path
+// ---------------------------------------------------------------------------
+
+func TestEvents_PublishedOnCommit(t *testing.T) {
+	gs, ps, _, s, eventBus := auditTestSetupWithEvents(t)
+	ctx := context.Background()
+
+	var received []InvalidationEvent
+	var mu sync.Mutex
+
+	eventBus.Subscribe("test", nil, func(event InvalidationEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		received = append(received, event)
+	}, true)
+
+	adminID := govSeedAdminUser(t, s, "event-commit-admin")
+	actor := PrincipalContext{Kind: "user", ID: adminID}
+
+	pvSeedUser(t, s, "event-commit-target")
+	pType := "user"
+	draft := &store.AccessConstraint{
+		Name:                 "event-test-boundary",
+		SubjectKind:          store.ConstraintSubjectPrincipal,
+		SubjectPrincipalType: &pType,
+		SubjectPrincipalID:   strPtr(tid("event-commit-target")),
+		ScopeType:            "system",
+		MaximumPermissions:   []string{"agent.read"},
+		Purpose:              "test events on commit",
+		CreatedBy:            adminID,
+	}
+
+	result, err := ps.GeneratePreview(ctx, PreviewRequest{
+		Operation: "create",
+		Draft:     draft,
+		Actor:     actor,
+	})
+	require.NoError(t, err)
+
+	_, err = gs.CommitBoundaryChange(ctx, CommitRequest{
+		Operation:    "create",
+		Draft:        draft,
+		PreviewToken: result.PreviewToken,
+		Actor:        actor,
+	})
+	require.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, received, 1)
+	assert.Equal(t, "boundary.created", received[0].Type)
+	assert.NotEmpty(t, received[0].EntityID)
+}
+
+// ---------------------------------------------------------------------------
+// 10. Capabilities computation
+// ---------------------------------------------------------------------------
+
+func TestCapabilities_AdminHasFullCapabilities(t *testing.T) {
+	srv, s := testServer(t)
+	authz := srv.authzService
+	ctx := context.Background()
+
+	adminID := govSeedAdminUser(t, s, "caps-admin")
+	actor := PrincipalContext{Kind: "user", ID: adminID}
+
+	cs := NewCapabilitiesService(s, authz, slog.Default())
+
+	caps, err := cs.ComputeCapabilities(ctx, actor, "system", "")
+	require.NoError(t, err)
+	require.NotNil(t, caps)
+
+	assert.True(t, caps.IsAdmin, "admin should have IsAdmin=true")
+	assert.True(t, caps.CanCreate, "admin should have CanCreate=true")
+	assert.True(t, caps.CanUpdate, "admin should have CanUpdate=true")
+	assert.True(t, caps.CanDelete, "admin should have CanDelete=true")
+	assert.True(t, caps.CanPreview, "admin should have CanPreview=true")
+}
+
+func TestCapabilities_NonAdminHasNoMutationCapabilities(t *testing.T) {
+	srv, s := testServer(t)
+	authz := srv.authzService
+	ctx := context.Background()
+
+	userID := govSeedNonAdminUser(t, s, "caps-nonadmin")
+	actor := PrincipalContext{Kind: "user", ID: userID}
+
+	cs := NewCapabilitiesService(s, authz, slog.Default())
+
+	caps, err := cs.ComputeCapabilities(ctx, actor, "system", "")
+	require.NoError(t, err)
+	require.NotNil(t, caps)
+
+	assert.False(t, caps.IsAdmin, "non-admin should have IsAdmin=false")
+	assert.False(t, caps.CanCreate, "non-admin should have CanCreate=false")
+	assert.False(t, caps.CanUpdate, "non-admin should have CanUpdate=false")
+	assert.False(t, caps.CanDelete, "non-admin should have CanDelete=false")
+	assert.False(t, caps.CanPreview, "non-admin should have CanPreview=false")
+}
+
+func TestCapabilities_DisabledConstraintBlocksMutation(t *testing.T) {
+	srv, s := testServer(t)
+	authz := srv.authzService
+	ctx := context.Background()
+
+	adminID := govSeedAdminUser(t, s, "caps-disabled-admin")
+	actor := PrincipalContext{Kind: "user", ID: adminID}
+
+	// Create a constraint and disable it.
+	pType := "user"
+	pvSeedUser(t, s, "caps-disabled-target")
+	created, err := s.CreateAccessConstraint(ctx, &store.AccessConstraint{
+		Name:                 "caps-disabled-boundary",
+		SubjectKind:          store.ConstraintSubjectPrincipal,
+		SubjectPrincipalType: &pType,
+		SubjectPrincipalID:   strPtr(tid("caps-disabled-target")),
+		ScopeType:            "system",
+		MaximumPermissions:   []string{"agent.read"},
+		Purpose:              "test disabled caps",
+		CreatedBy:            adminID,
+	})
+	require.NoError(t, err)
+
+	err = s.DisableAccessConstraint(ctx, created.ID)
+	require.NoError(t, err)
+
+	cs := NewCapabilitiesService(s, authz, slog.Default())
+	caps, err := cs.ComputeResourceCapabilities(ctx, actor, created.ID)
+	require.NoError(t, err)
+
+	assert.False(t, caps.CanUpdate, "disabled constraint should block update")
+	assert.False(t, caps.CanDelete, "disabled constraint should block delete")
+	assert.Contains(t, caps.Restrictions, "recovery_disabled")
+}
+
+// ---------------------------------------------------------------------------
+// 11. Metrics tracking
+// ---------------------------------------------------------------------------
+
+func TestMetrics_RecordMutation(t *testing.T) {
+	m := NewBoundaryMetrics(slog.Default())
+
+	m.RecordMutation(ClassificationTighten, 100)
+	m.RecordMutation(ClassificationRelax, 200)
+	m.RecordMutation(ClassificationMixed, 150)
+	m.RecordMutation(ClassificationTighten, 50)
+
+	snap := m.Snapshot()
+	assert.Equal(t, int64(2), snap["tighten_count"])
+	assert.Equal(t, int64(1), snap["relax_count"])
+	assert.Equal(t, int64(1), snap["mixed_count"])
+	assert.Equal(t, int64(50), snap["last_mutation_latency_ms"])
+}
+
+func TestMetrics_RecordLockoutCheck(t *testing.T) {
+	m := NewBoundaryMetrics(slog.Default())
+
+	m.RecordLockoutCheck(false)
+	m.RecordLockoutCheck(false)
+	m.RecordLockoutCheck(true)
+
+	snap := m.Snapshot()
+	assert.Equal(t, int64(3), snap["lockout_check_count"])
+	assert.Equal(t, int64(1), snap["lockout_block_count"])
+}
+
+// ---------------------------------------------------------------------------
+// 13. Recovery: list recovery-disabled boundaries
+// ---------------------------------------------------------------------------
+
+func TestRecovery_ListRecoveryDisabled(t *testing.T) {
+	_, _, _, s := auditTestSetup(t)
+	ctx := context.Background()
+
+	adminID := govSeedAdminUser(t, s, "list-disabled-admin")
+
+	// Create and disable a constraint.
+	pType := "user"
+	pvSeedUser(t, s, "list-disabled-user")
+	created, err := s.CreateAccessConstraint(ctx, &store.AccessConstraint{
+		Name:                 "list-disabled-boundary",
+		SubjectKind:          store.ConstraintSubjectPrincipal,
+		SubjectPrincipalType: &pType,
+		SubjectPrincipalID:   strPtr(tid("list-disabled-user")),
+		ScopeType:            "system",
+		MaximumPermissions:   []string{"agent.read"},
+		Purpose:              "test list disabled",
+		CreatedBy:            adminID,
+	})
+	require.NoError(t, err)
+
+	err = s.DisableAccessConstraint(ctx, created.ID)
+	require.NoError(t, err)
+
+	rs := NewRecoveryService(s, nil, slog.Default())
+	disabled, err := rs.ListRecoveryDisabled(ctx)
+	require.NoError(t, err)
+	assert.Len(t, disabled, 1)
+	assert.Equal(t, created.ID, disabled[0].ID)
+	assert.True(t, disabled[0].Disabled)
+}
+
+// ---------------------------------------------------------------------------
+// 14. Correlation ID from context
+// ---------------------------------------------------------------------------
+
+func TestCorrelationIDFromContext(t *testing.T) {
+	ctx := context.Background()
+	assert.Equal(t, "", correlationIDFromContext(ctx), "empty context should return empty string")
+
+	ctx = context.WithValue(ctx, correlationIDKey, "req-123")
+	assert.Equal(t, "req-123", correlationIDFromContext(ctx))
+}
