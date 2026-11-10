@@ -255,7 +255,8 @@ func envVarDeliveryKind(v store.EnvVar) MaterialKind {
 // as_needed and reserved-target skips, the progeny pass and the error
 // contract are resolveEnvFromStorage's; TZ rows, which buildStartEnv
 // discards, are skipped. A credential that cannot be minted is an error,
-// like a store read error.
+// like a store read error. The owner's user-scope rows not shared with
+// progeny are held to the owner material chain rule, as there.
 func (d *HTTPAgentDispatcher) selectDeliveryEnv(ctx context.Context, sel *deliverySelector, agent *store.Agent) (map[string]string, map[string]bool, error) {
 	result := make(map[string]string)
 	plain := make(map[string]bool)
@@ -263,6 +264,16 @@ func (d *HTTPAgentDispatcher) selectDeliveryEnv(ctx context.Context, sel *delive
 		return result, plain, nil
 	}
 
+	// The owner material chain rule for the owner's rows not shared with
+	// progeny (start_owner_material_chain.go). Its chain lookups, and the
+	// dispatch memo they fill, run on the selection's decision context
+	// (sel.decisionContext), as authorize's decisions do: for a start or
+	// restart they complete after the request has ended, and a lookup
+	// fault still withholds the row. The counts are reported on ctx.
+	gctx, gcancel := sel.decisionContext(ctx)
+	defer gcancel()
+	gate := d.newOwnerMaterialGate(agent)
+	defer gate.flush(ctx, ownerMaterialSiteLaunchEnv)
 	for _, filter := range d.envScopesForDispatch(ctx, agent) {
 		vars, err := d.store.ListEnvVars(ctx, filter)
 		if err != nil {
@@ -281,7 +292,11 @@ func (d *HTTPAgentDispatcher) selectDeliveryEnv(ctx context.Context, sel *delive
 			if v.Key == agentTZEnvKey {
 				continue
 			}
-			if filter.Scope != store.ScopeUser {
+			if filter.Scope == store.ScopeUser {
+				if !gate.allowEnvRow(gctx, filter, v) {
+					continue
+				}
+			} else {
 				allowed, err := sel.authorize(ctx, envVarDeliveryKind(v), materialRecordEnvVar, v.ID, v.Key, filter.Scope, filter.ScopeID)
 				if err != nil {
 					return nil, nil, err
@@ -376,9 +391,21 @@ func (d *HTTPAgentDispatcher) selectDeliverySecrets(ctx context.Context, sel *de
 		scopes = append(scopes, scopeEntry{store.ScopeUser, agent.OwnerID})
 	}
 
+	// The test-admin scope restriction, evaluated once: the start-time
+	// checks' keep decision and the withholding below use this one result.
+	ta := d.testAdminScopesFor(ctx, agent)
+
 	// The start-time owner-path and progeny checks resolveSecrets applies
 	// through the backend's Resolve. Nil without an authorization service.
-	startOpts := d.startSecretResolveOpts(ctx, agent)
+	// They run on the selection's decision context (sel.decisionContext),
+	// as authorize's decisions do: the owner material chain lookups, the
+	// dispatch memo they fill, the parent ceiling and the progeny decision
+	// complete after the request of a start or restart has ended, and a
+	// fault still withholds the secret. The counts are reported on ctx.
+	gctx, gcancel := sel.decisionContext(ctx)
+	defer gcancel()
+	startOpts, gate := d.startSecretResolveOpts(gctx, agent, &ta)
+	defer gate.flush(ctx, ownerMaterialSiteLaunchSecrets)
 
 	var kept []secretDeliveryCandidate
 	for _, sc := range scopes {
@@ -389,6 +416,15 @@ func (d *HTTPAgentDispatcher) selectDeliverySecrets(ctx context.Context, sel *de
 		for _, m := range metas {
 			if m.SecretType == store.SecretTypeInternal {
 				continue
+			}
+			// The same hub-scope rule as the backends' Resolve, applied
+			// before authorization and before any value is read, so an
+			// excluded hub row never shadows a broker-scope row.
+			if sc.scope == store.ScopeHub {
+				m.Scope = store.ScopeHub
+				if !secret.HubSecretDeliverable(m) {
+					continue
+				}
 			}
 			if sc.scope != store.ScopeUser {
 				allowed, err := sel.authorize(ctx, MaterialKindSecret, materialRecordSecret, m.ID, m.Name, sc.scope, sc.scopeID)
@@ -443,7 +479,7 @@ func (d *HTTPAgentDispatcher) selectDeliverySecrets(ctx context.Context, sel *de
 	// name or target, and the restriction then drops it. The one
 	// difference is fail-closed: a withheld item whose value could not
 	// have been read still outranks that lower-scope item.
-	restricted, allowedScopes, testAdminRoot := d.testAdminRootScopes(ctx, agent)
+	restricted, allowedScopes, testAdminRoot := ta.restricted, ta.allowed, ta.root
 	withheld := func(scope string) bool { return restricted && !allowedScopes[scope] }
 
 	metas := make([]secret.SecretMeta, 0, len(kept))

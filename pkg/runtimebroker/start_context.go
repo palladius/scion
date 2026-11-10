@@ -276,6 +276,12 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 			Message: fmt.Sprintf("buildStartContext: Operation not set or unrecognized: %q", in.Operation),
 		}
 	}
+	// A flat cloudrun instance refuses a per-agent GCP identity request
+	// here, ahead of every side effect below: the ownership record, the
+	// project files and the identity resolution (E-10).
+	if sce := s.flatCloudRunGCPIdentityRefusal(in); sce != nil {
+		return nil, sce
+	}
 
 	ctx, span := tracer.Start(ctx, "broker.agent.provision")
 	defer span.End()
@@ -594,13 +600,14 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 	// mode is rewritten to "passthrough" and the account and project are
 	// set as informational env in the passthrough arm below. "block" keeps
 	// the emulator in block mode as a second layer: the mode is set to
-	// "block", which also covers a hub-default passthrough the resolver
-	// mapped to block. The emulator and its env plumbing stay in place for
-	// every other dispatch.
+	// "block", which also covers a hub-default or confined project-default
+	// passthrough the resolver mapped to block. The emulator and its env
+	// plumbing stay in place for every other dispatch.
 	// requireLocalRuntime marks a passthrough granted by the hub's default
-	// rung. hubDefaultPassthrough is its only reading (the create request's
-	// GCPIdentity, else the resolved env overlaid by the config env); the
-	// Cloud Run resolver and the env re-stamp below both use this value.
+	// rung or a confined project-default grant. hubDefaultPassthrough is its
+	// only reading (the create request's GCPIdentity, else the resolved env
+	// overlaid by the config env); the Cloud Run resolver and the env
+	// re-stamp below both use this value.
 	requireLocalRuntime := hubDefaultPassthrough(in)
 	crIdentity, sce := s.resolveCloudRunIdentity(ctx, in, dispatchRuntimeType, gcpMetadataMode, gcpIdentityProfile, requireLocalRuntime)
 	if sce != nil {
@@ -738,6 +745,7 @@ func (s *Server) buildStartContext(ctx context.Context, in startContextInputs) (
 		ColocatedRuntimeHubEndpoints: s.config.ColocatedRuntimeHubEndpoints,
 		RuntimeName:                  runtimeName,
 		HubListenPort:                s.config.HubListenPort,
+		FlatCloudRun:                 s.flatCloudRunTarget(),
 	})
 	if err != nil {
 		return nil, &startContextError{
@@ -1515,13 +1523,14 @@ var hubDefaultPassthroughRuntimeTypes = map[string]bool{
 // can disagree with what this broker resolves for the same dispatch against
 // its own, current project-effective settings (in-repo overrides, a DB
 // settings overlay, or just registration drift). requireLocalRuntime is the
-// signal that a passthrough grant came from that rung specifically —
+// signal that a passthrough grant came from that rung (or the hub's
+// project-default rung, which is confined the same way) —
 // store.GCPIdentityConfig.RequireLocalRuntime on the create path, or the
 // SCION_METADATA_REQUIRE_LOCAL_RUNTIME env var buildStartContext re-stamps
 // for the start/restart paths, which never receive that struct at all (see
 // its call sites for why each path needs its own call to this function).
-// Explicit and project-level passthrough are never flagged, so this is a
-// no-op for them by construction — this is strictly a second line of
+// Explicit passthrough is never flagged, so this is a no-op for it by
+// construction — this is strictly a second line of
 // defense behind the hub-side gate (hubDefaultRuntimeAllowed,
 // pkg/hub/default_gcp_identity.go), not a replacement for it.
 //

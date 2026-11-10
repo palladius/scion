@@ -146,6 +146,9 @@ var SecurityMutationSymbols = map[string]string{
 	// Every token of a user, revoked by a forced user delete
 	// (ptone/scion#2143).
 	"RevokeUserAccessTokensForUser": "revoke-authority",
+	// A user's project-boundary tokens for one project, revoked by a
+	// project leave (ptone/scion#7494).
+	"RevokeUserAccessTokensForUserProject": "revoke-authority",
 
 	// Credential mutations — agent credentials
 	"CreateAgentCredential":         "mint-credential",
@@ -313,6 +316,9 @@ var EntryPointExemptions = []EntryPointExemption{
 	{Pattern: "/api/v1/system/apple-dns", Kind: ExemptionInternalOnly, Reason: "Workstation system endpoint, workstation-token auth", Owner: "route_metadata.go"},
 	{Pattern: "/api/v1/system/registry", Kind: ExemptionInternalOnly, Reason: "Workstation system endpoint, workstation-token auth", Owner: "route_metadata.go"},
 	{Pattern: "/api/v1/system/workstation-settings", Kind: ExemptionInternalOnly, Reason: "Workstation system endpoint, workstation-token auth", Owner: "route_metadata.go"},
+	{Pattern: "/api/v1/system/welcome/preview", Kind: ExemptionInternalOnly, Reason: "Workstation system endpoint, workstation-token auth", Owner: "route_metadata.go"},
+	{Pattern: "/api/v1/system/welcome/install", Kind: ExemptionInternalOnly, Reason: "Workstation system endpoint, workstation-token auth", Owner: "route_metadata.go"},
+	{Pattern: "/api/v1/system/welcome/skip", Kind: ExemptionInternalOnly, Reason: "Workstation system endpoint, workstation-token auth", Owner: "route_metadata.go"},
 	{Pattern: "/api/v1/system/fs/list", Kind: ExemptionInternalOnly, Reason: "Workstation system endpoint, workstation-token auth", Owner: "route_metadata.go"},
 	{Pattern: "/api/v1/system/fs/mkdir", Kind: ExemptionInternalOnly, Reason: "Workstation system endpoint, workstation-token auth", Owner: "route_metadata.go"},
 	{Pattern: "/api/v1/system/fs/validate-path", Kind: ExemptionInternalOnly, Reason: "Workstation system endpoint, workstation-token auth", Owner: "route_metadata.go"},
@@ -324,6 +330,8 @@ var EntryPointExemptions = []EntryPointExemption{
 	{Pattern: "/api/v1/broker/callback", Kind: ExemptionInternalOnly, Reason: "Broker callback, broker-HMAC auth", Owner: "route_metadata.go"},
 	{Pattern: "/api/v1/broker/inbound", Kind: ExemptionInternalOnly, Reason: "Broker message inbound, broker-HMAC auth; per-message authz via authorizeAgentMessage", Owner: "route_metadata.go"},
 	{Pattern: "/api/v1/broker/inbound/routed", Kind: ExemptionInternalOnly, Reason: "Broker routed message inbound, broker-HMAC auth; per-agent authorization via routing resolution", Owner: "route_metadata.go"},
+	{Pattern: "/api/v1/broker/inbound/attachments", Kind: ExemptionInternalOnly, Reason: "Broker attachment upload, broker-HMAC auth; sender and target authorization via authorizeBrokerAttachmentSender before any file is stored", Owner: "route_metadata.go"},
+	{Pattern: "/api/v1/broker/inbound/attachments/check", Kind: ExemptionInternalOnly, Reason: "Broker attachment check, broker-HMAC auth; writes nothing; sender authorization via authorizeBrokerAttachmentSender", Owner: "route_metadata.go"},
 	{Pattern: "/api/v1/broker/projects", Kind: ExemptionInternalOnly, Reason: "Broker project list, broker-HMAC auth", Owner: "route_metadata.go"},
 	{Pattern: "/api/v1/runtime-brokers/connect", Kind: ExemptionInternalOnly, Reason: "Runtime broker WebSocket connect, broker-HMAC auth", Owner: "route_metadata.go"},
 
@@ -385,7 +393,7 @@ var MutationClassifications = []MutationClassification{
 	{File: "pkg/hub/project_membership_service.go", Function: "AddMember", Symbol: "CreateRoleBinding", OperationID: "project.membership.add"},
 	{File: "pkg/hub/project_membership_service.go", Function: "UpdateMemberRole", Symbol: "CreateRoleBinding", OperationID: "project.membership.update"},
 	{File: "pkg/hub/project_membership_service.go", Function: "UpdateMemberRole", Symbol: "DeleteRoleBinding", OperationID: "project.membership.update"},
-	{File: "pkg/hub/project_membership_service.go", Function: "RemoveMember", Symbol: "DeleteRoleBinding", OperationID: "project.membership.remove"},
+	{File: "pkg/hub/project_leave.go", Function: "removeProjectBindingsTx", Symbol: "DeleteRoleBinding", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "governed remove step shared by RemoveMember (project.membership.remove) and LeaveProject (project.membership.leave, ptone/scion#7494): both callers run the credential gate and their governance (the matrix for remove, self-only direct user bindings classified by leaveBindingClass for leave), take the admin-guard and project membership locks and re-read the bindings under them before this call; the step reads the usable-owner pre-state, runs the constraint-admin lockout guard, deletes, and enforces the last-owner rule on the post-state in the same transaction", Scope: "pkg/hub/project_leave.go"}},
 	{File: "pkg/hub/project_membership_service.go", Function: "RemoveVisitor", Symbol: "DeleteRoleBinding", OperationID: "project.visitors.remove"},
 	{File: "pkg/hub/project_membership_service.go", Function: "RemoveVisitor", Symbol: "CreateProjectVisitorExclusion", OperationID: "project.visitors.remove"},
 	{File: "pkg/hub/project_membership_service.go", Function: "TransferOwnership", Symbol: "CreateRoleBinding", OperationID: "project.membership.transfer"},
@@ -510,14 +518,15 @@ var MutationClassifications = []MutationClassification{
 	{File: "pkg/hub/handlers_users_core.go", Function: "deleteUserRowCascadeModeTx", Symbol: "DeleteUser", OperationID: "user.admin.delete"},
 	{File: "pkg/hub/user_delete_force.go", Function: "forceDeleteUserTx", Symbol: "MarkUserDeleting", OperationID: "user.admin.delete"},
 	{File: "pkg/hub/useraccesstoken.go", Function: "revokeUserAccessTokensForUserTx", Symbol: "RevokeUserAccessTokensForUser", OperationID: "user.admin.delete"},
+	{File: "pkg/hub/useraccesstoken.go", Function: "revokeUserAccessTokensForUserProjectTx", Symbol: "RevokeUserAccessTokensForUserProject", OperationID: "project.membership.leave"},
 	{File: "pkg/hub/handlers_users_core.go", Function: "deleteUserRowCascadeModeTx", Symbol: "DeleteGroupMembershipsForUser", OperationID: "user.admin.delete"},
 	{File: "pkg/hub/handlers_users_core.go", Function: "guardAndCascadeUserRoleBindingsCheckTx", Symbol: "DeleteRoleBindingsForPrincipal", OperationID: "user.admin.delete"},
 	{File: "pkg/hub/handlers_users_core.go", Function: "guardAndCascadeUserRoleBindingsCheckTx", Symbol: "DeleteRoleBinding", OperationID: "user.admin.delete"},
 	{File: "pkg/hub/handlers_users_core.go", Function: "updateUser", Symbol: "UpdateUser", OperationID: "user.update"},
 	{File: "pkg/hub/handlers_test_identities.go", Function: "handleCreateTestIdentity", Symbol: "CreateTestFixtureUser", OperationID: "testidentity.create"},
 	{File: "pkg/hub/handlers_test_admin_identities.go", Function: "handleIssueTestAdminIdentity", Symbol: "CreateTestAdminUser", OperationID: "testidentity.admin.create"},
-	{File: "pkg/hub/handlers_test_admin_identities.go", Function: "revokeTestAdminIdentity", Symbol: "DeleteRoleBindingsForPrincipal", OperationID: "testidentity.admin.revokeall"},
-	{File: "pkg/hub/handlers_test_admin_identities.go", Function: "revokeTestAdminIdentity", Symbol: "UpdateUser", OperationID: "testidentity.admin.revokeall"},
+	{File: "pkg/hub/handlers_test_admin_identities.go", Function: "revokeTestAdminIdentityWith", Symbol: "DeleteRoleBindingsForPrincipal", OperationID: "testidentity.admin.revokeall"},
+	{File: "pkg/hub/handlers_test_admin_identities.go", Function: "revokeTestAdminIdentityWith", Symbol: "UpdateUser", OperationID: "testidentity.admin.revokeall"},
 	// Test identity purge (ptone/scion#4240, Phase 3b): resources selected
 	// by their fixture_root_id stamp, removed under testidentity.delete.
 	{File: "pkg/hub/fixture_purge.go", Function: "purgeFixtureGroup", Symbol: "DeleteGroup", OperationID: "testidentity.delete"},
@@ -560,7 +569,7 @@ var MutationClassifications = []MutationClassification{
 	// -----------------------------------------------------------------------
 	// pkg/hub/handlers_agent_lifecycle.go
 	// -----------------------------------------------------------------------
-	{File: "pkg/hub/handlers_agent_lifecycle.go", Function: "revokeSuspendedCredentials", Symbol: "RevokeAgentCredentialsByAgent", Exemption: &MutationExemption{Kind: ExemptionRouteGuarded, Reason: "Agent suspend revokes credentials (reached only from suspendAgent), route-guarded by agent.update permission", Scope: "pkg/hub/handlers_agent_lifecycle.go"}},
+	{File: "pkg/hub/handlers_agent_lifecycle.go", Function: "revokeSuspendedCredentials", Symbol: "RevokeAgentCredentialsByAgent", Exemption: &MutationExemption{Kind: ExemptionRouteGuarded, Reason: "Agent suspend revokes every credential of the agent. Reached from suspendAgent, route-guarded by agent.update permission, and from the scheduler's autoSuspendStalledAgent, which is hub-internal (no request; the route guard covers only the suspendAgent entry); it only narrows access", Scope: "pkg/hub/handlers_agent_lifecycle.go"}},
 
 	// -----------------------------------------------------------------------
 	// pkg/hub/agent_credential_revoke.go — shared best-effort revoke helper
@@ -626,7 +635,6 @@ var MutationClassifications = []MutationClassification{
 	{File: "pkg/hub/web.go", Function: "handleOAuthCallback", Symbol: "UpdateUser", Exemption: &MutationExemption{Kind: ExemptionAuthenticationOnly, Reason: "OAuth callback user record update", Scope: "pkg/hub/web.go"}},
 	{File: "pkg/hub/web.go", Function: "proxyAuthMiddleware", Symbol: "CreateUser", Exemption: &MutationExemption{Kind: ExemptionAuthenticationOnly, Reason: "Proxy auth user provisioning", Scope: "pkg/hub/web.go"}},
 	{File: "pkg/hub/web.go", Function: "proxyAuthMiddleware", Symbol: "UpdateUser", Exemption: &MutationExemption{Kind: ExemptionAuthenticationOnly, Reason: "Proxy auth user record update", Scope: "pkg/hub/web.go"}},
-	{File: "pkg/hub/web.go", Function: "sessionToBearerMiddleware", Symbol: "GenerateAccessToken", Exemption: &MutationExemption{Kind: ExemptionAuthenticationOnly, Reason: "Session-to-bearer token conversion middleware", Scope: "pkg/hub/web.go"}},
 
 	// -----------------------------------------------------------------------
 	// pkg/hub/handlers_test_login.go — dev/test login
@@ -705,7 +713,6 @@ var MutationClassifications = []MutationClassification{
 	// -----------------------------------------------------------------------
 	{File: "pkg/hub/server.go", Function: "sweepOrphanedGroupMemberships", Symbol: "DeleteOrphanedGroupMemberships", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Server startup: delete group memberships whose user and agent are both NULL (principal deleted, ON DELETE SET NULL); such rows are always orphans and carry no principal; idempotent, every startup (ptone/scion#2769)", Scope: "pkg/hub/server.go"}},
 	{File: "pkg/hub/agent_token_mint.go", Function: "recordAgentCredential", Symbol: "CreateAgentCredential", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Agent credential record at agent token issue, server infrastructure", Scope: "pkg/hub/agent_token_mint.go"}},
-	{File: "pkg/hub/server.go", Function: "a2aBridgeSweepHandler", Symbol: "GenerateAccessToken", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Background job: A2A bridge sweep generates GCP tokens", Scope: "pkg/hub/server.go"}},
 	{File: "pkg/hub/encryption_scan.go", Function: "scanSecretPayloads", Symbol: "ScanSecretPayloads", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Authenticating payload scan (ptone/scion#1530 §5, §6) shared by the startup encryption audit, key status and the read-only keys verify command: authenticates every stored payload in process memory; reports identities and counts only", Scope: "pkg/hub/encryption_scan.go"}},
 	{File: "pkg/hub/server.go", Function: "backupSigningKeyToStore", Symbol: "UpdateSecret", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "OIDC signing key backup, server infrastructure", Scope: "pkg/hub/server.go"}},
 	{File: "pkg/hub/server.go", Function: "backupSigningKeyToStore", Symbol: "UpsertSecret", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "OIDC signing key backup, server infrastructure", Scope: "pkg/hub/server.go"}},
@@ -734,11 +741,6 @@ var MutationClassifications = []MutationClassification{
 	// pkg/hub/lifecycle_hook_executor.go — lifecycle hook execution
 	// -----------------------------------------------------------------------
 	{File: "pkg/hub/lifecycle_hook_executor.go", Function: "resolveIdentityAndToken", Symbol: "GenerateAccessToken", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Lifecycle hook: generates GCP token for hook execution after the fire-time writer authority check (Server.AuthorizeHookFire)", Scope: "pkg/hub/lifecycle_hook_executor.go"}},
-
-	// -----------------------------------------------------------------------
-	// pkg/hub/maintenance/maintenance_executors.go — maintenance operations
-	// -----------------------------------------------------------------------
-	{File: "pkg/hub/maintenance/maintenance_executors.go", Function: "Run", Symbol: "GetSecretValue", Exemption: &MutationExemption{Kind: ExemptionHubAdmin, Reason: "Maintenance executor reads secrets, hub-admin operation", Scope: "pkg/hub/maintenance/maintenance_executors.go"}},
 
 	// -----------------------------------------------------------------------
 	// pkg/hub/system_identity.go
@@ -771,6 +773,8 @@ var MutationClassifications = []MutationClassification{
 	{File: "pkg/hub/brokerauth.go", Function: "GenerateAndStoreSecret", Symbol: "CreateBrokerSecret", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Broker secret generation, broker-HMAC auth infrastructure", Scope: "pkg/hub/brokerauth.go"}},
 	{File: "pkg/hub/brokerauth.go", Function: "MintSecretIfAbsent", Symbol: "CreateBrokerSecret", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "First broker secret on the deprecated embedded registration path, broker-HMAC auth infrastructure", Scope: "pkg/hub/brokerauth.go"}},
 	{File: "pkg/hub/brokerauth.go", Function: "RotateBrokerSecret", Symbol: "UpdateBrokerSecret", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Broker secret rotation, broker-HMAC auth infrastructure", Scope: "pkg/hub/brokerauth.go"}},
+	{File: "pkg/hub/brokerauth.go", Function: "ReplaceBrokerSecret", Symbol: "DeleteBrokerSecret", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Co-located flat activation secret replacement, broker-HMAC auth infrastructure", Scope: "pkg/hub/brokerauth.go"}},
+	{File: "pkg/hub/brokerauth.go", Function: "ReplaceBrokerSecret", Symbol: "CreateBrokerSecret", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Co-located flat activation secret replacement, broker-HMAC auth infrastructure", Scope: "pkg/hub/brokerauth.go"}},
 
 	// -----------------------------------------------------------------------
 	// pkg/hub/brokerclient.go / controlchannel_client.go / httpdispatcher.go
@@ -797,6 +801,8 @@ var MutationClassifications = []MutationClassification{
 	{File: "pkg/store/entadapter/agent_deletion_finalize.go", Function: "finalizeAgentDeletionOnce", Symbol: "DeleteGroupMembershipsForAgents", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Store adapter: finalize-hard removes the agent's group memberships before tx.Agent.Delete(), in the same transaction; the caller (FinalizeAgentDeletion via the delete engine) authorizes (ptone/scion#2769)", Scope: "pkg/store/entadapter"}},
 	{File: "pkg/store/entadapter/composite.go", Function: "DeleteProject", Symbol: "DeleteProject", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Store adapter: composite DeleteProject implementation", Scope: "pkg/store/entadapter"}},
 	{File: "pkg/store/entadapter/composite.go", Function: "DeleteProject", Symbol: "DeleteProject", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Store adapter: composite DeleteProject re-enters itself on the transactional store so the cascade and the row deletes commit together (ptone/scion#2769)", Scope: "pkg/store/entadapter"}},
+	{File: "pkg/store/entadapter/composite.go", Function: "DeleteUser", Symbol: "DeleteUser", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Store adapter: composite DeleteUser implementation; inside the transaction it delegates to UserStore.DeleteUser, which clears the user id on the user's choice answers and deletes the row", Scope: "pkg/store/entadapter"}},
+	{File: "pkg/store/entadapter/composite.go", Function: "DeleteUser", Symbol: "DeleteUser", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Store adapter: composite DeleteUser re-enters itself on the transactional store so the answer-user clear and the user delete commit together", Scope: "pkg/store/entadapter"}},
 
 	// -----------------------------------------------------------------------
 	// pkg/store/storetest/ — store interface conformance test fixtures
@@ -881,6 +887,30 @@ var MutationClassifications = []MutationClassification{
 	{File: "pkg/store/storetest/domains_user_deletion.go", Function: "UserDeletionConformance", Symbol: "RevokeUserAccessTokensForUser", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Store test fixture: user deletion conformance token revocation", Scope: "pkg/store/storetest"}},
 	{File: "pkg/store/storetest/domains_user_deletion.go", Function: "UserDeletionConformance", Symbol: "RevokeUserAccessTokensForUser", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Store test fixture: user deletion conformance token revocation", Scope: "pkg/store/storetest"}},
 	{File: "pkg/store/storetest/domains_user_deletion.go", Function: "UserDeletionConformance", Symbol: "RevokeUserAccessTokensForUser", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Store test fixture: user deletion conformance, a force request's writes roll back together", Scope: "pkg/store/storetest"}},
+	// -----------------------------------------------------------------------
+	// Test helpers in pkg/hub/internal/hubtestutil that seed users, role
+	// definitions, role bindings and group members for tests. Only test code
+	// imports the package.
+	// -----------------------------------------------------------------------
+	{File: "pkg/hub/internal/hubtestutil/authz_sqlite.go", Function: "SystemRoleUserWithPermissions", Symbol: "CreateUser", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/authz_sqlite.go", Function: "SystemRoleUserWithPermissions", Symbol: "CreateRoleDefinition", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/authz_sqlite.go", Function: "SystemRoleUserWithPermissions", Symbol: "CreateRoleBinding", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/authz_sqlite.go", Function: "CreateTestUserWithRole", Symbol: "CreateUser", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/authz_sqlite.go", Function: "CreateTestUserWithRole", Symbol: "CreateRoleBinding", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/authz_sqlite.go", Function: "CreateTestUserWithProjectRole", Symbol: "CreateUser", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/authz_sqlite.go", Function: "CreateTestUserWithProjectRole", Symbol: "CreateRoleBinding", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/authz_sqlite.go", Function: "AddProjectMemberWithRole", Symbol: "AddGroupMember", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/authz_sqlite.go", Function: "AddProjectMemberWithRole", Symbol: "CreateRoleBinding", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/authz_sqlite.go", Function: "GrantProjectAccessOnly", Symbol: "CreateRoleDefinition", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/authz_sqlite.go", Function: "GrantProjectAccessOnly", Symbol: "CreateRoleBinding", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/authz_sqlite.go", Function: "SetUserStatus", Symbol: "UpdateUser", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/authz_sqlite.go", Function: "CreateTestRoleDefinition", Symbol: "CreateRoleDefinition", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/access_sqlite.go", Function: "PvSeedGroupMember", Symbol: "AddGroupMember", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/hub/internal/hubtestutil/access_sqlite.go", Function: "PvSeedRoleBinding", Symbol: "CreateRoleBinding", Exemption: &MutationExemption{Kind: ExemptionTestFixture, Reason: "Test-only helper package: no production code may import pkg/hub/internal/hubtestutil, enforced by TestOnlyTestCodeImportsHubtestutil (no_hub_import_test.go) and by the hack/areadag testsupport rule.", Scope: "pkg/hub/internal/hubtestutil"}},
+	{File: "pkg/store/storetest/domains_user_deletion.go", Function: "UserDeletionConformance", Symbol: "CreateUserAccessToken", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Store test fixture: project-boundary token setup for the project leave revocation conformance", Scope: "pkg/store/storetest"}},
+	{File: "pkg/store/storetest/domains_user_deletion.go", Function: "UserDeletionConformance", Symbol: "RevokeUserAccessTokensForUserProject", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Store test fixture: project leave token revocation conformance", Scope: "pkg/store/storetest"}},
+	{File: "pkg/store/storetest/domains_user_deletion.go", Function: "UserDeletionConformance", Symbol: "RevokeUserAccessTokensForUserProject", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Store test fixture: project leave token revocation conformance, a second call revokes nothing", Scope: "pkg/store/storetest"}},
+	{File: "pkg/store/storetest/domains_user_deletion.go", Function: "UserDeletionConformance", Symbol: "RevokeUserAccessTokensForUserProject", Exemption: &MutationExemption{Kind: ExemptionInternalOnly, Reason: "Store test fixture: project leave token revocation conformance, a revocation rolls back with its transaction", Scope: "pkg/store/storetest"}},
 }
 
 // concatOperations joins the per-area operation lists into one catalog.

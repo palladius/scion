@@ -181,6 +181,15 @@ const AttachmentArtifacts = "hub.attachment_artifacts"
 // the delivery sweeper, which holds pending messages while it is off.
 const ChatScheduledSend = "web.chat_scheduled_send"
 
+// ChatChoices gates agent choice prompts in native web chat (design
+// native-chat choices v4): agent sends carrying decisions, which the hub
+// refuses with experiment_disabled while it is off, the hub's decision and
+// answer routes (404 while off), the decisions and choiceResponse fields of
+// chat history, and the decision cards in the web UI. Stored decisions and
+// answers are kept while it is off, and the markdown fallback in each
+// choice prompt's text stays readable.
+const ChatChoices = "web.chat_choices"
+
 // ChatStarredMessages gates starred messages in native web chat: the
 // message Star/Unstar action, the private starred indicator, the
 // conversation header's starred-message list, the starred-only center and
@@ -388,6 +397,13 @@ const ArtifactSponsorReviewGrant = "hub.artifact_sponsor_review_grant"
 // is left out. It needs hub.artifacts.
 const ArtifactArchive = "hub.artifact_archive"
 
+// ArtifactsOpenReviewCheck gates the open-review check on artifact
+// publishes (ptone/scion#6849): review tabs report that they are open, and
+// a publish that would overtake an open review is refused with 409
+// review_open unless it is forced. While it is off the review-session routes
+// answer 404 and publishing behaves exactly as before.
+const ArtifactsOpenReviewCheck = "hub.artifacts_open_review_check"
+
 // UserDeleteForceCascade gates the forced user delete (ptone/scion#2143):
 // DELETE /api/v1/users/{id}?force=true, which revokes the user's authority,
 // records a deletion tombstone and stops the user's agents, the GET
@@ -420,10 +436,47 @@ const ImageTagSetting = "hub.image_tag_setting"
 // an unset image_tag leaves every image reference unchanged.
 const ImageTagVersionDefault = "hub.image_tag_version_default"
 
+// ProjectSelfLeave gates project self-leave (ptone/scion#7494): POST
+// /api/v1/projects/{id}/leave, with which a user removes their own direct
+// project bindings, and the canLeave and leaveBlockedReason capabilities.
+// The hub checks it on the route; while it is off the route answers 404
+// and the capabilities are left out.
+const ProjectSelfLeave = "hub.project_self_leave"
+
+// WelcomeProject gates the welcome project (ptone/scion#7534): a one-time
+// onboarding step that installs the latest agent-team templates, pinned to
+// commit shas, into a "welcome" project and starts a coordinator that greets
+// its owner. Server layer: the hub refuses the welcome preview, install and
+// skip routes (404) while it is off. Web layer: shows the Welcome project
+// step in the setup wizard.
+const WelcomeProject = "hub.welcome_project"
+
 // compiled is the production experiment list. It is reachable only through
 // Default(); there is no package-level Lookup/All, so hub code cannot bypass
 // the Registry instance it was given (ptone/scion#2217).
 var compiled = []Experiment{
+	{
+		Name:        ProjectSelfLeave,
+		Title:       "Leave a project",
+		Description: "Lets a user leave a project they were added to directly: POST /api/v1/projects/{id}/leave removes the caller's own direct project roles in one step, and revokes their access tokens limited to that project when they keep no other access. The last usable direct owner and a member only through a group are refused. The user's agents in the project are held by the existing membership check. While off, the route answers 404 and the leave capabilities are not reported.",
+		Default:     false,
+		Layers:      []Layer{LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7494",
+		Owner:       "authz",
+		ReviewBy:    "2027-02-05",
+	},
+	{
+		Name:        WelcomeProject,
+		Title:       "Welcome project",
+		Description: "Adds a Welcome project step to the workstation setup wizard. It downloads the latest agent-team templates and the skills they use, pinned to commit shas and shown before install, installs them into a new \"welcome\" project and starts a coordinator agent that greets the owner once in chat. It runs at most once per hub: Skip, a failure or deleting the project never re-creates it. Server layer: the welcome preview, install and skip routes answer 404 while it is off. Web layer: shows the wizard step.",
+		Default:     false,
+		Layers:      []Layer{LayerWeb, LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7534",
+		Owner:       "onboarding",
+		ReviewBy:    "2027-05-08",
+	},
 	{
 		Name:        LifecycleEvents,
 		Title:       "Agent lifecycle events",
@@ -615,6 +668,17 @@ var compiled = []Experiment{
 		ReviewBy:    "2027-01-31",
 	},
 	{
+		Name:        ChatChoices,
+		Title:       "Choices in chat",
+		Description: "Lets an agent ask a user to decide between a few options: a choice prompt carries one or more keyed decisions, which web chat shows as cards with one button per choice; a click records the answer and sends it back to the agent. Gates sending choices, which the hub refuses while it is off, the hub's decision and answer routes, which answer 404 while it is off, and the decision fields of chat history (LayerServer), and the cards (LayerWeb). Every choice prompt also carries a markdown copy of its decisions, so other surfaces and clients with it off still show them. Stored decisions and answers are kept while it is off.",
+		Default:     false,
+		Layers:      []Layer{LayerWeb, LayerServer},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#7514",
+		Owner:       "native-chat",
+		ReviewBy:    "2027-02-05",
+	},
+	{
 		Name:        ChatStarredMessages,
 		Title:       "Starred messages in chat",
 		Description: "Lets each user star chat messages privately and find them again from the conversation header. Gates the Star message action, the starred indicator and the header list (LayerWeb) and the hub's starred-message routes, which answer 404 while it is off (LayerServer). Stars are stored per user and are never shown to anyone else; turning it off keeps them.",
@@ -723,6 +787,17 @@ var compiled = []Experiment{
 		Issue:       "ptone/scion#7106",
 		Owner:       "artifacts",
 		ReviewBy:    "2027-02-01",
+	},
+	{
+		Name:        ArtifactsOpenReviewCheck,
+		Title:       "Warn publishers about open reviews",
+		Description: "Review mode on the artifact page reports that a review is open, and a publish that would overtake an open review of the current version is refused with 409 review_open, naming the reviewers and their last activity, until the publisher publishes anyway (force). Needs hub.artifacts. While off, the review-session routes answer 404, force is ignored and publishing behaves as before. Do not turn it on, on any hub, before the filter that drops reviewers who lost access to the artifact has landed (ptone/scion#6849).",
+		Default:     false,
+		Layers:      []Layer{LayerServer, LayerWeb},
+		Stage:       StageAlpha,
+		Issue:       "ptone/scion#6849",
+		Owner:       "artifacts",
+		ReviewBy:    "2027-02-04",
 	},
 	{
 		Name:        UserDeleteForceCascade,
