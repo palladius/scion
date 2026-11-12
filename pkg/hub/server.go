@@ -45,6 +45,7 @@ import (
 	"github.com/GoogleCloudPlatform/scion/pkg/agentkeys"
 	"github.com/GoogleCloudPlatform/scion/pkg/api"
 	"github.com/GoogleCloudPlatform/scion/pkg/artifacts"
+	"github.com/GoogleCloudPlatform/scion/pkg/conduit"
 	"github.com/GoogleCloudPlatform/scion/pkg/conduit/registry"
 	"github.com/GoogleCloudPlatform/scion/pkg/config"
 	"github.com/GoogleCloudPlatform/scion/pkg/config/opsettings"
@@ -184,6 +185,9 @@ type ServerConfig struct {
 	// the agent's exposed ports. The reserved ports (9810, 18380) are always
 	// refused. Only used behind the hub.conduit experiment.
 	ConduitTCPAllowedPorts []int
+	// ConduitPolicy is server.hub.conduit.disable_ssh, deny_ports and
+	// disable_ssh_socket_forwarding, also sent to agents.
+	ConduitPolicy conduit.Policy
 	// ConduitGrantKeyActivation is how long a rotated-in Conduit grant key
 	// is published before it signs (default 15m). It must be at least the
 	// maximum interval at which grant targets refresh their key set
@@ -5529,6 +5533,7 @@ func (s *Server) CreateAuthenticatedDispatcher() *HTTPAgentDispatcher {
 	dispatcher.SetAsyncLaunchSettingsProvider(s.asyncLaunchSettings)
 	dispatcher.SetAutoExposePortsDefaultProvider(s.autoExposePortsDefault)
 	dispatcher.SetDispatchExperimentsProvider(s.dispatchExperiments)
+	dispatcher.SetConduitPolicyProvider(s.conduitAgentPolicy)
 
 	// Set image registry so bare image names are rewritten before dispatch.
 	// It is read per dispatch, so a saved image_registry applies to the
@@ -7032,6 +7037,9 @@ func (s *Server) registerSchedulerHandlers() {
 	// by hub.agent_delegation, so rows issued before the experiment was
 	// turned off are still cleaned up.
 	s.scheduler.RegisterRecurringSingleton("agent-delegated-credential-purge", 60, store.LockAgentDelegatedCredentialPurge, s.agentDelegatedCredentialPurgeHandler(time.Now))
+	// Hourly: a pending secret past its expiry is already treated as gone
+	// on every path; this deletes its row and releases its held value.
+	s.registerPendingSecretExpiry(s.scheduler)
 	// Not a singleton: this instance can only self-heal the providers of
 	// brokers it personally holds a live local control-channel socket for
 	// (see brokerProviderSelfHealHandler), so every instance must run it.
@@ -7814,6 +7822,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/env/", s.guarded("/api/v1/env/", s.handleEnvVarByKey))
 	s.mux.HandleFunc("/api/v1/secrets", s.guarded("/api/v1/secrets", s.handleSecrets))
 	s.mux.HandleFunc("/api/v1/secrets/", s.guarded("/api/v1/secrets/", s.handleSecretByKey))
+	s.mux.HandleFunc("/api/v1/pending-secrets", s.guarded("/api/v1/pending-secrets", s.handlePendingSecrets))
+	s.mux.HandleFunc("/api/v1/pending-secrets/", s.guarded("/api/v1/pending-secrets/", s.handlePendingSecrets))
 
 	// Session metrics (DB-backed, distinct from Cloud Monitoring metrics dashboard)
 	s.mux.HandleFunc("/api/v1/metrics/session/", s.guarded("/api/v1/metrics/session/", s.handleSessionMetrics))
@@ -7923,6 +7933,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/admin/diagnostics/logs/stream", s.guarded("/api/v1/admin/diagnostics/logs/stream", s.handleDiagnosticsLogsStream))
 	s.mux.HandleFunc("/api/v1/admin/diagnostics/logs", s.guarded("/api/v1/admin/diagnostics/logs", s.handleDiagnosticsLogs))
 	s.mux.HandleFunc("/api/v1/admin/health/summary", s.guarded("/api/v1/admin/health/summary", s.handleHealthSummary))
+	s.mux.HandleFunc("/api/v1/admin/orphaned-agents", s.guarded("/api/v1/admin/orphaned-agents", s.handleAdminOrphanedAgents))
 	s.mux.HandleFunc("/api/v1/admin/messaging/divergence", s.guarded("/api/v1/admin/messaging/divergence", s.handleAdminMessagingDivergence))
 	s.mux.HandleFunc("/api/v1/metrics/", s.guarded("/api/v1/metrics/", s.handleMetricsDashboard))
 	s.mux.HandleFunc("/api/v1/admin/metrics-dashboard", s.guarded("/api/v1/admin/metrics-dashboard", s.handleAdminMetricsDashboard)) // legacy backward-compat
@@ -7999,6 +8010,8 @@ func (s *Server) registerRoutes() {
 		s.mux.HandleFunc("/api/v1/chat/attachments/", s.guarded("/api/v1/chat/attachments/", s.chatAttachmentRoute(s.handleChatAttachmentByID)))
 		// Choice prompt decisions: read and answer (web.chat_choices; 404 while off).
 		s.mux.HandleFunc("/api/v1/decisions/", s.guarded("/api/v1/decisions/", s.chatRoute(s.handleDecisionRoutes)))
+		// Choice prompt set answers (web.chat_choices; 404 while off).
+		s.mux.HandleFunc("/api/v1/choice-prompts/", s.guarded("/api/v1/choice-prompts/", s.chatRoute(s.handleChoicePromptRoutes)))
 	}
 
 	// Attachment delivery capability redemption by brokers (ptone/scion#4596).

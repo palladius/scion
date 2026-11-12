@@ -715,6 +715,11 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Classification: RoutePolicy,
 		Permission:     "project.read", Resource: "project", Action: "read",
 	},
+	"/api/v1/choice-prompts/": {
+		Pattern: "/api/v1/choice-prompts/", RouteID: "choiceprompts.byId",
+		Classification: RoutePolicy,
+		Permission:     "project.read", Resource: "project", Action: "read",
+	},
 	"/api/v1/chat/search": {
 		Pattern: "/api/v1/chat/search", RouteID: "chat.search",
 		Classification: RoutePolicy,
@@ -1035,6 +1040,15 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Classification: RouteHubAdmin,
 		Permission:     "hub.health.read", Resource: "hub", Action: "read",
 	},
+	// Orphaned and revoked agents, an operator diagnostic under the
+	// permission of the health summary. Session only (GOV_PENDING): its
+	// token admission waits for its governance batch.
+	"/api/v1/admin/orphaned-agents": {
+		Pattern: "/api/v1/admin/orphaned-agents", RouteID: "admin.orphanedAgents",
+		Classification: RouteHubAdmin,
+		Permission:     "hub.health.read", Resource: "hub", Action: "read",
+		SessionOnly: authzop.ReasonGovernancePending,
+	},
 	"/api/v1/admin/messaging/divergence": {
 		Pattern: "/api/v1/admin/messaging/divergence", RouteID: "admin.messaging.divergence",
 		Classification: RouteHubAdmin,
@@ -1187,6 +1201,18 @@ var routeMetadataTable = map[string]RouteMetadata{
 		Pattern: "/api/v1/admin/effective-access", RouteID: "admin.effectiveAccess",
 		Classification: RouteAuthenticated,
 		Permission:     "hub.audit.read", Resource: "hub", Action: "read",
+	},
+
+	// -------------------------------------------------------------------------
+	// Authenticated: the caller's own pending secrets
+	// -------------------------------------------------------------------------
+	"/api/v1/pending-secrets": {
+		Pattern: "/api/v1/pending-secrets", RouteID: "pendingSecrets.list",
+		Classification: RouteAuthenticated,
+	},
+	"/api/v1/pending-secrets/": {
+		Pattern: "/api/v1/pending-secrets/", RouteID: "pendingSecrets.decide",
+		Classification: RouteAuthenticated,
 	},
 
 	// -------------------------------------------------------------------------

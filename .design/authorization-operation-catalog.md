@@ -2,7 +2,7 @@
 
 *Generated from Go-native OperationSpec definitions. Do not edit manually.*
 
-**Operations:** 381
+**Operations:** 386
 
 ## Table of Contents
 
@@ -36,7 +36,7 @@
 - [agent.token.refresh](#agenttokenrefresh) — Refresh the calling agent's own hub token
 - [agent.outbound.message](#agentoutboundmessage) — Deliver an outbound message from the calling agent
 - [agent.metrics.report](#agentmetricsreport) — Report runtime metrics for the calling agent
-- [agent.secrets.access](#agentsecretsaccess) — List, read and write the secrets available to the calling agent: its project's and its creating user's
+- [agent.secrets.access](#agentsecretsaccess) — List, read and write the secrets available to the calling agent: its project's and its creating user's. A user-scope write is held as a pending secret for the owner's approval (secret.user.pending.*)
 - [agent.stopall](#agentstopall) — Stop all running agents on the hub
 - [agent.stopall.project](#agentstopallproject) — Stop all running agents in a project
 - [project.membership.add](#projectmembershipadd) — Add a member to a project with a specified role
@@ -201,6 +201,7 @@
 - [chat.conversation.promote](#chatconversationpromote) — Promote one of the caller's DMs with an agent into a thread of the agent's space. Needs DM participation, project:read on the agent's project, and the create_thread action of chat-space-access (project.chat_post; 403 chat_post_denied without it); a token also needs inbox:write under the DM rule, and project.chat_post is checked on its holder's account (the project:chat_post selector is not needed)
 - [chat.decision.read](#chatdecisionread) — Read one version of a choice prompt decision. Needs read access to the prompt's conversation (project:read for a thread; the caller in a user slot of a DM key). Agents, visitors and tokens get 403; a missing or unreadable decision is 404. 404 while web.chat_choices is off
 - [chat.decision.answer](#chatdecisionanswer) — Answer a choice prompt decision by choice id (the label is copied from the stored row). Needs the right to send in the prompt's conversation (project:read and project.chat_post for a thread; for a DM, only the user in its key). Agents, visitors and tokens get 403, and so does a user other than the one an agent-interpreted answer records, or a user the asking agent takes no messages from (MESSAGE_DENIED, the chat send's check; a confirm is not delivered, so it is not checked). A replaced version or an answered one is 409, as is an idempotency key reused for another answer; the first answer wins. Records the answer and a choice-response message, delivers it to the asking agent and publishes choice.updated. 404 while web.chat_choices is off
+- [chat.choiceprompt.answer](#chatchoicepromptanswer) — Answer every actionable decision of a choice prompt with two or more decisions as one set, by choice id (labels are copied from the stored rows). Needs the right to send in the prompt's conversation (project:read and project.chat_post for a thread; for a DM, only the user in its key). Agents and visitors get 403, tokens and other non-session credentials the session-only 403, and a user the asking agent takes no messages from 403 MESSAGE_DENIED (an all-confirm set is not delivered, so it is not checked). A missing or unreadable prompt is 404; a malformed set is 400; a set that does not equal the actionable set is 409 answer_set_changed with fresh views and a reason per row, and stores nothing; an idempotency key reused for other answers is 422. Records one answer per row with a shared batch id and one choice-response message in one transaction, delivers it to the asking agent and publishes choice.updated per row. 404 while web.chat_choices is off
 - [role.definition.create](#roledefinitioncreate) — Create a custom role definition (create, import, duplicate). A token needs role:create and role:read on a hub boundary and the holder's live role.create authority; the holder must hold every permission of the role within the token's selectors. A project-scoped definition can be bound in every project, so it is judged on the holder's system-scope authority; a system-scoped definition is refused to every token
 - [role.definition.update](#roledefinitionupdate) — Update a custom role definition. A token needs role:update and role:read on a hub boundary and the holder's live role.update authority; the holder must hold every permission of the updated role within the token's selectors, judged as for create
 - [role.definition.delete](#roledefinitiondelete) — Delete a custom role definition. A token needs role:delete and role:read on a hub boundary and the holder's live role.delete authority; system roles and roles that are still bound are kept
@@ -271,6 +272,7 @@
 - [hub.allowlist.read](#huballowlistread) — Read the platform email allow list and its domains. A token needs hub_allow_list:read on the hub boundary; it does not admit the allow-list writes
 - [hub.allowlist.update](#huballowlistupdate) — Manage the platform email allow list: add and import create invited records (status invited, placeholder role member, no role binding or group membership); delete removes an invited record under the last-project-owner guard and binding cascade of user.admin.delete. The route guard checks hub.allow_list.read, so a token needs hub_allow_list:read and hub_allow_list:update on the hub boundary
 - [hub.health.read](#hubhealthread) — Read platform health summary and GCP quota status
+- [hub.orphanedagents.read](#huborphanedagentsread) — List the hub's agents whose authority state is orphaned or revoked: the non-deleted agents, paged, filtered by computed state (an operator diagnostic under the permission of the health summary; session only until its token admission is governed)
 - [hub.diagnostics.read](#hubdiagnosticsread) — Read diagnostic logs, the diagnostic log stream and messaging divergence data. The log stream re-checks a token credential on every heartbeat and ends once the token stops validating or loses hub.diagnostics.read
 - [hub.scheduler.read](#hubschedulerread) — Read scheduler status and configuration
 - [hub.projectdefaults.read](#hubprojectdefaultsread) — Read project default settings
@@ -363,6 +365,9 @@
 - [env.user.write](#envuserwrite) — Create, update or delete the caller's own user-level environment variables (scope=user, the default). A federated caller is refused (requireProfileWriter)
 - [secret.user.read](#secretuserread) — Read the caller's own user-level secrets (scope=user, the default). A federated caller reads its own (retained prior behaviour)
 - [secret.user.write](#secretuserwrite) — Create, update or delete the caller's own user-level secrets (scope=user, the default). A federated caller is refused (requireProfileWriter)
+- [secret.user.pending.read](#secretuserpendingread) — List the caller's own pending secrets: user-scope secrets written by an agent that wait for the caller's approval, alone or merged with the caller's approved user secrets (includePending=true). Metadata and provenance only, never the value. A federated caller is refused
+- [secret.user.pending.decide](#secretuserpendingdecide) — Approve (writing the caller's own user-level secret the agent requested) or reject one of the caller's own pending secrets. Another user's or an expired pending secret is not found. A federated caller is refused (requireProfileWriter)
+- [secret.user.pending.reveal](#secretuserpendingreveal) — Return the held value of one of the caller's own pending secrets, audited (secret_pending_reveal). Another user's or an expired pending secret is not found. Cross-site and non-JSON browser requests are refused. A federated caller is refused (requireProfileWriter)
 - [env.hub.read](#envhubread) — Read one hub-level environment variable (scope=hub). Agents may read; a user must be an unscoped admin
 - [env.hub.write](#envhubwrite) — Create, update or delete hub-level environment variables (scope=hub). A user must be an unscoped admin
 - [secret.hub.read](#secrethubread) — Read hub-level secrets (scope=hub). Agents may read; a user must be an unscoped admin
@@ -1476,7 +1481,7 @@
 
 **Domain:** agent
 
-**Description:** List, read and write the secrets available to the calling agent: its project's and its creating user's
+**Description:** List, read and write the secrets available to the calling agent: its project's and its creating user's. A user-scope write is held as a pending secret for the owner's approval (secret.user.pending.*)
 
 ### Entry Points
 
@@ -7611,6 +7616,56 @@
 
 ---
 
+## chat.choiceprompt.answer
+
+**Domain:** chat
+
+**Description:** Answer every actionable decision of a choice prompt with two or more decisions as one set, by choice id (labels are copied from the stored rows). Needs the right to send in the prompt's conversation (project:read and project.chat_post for a thread; for a DM, only the user in its key). Agents and visitors get 403, tokens and other non-session credentials the session-only 403, and a user the asking agent takes no messages from 403 MESSAGE_DENIED (an all-confirm set is not delivered, so it is not checked). A missing or unreadable prompt is 404; a malformed set is 400; a set that does not equal the actionable set is 409 answer_set_changed with fresh views and a reason per row, and stores nothing; an idempotency key reused for other answers is 422. Records one answer per row with a shared batch id and one choice-response message in one transaction, delivers it to the asking agent and publishes choice.updated per row. 404 while web.chat_choices is off
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/choice-prompts/{messageId}/answers` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `INTERACTIVE_STATE`)
+
+**Base Permission:** `inbox.write`
+
+**Resource Resolver:** conversation-project
+
+**Effects:** `create-resource`, `emit-external-effect`
+
+### Audit
+
+- **Event Type:** `chat.choiceprompt.answer`
+- **Context Fields:** actor_id, prompt_message_id, batch_id
+- **After Fields:** response_message_id
+- **Atomic:** No
+- **Non-Atomic Justification:** The answers and their response message are stored in one transaction before agent delivery, which is fire-and-forget
+
+### External Effect Policy
+
+- **Delivery:** `fire_and_forget`
+- **Failure Mode:** `log_and_continue`
+- **Idempotency:** idempotency_key of the set
+- **Retry:** a client retry with the same idempotency key and answers replays the recorded set
+- **Auth Before Emit:** Yes
+
+**Denial Codes:** `forbidden`, `not_found`, `conflict`
+
+### Tests
+
+- `pkg/hub:TestChoiceSetAnswer_RecordsAndDeliversOneResponse`
+- `pkg/hub:TestChoiceSetAnswer_ChangedSet409`
+- `pkg/hub:TestChoiceSetAnswer_Authorization`
+
+---
+
 ## role.definition.create
 
 **Domain:** role
@@ -10306,6 +10361,39 @@
 ### Tests
 
 - `pkg/hub:TestBearerDispositionMatrix_CatalogEntryPoints`
+
+---
+
+## hub.orphanedagents.read
+
+**Domain:** hub
+
+**Description:** List the hub's agents whose authority state is orphaned or revoked: the non-deleted agents, paged, filtered by computed state (an operator diagnostic under the permission of the health summary; session only until its token admission is governed)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/admin/orphaned-agents` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `GOV_PENDING`)
+
+**Base Permission:** `hub.health.read`
+
+**Resource Resolver:** hub-scoped
+
+**Effects:** `list-scoped`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+- `pkg/hub:TestAdminOrphanedAgents_Access`
 
 ---
 
@@ -13564,6 +13652,134 @@
 - `pkg/hub:TestUserEnvSecret_ProjectBoundaryTokenRefused`
 - `pkg/hub:TestUserEnvSecretWrites_SessionAllowedTokenRefused`
 - `pkg/hub:TestUserEnvSecretWrites_FederatedUserRefused`
+
+### Exemptions
+
+- **authentication_only:** User-level env and secret material is the caller's own record, so no resource permission applies; a session credential is required (scope: caller's own user-level environment variables and secrets) — waives: `base_permission`
+
+---
+
+## secret.user.pending.read
+
+**Domain:** secret
+
+**Description:** List the caller's own pending secrets: user-scope secrets written by an agent that wait for the caller's approval, alone or merged with the caller's approved user secrets (includePending=true). Metadata and provenance only, never the value. A federated caller is refused
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | GET | `/api/v1/pending-secrets` |
+| http_route | GET | `/api/v1/secrets` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `CREDENTIAL_MANAGEMENT`)
+
+**Resource Resolver:** self-principal
+
+**Effects:** `list-scoped`
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+- `pkg/hub:TestPendingSecretsAPI_Refusals`
+- `pkg/hub:TestPendingSecretsAPI_ListApproveReject`
+
+### Exemptions
+
+- **authentication_only:** User-level env and secret material is the caller's own record, so no resource permission applies; a session credential is required (scope: caller's own user-level environment variables and secrets) — waives: `base_permission`
+
+---
+
+## secret.user.pending.decide
+
+**Domain:** secret
+
+**Description:** Approve (writing the caller's own user-level secret the agent requested) or reject one of the caller's own pending secrets. Another user's or an expired pending secret is not found. A federated caller is refused (requireProfileWriter)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/pending-secrets/{id}/approve` |
+| http_route | POST | `/api/v1/pending-secrets/{id}/reject` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `CREDENTIAL_MANAGEMENT`)
+
+**Resource Resolver:** self-principal
+
+**Effects:** `create-resource`, `update-resource`, `delete-resource`
+
+### Audit
+
+- **Event Type:** `secret.write`
+- **Context Fields:** actor_id
+- **Before Fields:** secret_key
+- **Atomic:** Yes
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+- `pkg/hub:TestPendingSecretsAPI_Refusals`
+- `pkg/hub:TestPendingSecretsAPI_ListApproveReject`
+
+### Exemptions
+
+- **authentication_only:** User-level env and secret material is the caller's own record, so no resource permission applies; a session credential is required (scope: caller's own user-level environment variables and secrets) — waives: `base_permission`
+
+---
+
+## secret.user.pending.reveal
+
+**Domain:** secret
+
+**Description:** Return the held value of one of the caller's own pending secrets, audited (secret_pending_reveal). Another user's or an expired pending secret is not found. Cross-site and non-JSON browser requests are refused. A federated caller is refused (requireProfileWriter)
+
+### Entry Points
+
+| Kind | Method | Pattern |
+|------|--------|---------|
+| http_route | POST | `/api/v1/pending-secrets/{id}/reveal` |
+
+**Principals:** `user`
+
+**Credentials:** `session_jwt`
+
+**Bearer:** `session_only` (reason `CREDENTIAL_MANAGEMENT`)
+
+**Resource Resolver:** self-principal
+
+**Effects:** `read-secret`
+
+### Audit
+
+- **Event Type:** `secret.read`
+- **Context Fields:** actor_id
+- **Atomic:** Yes
+
+**Denial Codes:** `forbidden`
+
+### Tests
+
+- `pkg/hub/authzop:TestCatalogValidation`
+- `pkg/hub:TestPendingSecretsAPI_Refusals`
+- `pkg/hub:TestPendingSecretsAPI_ListApproveReject`
+- `pkg/hub:TestPendingSecretsAPI_Reveal`
+- `pkg/hub:TestPendingSecretsAPI_RevealRefusals`
+- `pkg/hub:TestPendingSecretsAPI_RevealCrossSiteRefused`
+- `pkg/hub:TestPendingSecretsAPI_RevealNoCORSHeaders`
+- `pkg/hub:TestPendingSecretsAPI_RevealProxyModeCrossSite`
 
 ### Exemptions
 

@@ -60,6 +60,7 @@ interface AgentNotificationsResponse {
 }
 import { agentStatusBadge, stateLabel } from '../../shared/agent-state-display.js';
 import { apiFetch, extractApiError } from '../../client/api.js';
+import { showPendingSecretsStartHint } from '../../client/pending-secrets.js';
 import { agentPlacementView } from './agent-placement.js';
 import {
   gcpModeLabel,
@@ -74,6 +75,7 @@ import { AgentSeedEpoch } from '../../client/agent-seed-epoch.js';
 import '../shared/status-badge.js';
 import '../shared/detail-header.js';
 import { DeletionLeaseController } from '../shared/deletion-badge.js';
+import '../shared/authority-badge.js';
 import '../shared/deletion-banner.js';
 import { runAgentDelete, lifecycleActionErrorMessage } from '../../client/agent-delete.js';
 import { showResponseBodyWarnings } from '../../client/response-warnings.js';
@@ -1317,6 +1319,7 @@ export class ScionPageAgentDetail extends LitElement {
         // The hub's start warnings (for example, a token issued without the
         // artifact scopes).
         await showResponseBodyWarnings(response);
+        void showPendingSecretsStartHint();
       }
 
       this.backgroundRefresh();
@@ -1819,6 +1822,7 @@ export class ScionPageAgentDetail extends LitElement {
         <sl-icon slot="icon" name="cpu"></sl-icon>
         ${agentStatusBadge(agent)}
         <scion-deletion-badge .deletion=${this.deletingView(agent)} live></scion-deletion-badge>
+        <scion-authority-badge .authority=${agent.authority}></scion-authority-badge>
         <scion-message-mode-badge
           mode=${agent.messageMode || 'project'}
           size="medium"

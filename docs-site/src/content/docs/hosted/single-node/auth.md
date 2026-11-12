@@ -124,6 +124,32 @@ While the deletion is in progress:
 
 An agent whose Runtime Broker cannot be reached stays `failed`, and the deletion stays in progress, with no timeout: the Hub never reports an agent as stopped unless its teardown was confirmed. To finish, delete that agent from its page with force (`DELETE /api/v1/agents/{id}?force=true`); it is then reported as `removed`, and the completion records how many agents were stopped and how many were removed. An agent whose delete is refused because its saved placement is inconsistent also stays `failed`, and deleting it with force does not remove it: a force delete is refused for the same reason. Its latest error usually starts with `placement conflict:`, followed by the refusal code; if the refusal was recorded on another Hub process, or before the Hub restarted, it is the refusal's message alone, which links to the same section. See [Inconsistent agent placement](/scion/hosted/ha/multi-broker/#inconsistent-agent-placement). Turning the experiment off stops new forced deletes only: a deletion already accepted runs to completion, because the user's authority is already revoked and what remains is stopping the agents the requester was allowed to delete. While the experiment is off, the **Deletion status** panel and `GET /api/v1/users/{id}/deletion` are not available.
 
+### Orphaned and revoked agents
+
+An agent acts under authority delegated to it: by the user who created it, or by the agent that started it, and so on up to a user. The Hub computes each agent's **authority state** from that recorded chain whenever the agent is read, and shows it so you can see which agents cannot act:
+
+| State | Meaning |
+| :--- | :--- |
+| `live` | The chain reaches an active user. |
+| `orphaned` | The agent has an active delegation, but the chain reaches a principal that cannot authorize it. The cause says why: `delegator_deleted` (a user or agent on the chain was deleted, for example a parent agent that was deleted while its children kept running, or a user deleted before deletes were refused), `delegator_inactive` (the user at the root is suspended or being deleted), `delegator_revoked` (a parent agent's own delegation was revoked) or `chain_invalid` (the recorded chain cannot be resolved). |
+| `revoked` | The agent's delegation was deactivated. The cause is the one recorded with it: `user_delete_cascade` for the agents of a [force-deleted](#force-deleting-a-user-who-has-agents) user, `delegator_deleted` for an agent whose delegating user was deleted. |
+| `unrecorded` | The agent's delegation was never recorded (an agent from before delegations were recorded), or its last delegation was deactivated without a recorded cause. It is not reported as orphaned or revoked. |
+
+An orphaned or revoked agent keeps running until it is stopped, but every request that needs its delegation is denied. Where the state shows:
+
+- **Web:** an **Orphaned** or **Revoked** badge on the agent's page and in the project's agent list; its tooltip names the cause and the remediation.
+- **CLI:** `scion list` marks the agent in the PHASE column, for example `running (ORPHANED)`, and `scion look` prints the cause on stderr. Both do so in human CLI mode only.
+- **API:** `authority` on `GET /api/v1/agents/{id}`, and on agent lists with `include=authority`; a request made with an agent delegated credential gets none. The ID of the principal the cause names is shown only to readers who may read that principal; for a user, that is hub admins.
+- **Operators:** `GET /api/v1/admin/orphaned-agents` pages over the hub's non-deleted agents and lists those whose computed state is orphaned or revoked (follow `nextCursor`; a page can be empty). It is an operator diagnostic under `hub.health.read`, the same permission as the admin health summary, and needs a sign-in session; access tokens are refused.
+
+To remediate:
+
+| Who | Action |
+| :--- | :--- |
+| Anyone who may delete the agent (its owner, a project admin, a hub admin) | Stop or delete the agent with the normal agent delete. This is the only remediation; an orphaned agent cannot be given a new delegator. |
+| Hub admin | Find orphaned and revoked agents with `GET /api/v1/admin/orphaned-agents`, then delete them. |
+| Admin of a forced user delete whose agent cannot be stopped | Retry the deletion, or delete the agent with force (`DELETE /api/v1/agents/{id}?force=true`) when its Runtime Broker is gone; it is then reported as `removed`. |
+
 ## OAuth Authentication
 
 Scion supports OAuth authentication via Google and GitHub. OAuth credentials are configured separately for web and CLI clients due to different redirect URI requirements.
@@ -580,7 +606,12 @@ Administrators can force any user to re-authenticate by revoking all of their ac
 - **Web Dashboard**: On the Admin Users page, open the actions menu for a user and select **Revoke Sessions**.
 - **API**: `POST /api/v1/users/:id/revoke-sessions` (requires admin privileges).
 
-Revocation takes effect immediately — the user is redirected to the login page on their next request. Agent tokens and User Access Tokens (UATs) are unaffected; revoke those through their own mechanisms ([UATs](/scion/hosted/user/personal-access-tokens/), agent credential reset via [`scion reset-auth`](/scion/reference/cli/#scion-reset-auth)).
+Revocation increments the user's `session_generation` counter and takes effect immediately across every user-authenticated surface:
+- **Cookie-based web sessions**: invalidated on the next HTTP request, redirecting the browser to the login page.
+- **Hub-issued user JWTs (`access`, `refresh`, and `cli` tokens)**: carry the `sg` claim and are checked against the user's stored `session_generation` on token validation and refresh. Any token whose `sg` is absent or does not equal the user's current `session_generation` is rejected with `401` (`session_revoked` when `sg` is behind or absent, or `session_generation_ahead` if `sg` is ahead).
+- **Conduit sessions and user streams**: when a Conduit session or stream is authenticated with a Hub user token, the Hub captures the token's `session_generation` and compares it on the session handshake and on the periodic stream re-check, closing the session or stream (`session revoked`, `4401` on attach streams) as soon as the user's `session_generation` changes.
+
+User Access Tokens (`scion_pat_`), agent tokens, dev tokens, and trusted-proxy sessions are unaffected; revoke those through their own mechanisms ([UATs](/scion/hosted/user/personal-access-tokens/), agent credential reset via [`scion reset-auth`](/scion/reference/cli/#scion-reset-auth)).
 
 ## CLI Authentication
 

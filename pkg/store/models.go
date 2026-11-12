@@ -408,6 +408,11 @@ type ExposedPort struct {
 	ExposedBy string    `json:"exposedBy"`
 }
 
+// RuntimeTargetPendingDefault is the AgentAppliedConfig.RuntimeTargetPending
+// value that stands for the single runtime target of a flat Runtime Broker,
+// recorded when no target was recorded before. It is not a valid target ID.
+const RuntimeTargetPendingDefault = "@default"
+
 // AgentAppliedConfig stores the effective configuration of an agent.
 type AgentAppliedConfig struct {
 	Image         string            `json:"image,omitempty"`
@@ -422,7 +427,8 @@ type AgentAppliedConfig struct {
 	// Recorded from heartbeats once two consecutive reports name the same
 	// target (see RuntimeTargetCandidate) and cleared when a create, start or
 	// restart is accepted; the missing-container reconcile only considers an
-	// agent whose recorded target a heartbeat lists as complete.
+	// agent whose recorded target (or, on a flat Runtime Broker while none
+	// is recorded, RuntimeTargetPending) a heartbeat lists as complete.
 	RuntimeTarget string              `json:"runtimeTarget,omitempty"`
 	Task          string              `json:"task,omitempty"`      // Initial task/prompt for the agent
 	Attach        bool                `json:"attach,omitempty"`    // If true, signals interactive attach mode to the broker/harness
@@ -440,6 +446,15 @@ type AgentAppliedConfig struct {
 	// start was accepted cannot record the agent's previous target. Cleared
 	// together with RuntimeTarget.
 	RuntimeTargetCandidate string `json:"runtimeTargetCandidate,omitempty"`
+
+	// RuntimeTargetPending is the target the missing-container reconcile
+	// falls back to while RuntimeTarget is empty after a create, start or
+	// restart was accepted on a flat Runtime Broker (ptone/scion#7251).
+	// ClearAgentRuntimeTarget, asked to record it, sets it to the target it
+	// removes, else keeps an existing pending target, else sets
+	// RuntimeTargetPendingDefault. Recording a RuntimeTarget removes it. It
+	// is never recorded from a heartbeat.
+	RuntimeTargetPending string `json:"runtimeTargetPending,omitempty"`
 
 	// NativeCloudRun records the hub's own decision that a dispatch of this
 	// agent runs it on Cloud Run Instances as its own identity
@@ -2611,12 +2626,25 @@ const (
 	// cleaned start of the review's summary note, or is empty when the
 	// review has none.
 	NotificationKindArtifactReviewSummary = "artifact_review_summary"
+	// NotificationKindSecretPending: an agent saved a user-scope secret
+	// that waits for the owner's approval. The owner is the only
+	// recipient; AgentID and ProjectID are the writing agent and its
+	// project. ResourceType is NotificationResourcePendingSecret and
+	// ResourceID the latest pending secret's id. One is stored per owner,
+	// writing agent and clock hour and updated in place by each later write
+	// in that hour, with the count of that agent's pending secrets; a write
+	// that would replace an approved secret is announced separately, at
+	// most once per owner, agent and key per hour. It never carries a
+	// value.
+	NotificationKindSecretPending = "secret_pending"
 )
 
 // Notification.ResourceType values.
 const (
 	// NotificationResourceArtifact: ResourceID is an artifact id.
 	NotificationResourceArtifact = "artifact"
+	// NotificationResourcePendingSecret: ResourceID is a pending secret id.
+	NotificationResourcePendingSecret = "pending_secret"
 )
 
 // Notification.Status values of NotificationKindArtifactGrant rows.
@@ -2633,6 +2661,10 @@ const (
 // NotificationKindArtifactReviewSummary row: a reviewer finalized a review
 // of the user's artifact.
 const NotificationStatusArtifactReviewSubmitted = "ARTIFACT_REVIEW_SUBMITTED"
+
+// NotificationStatusSecretPending is the Status of a
+// NotificationKindSecretPending row.
+const NotificationStatusSecretPending = "SECRET_PENDING"
 
 // MatchesActivity returns true if the given activity matches any of the subscription's
 // trigger activities. Comparison is case-insensitive.
@@ -2727,6 +2759,9 @@ const (
 	NotificationReasonSubscriberGone = "subscriber_gone"
 	// NotificationReasonWatchedAgentGone: the watched agent was deleted.
 	NotificationReasonWatchedAgentGone = "watched_agent_gone"
+	// NotificationReasonSubscriberHeld: the subscriber agent is held
+	// (ptone/scion#7145); the notification was dropped, not delivered.
+	NotificationReasonSubscriberHeld = "subscriber_held"
 )
 
 // ValidNotificationReason reports whether reason is a known
@@ -2734,7 +2769,8 @@ const (
 func ValidNotificationReason(reason string) bool {
 	switch reason {
 	case NotificationReasonExpired, NotificationReasonSubscriptionGone,
-		NotificationReasonSubscriberGone, NotificationReasonWatchedAgentGone:
+		NotificationReasonSubscriberGone, NotificationReasonWatchedAgentGone,
+		NotificationReasonSubscriberHeld:
 		return true
 	}
 	return false
